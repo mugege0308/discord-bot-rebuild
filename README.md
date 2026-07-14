@@ -1,0 +1,1248 @@
+# Discord秘書Bot
+
+Discord上で動作する自分用の秘書Botです。
+今後の基本操作は `/` コマンドです。`@初号ちゃん` とメンションすると、ボタン付きの操作パネルを表示します。
+
+## Claude Codeの起動
+
+`PC_CONTROL_ALLOWED_USER_IDS` に登録したユーザーは、Discordから自宅PC上のClaude Code起動用bat/cmdを起動できます。
+
+```text
+/claude_start
+/claude_status
+```
+
+`.env`には起動ファイルの絶対パスを設定します。許可する拡張子は `.bat` と `.cmd` だけです。
+
+```env
+CLAUDE_START_FILE=C:\Users\PC_User\Documents\Codex\start_claude_code.bat
+```
+
+`start_claude_code.bat`の完成例:
+
+```bat
+@echo off
+cd /d "C:\Users\PC_User\Documents\Codex"
+claude
+pause
+```
+
+起動処理は `cmd.exe` を引数配列で呼び出し、`shell=False` と `CREATE_NEW_CONSOLE` を使用します。Discordから任意のパスやコマンドを渡すことはできません。起動済みの場合は多重起動しません。
+
+プロセス状態は `data/claude_process_state.json` に原子的に保存します。Bot再起動後はPIDに加えてプロセス名と生成時刻を照合し、停止済みPIDや別プロセスに再利用されたPIDを起動中として扱わないようにします。壊れた状態JSONはログに記録して停止中として扱います。
+
+## VOICEVOXによるVC読み上げ
+
+ローカルで起動したVOICEVOXを使い、Discordのボイスチャンネルで指定文を読み上げられます。
+
+```text
+/vc_join
+/vc_say text:こんにちは、初号ちゃんです
+/vc_leave
+```
+
+- `/vc_join` は実行者が参加中のVCへ接続します。別VCに接続中なら移動します。
+- `/vc_say` は最大200文字をVOICEVOXでwavへ変換し、guildごとのキューへ追加します。Botが未接続なら実行者のVCへ自動接続します。
+- `/vc_leave` は再生を停止し、待機キュー、ワーカー、一時wavを破棄して退出します。
+- Bot終了時や手動切断時にも、キューと一時ファイルを可能な範囲でクリーンアップします。
+- 今回は自動読み上げ、Webhook/Bot発言の読み上げ、音声受信、録音、音声認識を実装していません。
+
+`.env`設定:
+
+```env
+VOICEVOX_API_URL=http://127.0.0.1:50021
+VOICEVOX_SPEAKER_ID=1
+VOICEVOX_REQUEST_TIMEOUT_SECONDS=30
+VC_SAY_MAX_LENGTH=200
+```
+
+`VOICEVOX_API_URL` は `localhost`、`127.0.0.1`、`::1` のHTTP URLだけ利用できます。音声再生にはFFmpegと、`discord.py[voice]` が導入するPyNaCl・daveyが必要です。依存関係は次で導入できます。
+
+```bash
+python -m pip install -r requirements.txt
+```
+
+VOICEVOXを起動し、HTTP APIが `http://127.0.0.1:50021` で待機している状態で使用してください。VOICEVOXが停止中、HTTPエラー、タイムアウト、JSON異常の場合はBotを落とさずDiscordへエラーを返します。一時音声は `data/voice_temp` にランダム名で作成され、再生成功・失敗のどちらでも削除されます。
+
+## 選択式キャラクター生成
+
+`/character_generate` では、髪色・髪型・目の色・表情・服装・背景・雰囲気をSelectメニューから選んでキャラクター画像を生成できます。各項目には「指定なし」と「ランダム」があり、2ページの選択後に、選択内容と組み立てた日本語を最終確認できます。
+
+確認画面の「生成する」は、既存の `/generate` と同じLM Studio、Memory、ComfyUI、画像選別AI処理を使います。「作り直す」で最初の選択画面へ戻れます。
+
+```text
+/character_generate
+/character_generate reference_id:1
+```
+
+`reference_id` を指定した場合は、指定した画像参考Memoryの全タグをプロンプト生成時に利用します。選択肢は `data/character_template_options.json` で追加・変更できます。DiscordのSelectメニュー上限に合わせ、1カテゴリ25項目以内にしてください。
+
+## 画像参考Memoryの名前
+
+画像解析時に、`note` とは別に任意の名前を付けられます。名前は1〜50文字で、前後空白・改行・制御文字は保存時に除去されます。`name` を省略した場合は、「Memoryに保存」を押すとVision解析タグから作った自動名入りのModalが開き、そのまま保存するか編集できます。
+
+```text
+/image_analyze image:画像 name:黒髪ボブ緑目
+/image_memory_rename id:3 name:銀髪小悪魔
+```
+
+`/image_memory_list` は「ID / 名前 / 短い要約」を表示し、`/image_memory_show` は名前を先頭に表示します。`/character_generate reference_id:3` の選択画面と確認画面にも、IDと名前を表示します。
+
+保存先の `data/image_memory/ref_XXXX.json` には `name` を保存します。互換性のため `title` も同じ表示名で更新し、古いデータは `name`、`title`、`参考画像 #ID` の順で表示名を解決します。ファイル名とIDは改名しても変わりません。
+
+### 評価と生成利用
+
+画像参考Memoryごとに、好み度と通常生成の自動候補に使うかを管理できます。
+
+```text
+/image_memory_rate id:3 rating:5
+/image_memory_use id:3 enabled:false
+```
+
+- `rating`: 0〜5。新規保存時は0（未評価）で、コマンドでは1〜5を指定します。
+- `use_for_generation`: `true` / `false`。新規保存時は`true`です。
+- 古いJSONにフィールドがない場合は、`rating=0`、`use_for_generation=true`として扱います。
+- 通常の `/prompt`、`/generate`、`/character_generate` は、生成利用がONの関連Memoryだけを候補にし、評価の高いものを優先します。
+- 通常参照では画像Memory由来タグを最大5個に制限します。
+- `reference_id` を明示した場合は、評価や生成利用ON/OFFに関係なく、所有者本人の参考画像を使用できます。
+
+保存JSONでは、将来画像選別AIへ評価データを渡せるよう独立フィールドとして保持します。現時点では画像選別AIの再学習には使用しません。
+
+```json
+{
+  "rating": 0,
+  "use_for_generation": true
+}
+```
+
+### 元画像の保存と表示
+
+`/image_analyze` の「Memoryに保存」を押すと、解析結果と一緒に解析対象の元画像を保存します。8MB制限とJPEG / PNG / WebP制限は従来どおりです。
+
+```text
+data/image_memory/ref_0003.json
+data/image_memory/images/ref_0003.webp
+```
+
+JSONには対応する画像パスを保存します。
+
+```json
+{
+  "image_path": "data/image_memory/images/ref_0003.webp"
+}
+```
+
+- `/image_memory_list` は1ページ3件で、ID、名前、評価、生成利用ON/OFF、短い要約、元画像サムネイルを表示します。
+- 別ページは `/image_memory_list page:2` のように指定します。
+- `/image_memory_show id:3` は解析内容とSDタグに加えて元画像を添付します。
+- `image_path` がない古いデータは「元画像なし」と表示します。
+- `/image_memory_delete` は専用JSON、保存画像、linked通常Memoryをまとめて削除します。
+- 保存画像は `data/image_memory/images` 内のIDと一致する固定ファイル名だけを読み書き・削除対象にします。
+
+## セットアップ
+
+### 1. Pythonを確認する
+
+```bash
+python --version
+```
+
+`python` が見つからない場合:
+
+```bash
+py --version
+```
+
+### 2. 依存関係をインストールする
+
+```bash
+pip install -r requirements.txt
+```
+
+または
+
+```bash
+py -m pip install -r requirements.txt
+```
+
+Windowsで `ZoneInfoNotFoundError` や `No module named 'tzdata'` が出た場合:
+
+```bash
+python -m pip install -r requirements.txt
+```
+
+### 3. `.env` を作成する
+
+PowerShell:
+
+```powershell
+Copy-Item .env.example .env
+```
+
+コマンドプロンプト:
+
+```cmd
+copy .env.example .env
+```
+
+### 4. `.env` を設定する
+
+```env
+DISCORD_BOT_TOKEN=ここにBotトークンを貼り付ける
+DISCORD_GUILD_ID=テスト用DiscordサーバーID
+
+WEATHER_CHANNEL_ID=起動時の天気通知を送るチャンネルID
+WEATHER_LATITUDE=35.0116
+WEATHER_LONGITUDE=135.7681
+WEATHER_LOCATION_NAME=京都
+WEATHER_NOTIFY_AFTER_HOUR=6
+WEATHER_EVENING_NOTIFY_AFTER_HOUR=18
+
+PC_CONTROL_ALLOWED_USER_IDS=123456789012345678
+PC_SHUTDOWN_DELAY_SECONDS=60
+```
+
+## 起動方法
+
+### Windowsでダブルクリック起動
+
+botフォルダ直下の `start_bot.bat` をダブルクリックすると起動できます。
+
+`start_bot.bat` は以下を行います。
+
+- botフォルダをカレントディレクトリにする
+- `chcp 65001` でUTF-8表示に切り替える
+- `python main.py` を実行する
+- `python` が失敗した場合は `py main.py` を試す
+- 最後に `pause` して、エラー内容を確認できるようにする
+
+### Windowsログイン時に自動起動する
+
+`start_bot.bat` のショートカットをWindowsのスタートアップフォルダに入れると、次回Windowsログイン時にBotを自動起動できます。
+
+手順:
+
+1. botフォルダ内の `start_bot.bat` を右クリック
+2. `ショートカットを作成` を選ぶ
+3. `Win + R` を押す
+4. `shell:startup` と入力してEnter
+5. 開いたスタートアップフォルダに、作成したショートカットを移動
+6. 次回Windowsログイン時にBotが自動起動する
+
+注意:
+
+- Windowsにログインした後に起動します
+- 開いた黒い画面を閉じるとBotも止まります
+- `.env` や `commands` フォルダがあるbotフォルダ内の `start_bot.bat` を使ってください
+- `start_bot.bat` 本体ではなく、ショートカットをスタートアップフォルダに置くのがおすすめです
+
+### PowerShellで起動
+
+通常:
+
+```bash
+python main.py
+```
+
+`python` が使えない場合:
+
+```bash
+py main.py
+```
+
+### 開発用の自動再起動
+
+Pythonファイルを保存したときにBotを自動再起動したい場合は、開発用ランナーを使います。
+
+```bash
+python dev_runner.py
+```
+
+`python` が使えない場合:
+
+```bash
+py dev_runner.py
+```
+
+`dev_runner.py` は開発用です。本番環境や常時稼働では、通常通り `python main.py` を使ってください。
+Botトークンや `.env` の読み込みは、これまで通り `main.py` 側で行います。
+
+## 基本の使い方
+
+このBotは `/` コマンドで操作します。
+
+主なコマンド:
+
+- `/help`
+- `/ping`
+- `/memo`
+- `/memo_list`
+- `/memo_delete`
+- `/todo`
+- `/todo_add`
+- `/todo_list`
+- `/todo_done`
+- `/todo_delete`
+- `/today`
+- `/progress`
+- `/log_list`
+- `/log_delete`
+- `/daily_report_set`
+- `/daily_report_off`
+- `/daily_report_now`
+- `/remember`
+- `/memory_list`
+- `/memory_delete`
+- `/chat`
+- `/weather`
+- `/nisa`
+- `/pc_shutdown`
+- `/pc_shutdown_status`
+- `/pc_shutdown_cancel`
+- `/bot_restart`
+- `/jockie_shuffle`
+- `/playlist_save`
+- `/playlist_list`
+- `/playlist_delete`
+- `/jockie_shuffle_saved`
+- `/double_translate_start`
+- `/double_translate_status`
+- `/double_translate_stop`
+- `/health_check`
+- `/prompt`
+- `/generate`
+- `/image_analyze`
+- `/image_memory_list`
+- `/image_memory_show`
+- `/image_memory_delete`
+
+以前の `@初号ちゃん help` のようなメンションコマンドは旧方式です。今後は `/` コマンドを使ってください。
+
+## 操作パネル
+
+`@初号ちゃん` とメンションすると、カテゴリ型の操作パネルが表示されます。
+
+```text
+初号ちゃんです。
+何をしますか？
+
+[今日] [記録] [便利]
+[音楽] [PC操作] [ヘルプ]
+```
+
+メインカテゴリ:
+
+- 今日
+- 記録
+- 便利
+- 音楽
+- PC操作
+- ヘルプ
+
+各カテゴリを押すと、詳細メニューが本人だけに表示されます。
+
+カテゴリごとの内容:
+
+- 今日: 今日のまとめ、今日の天気、明日の天気、傘確認
+- 記録: メモ一覧、メモの使い方、ToDo一覧、ToDoの使い方、メモ/TODO/進捗追加、最近の記録、日次レポート操作
+- 便利: 二重翻訳の開始/状態確認/停止、NISA目安
+- 音楽: 保存済み再生リスト一覧、Jockie Music補助の使い方
+- PC操作: シャットダウン予約、シャットダウン取消、使い方
+- ヘルプ: `/help` 相当の説明
+
+注意:
+
+- パネルは呼び出した本人用です
+- 他の人が押しても操作できません
+- パネルが古くなって反応しない場合は、もう一度 `@初号ちゃん` と送ってください
+- メインパネルはカテゴリ入口です。カテゴリを押しても元のメインパネルは消えません
+- メモ追加、TODO追加、進捗追加は記録パネルのModalからも入力できます
+- TODO完了・削除、プレイリスト保存のようにIDや名前の指定が必要な操作は `/` コマンドを使ってください
+- PC操作は危険操作のため、許可ユーザーだけが実行でき、実行前に確認ボタンが表示されます
+- メンション後に文章がある場合も、基本的には操作パネルを表示します
+
+## スラッシュコマンド
+
+### /help
+
+使える機能を表示します。
+
+### /ping
+
+Botが起きているか確認します。
+
+### /memo
+
+```text
+/memo content:給料日は25日
+```
+
+メモを保存します。
+
+### /memo_list
+
+SQLiteの `records` に保存された最近のメモを表示します。
+
+### /memo_delete
+
+```text
+/memo_delete number:3
+```
+
+指定した記録IDのメモを削除します。
+
+### ToDo機能
+
+やることをユーザーごとに保存できます。
+
+使い方:
+
+```text
+/todo content:定期更新する
+/todo_add content:定期更新する
+/todo_list
+/todo_done todo_id:3
+/todo_delete number:1
+```
+
+`/todo` と `/todo_add` は、どちらもSQLiteの `records` に `type=todo` として保存します。
+`/todo_add` は既存互換のため、従来の `data/todos.json` にも保存します。
+`/todo_list` では未完了TODOだけを表示し、表示には `#3` のような `records.id` が含まれます。
+`/todo_done` は、そのIDを指定して完了にします。
+
+### 今日のまとめ
+
+`/today` で、今日の天気、未完了ToDo、メモ状況をまとめて確認できます。
+
+```text
+/today
+```
+
+NISA目安は自動では含めません。
+必要な場合は `/nisa` を使ってください。
+
+### 記録・進捗・日次レポート
+
+メモ、TODO、進捗をSQLiteの `data/daily_log.db` に保存します。
+
+使い方:
+
+```text
+/memo content:気づいたこと
+/todo content:Botの権限設定を確認する
+/progress content:日次レポート機能を追加した
+/todo_list
+/todo_done todo_id:3
+/log_list kind:all limit:10
+/log_delete record_id:3
+```
+
+`/memo` は既存の `data/memos.json` にも保存しつつ、日次レポート用にSQLiteの `records` にも保存します。
+新しい記録確認は `/log_list`、削除は `/log_delete` を使います。
+
+日次レポート:
+
+```text
+/daily_report_set channel:#作業ログ hour:7 minute:0
+/daily_report_off
+/daily_report_now date:2026-06-28
+```
+
+- `daily_report_set` は、サーバーごとに投稿先チャンネルと投稿時刻を保存します
+- 自動投稿は1分ごとに現在時刻を確認し、設定時刻に昨日分を投稿します
+- `last_posted_for` に対象日を保存し、同じ日付の二重投稿を防ぎます
+- `daily_report_now` の `date` を省略すると、昨日分を今すぐ投稿します
+- FeatherPanelなどでBotを再起動しても、`data/daily_log.db` が残っていれば記録と設定は残ります
+
+操作パネルからも使えます。
+
+`@初号ちゃん` → `記録` から以下を操作できます。
+
+- メモ追加
+- TODO追加
+- 進捗追加
+- 未完了TODO一覧
+- 最近の記録一覧
+- 日次レポート手動表示
+- 現在のチャンネルを7:00の投稿先に設定
+- 投稿時刻を入力して設定
+- 日次レポート停止
+
+メモ追加、TODO追加、進捗追加はModalで内容を入力します。
+
+### 簡易メモリ機能
+
+LM Studioのモデル自体を学習させるのではなく、ユーザーごとの好み・設定・会話メモを `data/memory.json` に保存します。
+
+使い方:
+
+```text
+/remember text:画像は淡い色、眠たげな雰囲気が好き
+/memory_list
+/memory_delete id:1
+/chat text:この設定を踏まえて短く相談に乗って
+```
+
+動作:
+
+- メモリはDiscordユーザーごとに分けて保存します。
+- `/chat` と `/prompt` 実行時に、関連しそうな保存済みメモリを「このユーザーの好み」として自然な文章にまとめ、system promptへ追記します。
+- 「好き」「よく使う」「お気に入り」「好み」などを含むメモリは優先度を高く扱います。
+- 「画像」「プロンプト」「絵」などの依頼では、画像生成関連のメモリを優先します。
+- `/chat` では、可能な範囲で保存済みメモリを引用・活用するようLM Studioへ伝えます。
+- `/prompt` では、保存済みメモリを初号ちゃん側でルールベースのタグに変換し、画風・色・構図・タグ選びへ反映するようLM Studioへ伝えます。
+- `/prompt` と `/generate` では、メモリを「常時反映してよい好み」と「入力文に関連語がある時だけ反映する要素」に分けて扱います。
+- 検索は全文・単語一致の簡易検索です。RAGやベクトル検索は使っていません。
+- 既存の `/memo` とは別機能です。
+
+メモリからタグへの変換例:
+
+```text
+暖色が好き -> warm lighting, orange tones
+柔らかい光が好き -> gentle lighting
+自然な目が好き -> detailed eyes, expressive eyes
+```
+
+常時反映してよい好み:
+
+```text
+可愛い系、人物品質、自然な目、暖色傾向、柔らかい光、淡い色
+```
+
+入力文に関連語がある時だけ反映する要素:
+
+```text
+神社、鳥居、和服、制服、カフェ、雨、サンタ服、桜、夕焼け、メイド
+```
+
+たとえば、メモリに「神社が好き」があっても、入力文に「神社」や「鳥居」がない場合は `shrine` / `torii` を足しません。
+メモリに「和服が好き」があっても、入力文に「和服」や「着物」がない場合は `kimono` / `obi` を足しません。
+背景指定がない入力では、背景系メモリを無理に追加しないようにしています。
+採用したMemoryタグと除外したMemoryタグはログに出力します。
+
+### /weather
+
+```text
+/weather day:今日
+/weather day:明日
+```
+
+今日または明日の天気を表示します。
+
+### /nisa
+
+NISAのざっくり目安を表示します。
+投資判断そのものではなく、年間枠や毎月金額の目安を確認するための表示です。
+
+### /jockie_shuffle
+
+YouTube再生リストURLから、Jockie Musicでシャッフル再生しやすいコピー用コマンドを作ります。
+BotがJockie Musicを直接操作するのではなく、ユーザーがコピーして送信するための文字列を返します。
+
+```text
+/jockie_shuffle url:https://www.youtube.com/playlist?list=xxxxx
+```
+
+返信例:
+
+```text
+Jockie Musicでシャッフル再生するなら、以下をコピーして送信してください。
+```
+
+コピーするコマンド:
+
+```text
+m!play https://www.youtube.com/playlist?list=xxxxx --shuffle
+```
+
+Jockie Musicのプレフィックスが `m!` 以外の場合は、`prefix` を指定してください。
+
+```text
+/jockie_shuffle url:https://www.youtube.com/playlist?list=xxxxx prefix:!
+```
+
+### 再生リスト保存機能
+
+よく使うYouTube再生リストを名前付きで保存できます。
+
+例:
+
+```text
+/playlist_save name:作業用 url:https://www.youtube.com/playlist?list=xxxxx
+/playlist_list
+/jockie_shuffle_saved name:作業用
+```
+
+出力されたJockie Music用コマンドをコピーして、自分で送信してください。
+
+削除する場合:
+
+```text
+/playlist_delete name:作業用
+```
+
+注意:
+
+- 初号ちゃんがJockie Musicを直接操作する機能ではありません
+- Jockie MusicがBotの発言に反応しない可能性があるため、ユーザーがコピーして貼る方式です
+- 保存データは `data/playlists.json` に保存されます
+- 保存データはユーザーごとに分かれます
+
+## 二重翻訳機能
+
+指定した時間だけ、自分の発言を `日本語→英語→日本語` に変換してBotが返信します。
+
+使い方:
+
+```text
+/double_translate_start minutes:5
+/double_translate_status
+/double_translate_stop
+```
+
+動作:
+
+- 対象は開始したユーザー本人のみです
+- 他ユーザーのメッセージは翻訳されません
+- Bot再起動時に状態はリセットされます
+- 500文字を超える文章は翻訳せず、短くするよう案内します
+- 翻訳に失敗する場合があります
+
+例:
+
+```text
+今日は仕事がだるい
+```
+
+```text
+今日の仕事は面倒です。
+```
+
+## PCシャットダウン機能
+
+許可したDiscordユーザーだけが、DiscordからBotが起動しているPCのシャットダウンを予約できます。
+危険な操作なので、許可ユーザーIDを `.env` に設定した場合だけ使ってください。
+
+使い方:
+
+```text
+/pc_shutdown
+/pc_shutdown_status
+/pc_shutdown_cancel
+```
+
+設定:
+
+```env
+PC_CONTROL_ALLOWED_USER_IDS=123456789012345678
+PC_SHUTDOWN_DELAY_SECONDS=60
+```
+
+動作:
+
+- `/pc_shutdown` を実行すると、確認ボタンが表示されます
+- 「実行する」を押すまで実行されません
+- 確認ボタンを押せるのは、`/pc_shutdown` を実行した本人だけです
+- Windowsでは `shutdown /s /t 秒数` を固定コマンドとして実行します
+- `/pc_shutdown_status` で、Botが最後に保存した予約内容を確認できます
+- `/pc_shutdown_cancel` で予約済みシャットダウンをキャンセルできます
+
+注意:
+
+- Botが起動しているPCだけをシャットダウンできます
+- PCがスリープ中・電源OFF中は操作できません
+- 許可ユーザーIDを `.env` の `PC_CONTROL_ALLOWED_USER_IDS` に設定してください
+- 複数ユーザーを許可する場合は、カンマ区切りで指定します
+- Windows以外では実行しません
+- 任意のOSコマンドを実行する機能ではありません
+- `data/pc_shutdown_state.json` には、Botが最後に予約した内容だけを保存します
+- Windows側に実際の予約が残っているかを厳密に検出するものではありません
+- PC自体を再起動した場合、Windows側のshutdown予約は消える可能性があります
+
+### 操作パネルからPCをシャットダウンする
+
+`@初号ちゃん` → `PC操作` から、シャットダウン予約や取り消しができます。
+
+PC操作パネル:
+
+```text
+PC操作メニューです。
+許可されたユーザーだけが実行できます。
+
+[シャットダウン] [時間指定シャットダウン] [予約状況]
+[シャットダウン取消] [使い方]
+```
+
+注意:
+
+- 許可ユーザーだけが操作できます
+- 実行前に確認ボタンが出ます
+- 予約状況では、Botが最後に保存した予約内容を確認できます
+- Botが起動しているPCだけをシャットダウンできます
+- PCがスリープ中や電源OFF中は操作できません
+- 誤操作防止のため、メインパネルから直接シャットダウンはされません
+
+## 起動時の自動通知
+
+Botを起動した時間帯によって、自動通知の内容が変わります。
+
+- 6:00〜17:59 に起動: 今日の天気を通知
+- 18:00以降に起動: お疲れさまメッセージと明日の天気を通知
+
+朝通知と夕方通知は別々に1日1回だけ送信されます。
+起動時の自動通知では、今日または明日の天気を表示します。
+NISA目安を確認したい場合は `/nisa` を使ってください。
+
+送信条件:
+
+- 現在時刻が日本時間の通知開始時刻以降
+- その日の同じ種類の通知をまだ送っていない
+- `.env` に `WEATHER_CHANNEL_ID` が設定されている
+- 天気APIの取得に成功している
+
+通知済みの日付は `data/weather_state.json` に保存されます。
+
+保存例:
+
+```json
+{
+  "morning_last_notified_date": "2026-06-24",
+  "evening_last_notified_date": "2026-06-24"
+}
+```
+
+よくある例:
+
+- 朝にPCをつけた場合: 今日の天気が送られます
+- 仕事後の18時以降にPCをつけた場合: お疲れさまメッセージと明日の天気が送られます
+- 朝にも起動して、夜にも起動した場合: 朝は今日の天気、夜は明日の天気がそれぞれ1回ずつ送られます
+
+## Discord Developer Portalで必要な設定
+
+1. [Discord Developer Portal](https://discord.com/developers/applications) を開きます。
+2. `New Application` からアプリケーションを作成します。
+3. 左メニューの `Bot` を開き、`Add Bot` でBotを作成します。
+4. `Token` からBotトークンを発行し、`.env` の `DISCORD_BOT_TOKEN` に設定します。
+5. `Privileged Gateway Intents` で `MESSAGE CONTENT INTENT` を有効にします。
+6. 左メニューの `OAuth2` → `URL Generator` を開きます。
+7. `Scopes` で `bot` と `applications.commands` を選択します。
+8. `Bot Permissions` で `View Channels`、`Send Messages`、`Read Message History` を選択します。
+9. 生成されたURLを開き、Botを自分のDiscordサーバーに招待します。
+
+すでにBotを招待済みで `/` にコマンドが出ない場合は、`applications.commands` を含めた招待URLで再招待してください。
+
+## チャンネルIDの取り方
+
+1. Discordのユーザー設定を開く
+2. 詳細設定を開く
+3. 開発者モードをONにする
+4. 天気通知を送りたいチャンネルを右クリック
+5. IDをコピー
+6. `.env` の `WEATHER_CHANNEL_ID` に貼り付ける
+
+## よくあるトラブル
+
+### start_bot.bat で起動できない
+
+- `python --version` または `py --version` が動くか確認する
+- `python -m pip install -r requirements.txt` を実行する
+- `.env` が作成されているか確認する
+- `DISCORD_BOT_TOKEN` が設定されているか確認する
+
+### 起動しても天気が送られない
+
+- 6時前ではないか
+- 今日すでに送信済みではないか
+- `WEATHER_CHANNEL_ID` が設定されているか
+- Botにそのチャンネルへの送信権限があるか
+
+### Windowsで Asia/Tokyo が見つからない
+
+- `requirements.txt` に `tzdata` があるか確認する
+- `python -m pip install -r requirements.txt` を実行する
+
+### `/` コマンドが古いと言われる
+
+- 数分待つ
+- Discordを再読み込みする
+- `DISCORD_GUILD_ID` が正しいか確認する
+- 起動時のguild syncログを確認する
+
+## ファイル構成
+
+```text
+secretary-bot/
+├─ main.py
+├─ daily_log.py
+├─ start_bot.bat
+├─ commands/
+│  ├─ __init__.py
+│  ├─ chat.py
+│  ├─ help.py
+│  ├─ memo.py
+│  ├─ ping.py
+│  ├─ today.py
+│  └─ todo.py
+├─ services/
+│  ├─ __init__.py
+│  ├─ nisa.py
+│  ├─ pc_control.py
+│  ├─ double_translate.py
+│  ├─ jockie.py
+│  ├─ translator.py
+│  └─ weather.py
+├─ views/
+│  ├─ __init__.py
+│  ├─ panel.py
+│  └─ pc_control.py
+├─ data/
+│  ├─ daily_log.db
+│  ├─ image_memory/
+│  ├─ memory.json
+│  ├─ memos.json
+│  ├─ pc_shutdown_state.json
+│  ├─ playlists.json
+│  ├─ todos.json
+│  └─ weather_state.json
+├─ .env.example
+├─ requirements.txt
+└─ README.md
+```
+
+`data/daily_log.db` は、記録・TODO・進捗・日次レポート設定を保存するSQLiteデータベースです。
+`data/image_memory/` は、画像参考メモの専用JSONを保存します。
+`data/memory.json` は、ユーザーIDごとの簡易メモリを保存します。
+`data/memos.json` は、ユーザーIDごとのメモを保存します。
+`data/pc_shutdown_state.json` は、Botが最後に保存したPCシャットダウン予約内容を保存します。
+`data/playlists.json` は、ユーザーIDごとの保存済みYouTube再生リストを保存します。
+`data/todos.json` は、ユーザーIDごとのToDoを保存します。
+`data/weather_state.json` は、起動時天気通知の送信済み日付を保存します。
+
+これらのデータファイルは、必要になったときに自動作成されます。
+
+## ローカル画像生成操作
+
+Discordから家PC上のStability Matrix / ComfyUI APIを操作するための機能です。通常操作はスラッシュコマンドで行います。
+
+使えるコマンド:
+
+- `/sd_start`
+  - `SD_BACKEND=comfy` の場合は `.env` の `COMFYUI_START_FILE` に設定した bat/cmd/exe を起動します。
+  - それ以外の場合は `.env` の `SD_START_FILE` に設定した bat/cmd/exe を起動します。
+- `/sd_status`
+  - `SD_API_URL` のAPIが応答しているか確認します。ComfyUIの場合は通常 `http://127.0.0.1:8188` を使います。
+- `/sd_generate prompt:内容`
+  - ComfyUI API にWorkflowを投げ、生成画像をDiscordに返します。
+- `/sd_latest`
+  - 最新生成画像をDiscordに送ります。
+- `/sd_save_favorite`
+  - 最新画像を `data/sd_favorites` にコピーします。
+- `/sd_shutdown_after_done`
+  - 次の画像生成完了後にPCシャットダウンを予約します。
+
+必要な `.env` 設定:
+
+```env
+SD_BACKEND=comfy
+SD_API_URL=http://127.0.0.1:8188
+COMFYUI_START_FILE=C:\Users\PC_User\Documents\Codex\2026-06-23\discord-bot-python-discord-py-pc\start_comfyui.bat
+COMFY_WORKFLOW_FILE=workflows/comfy_workflow.json
+SD_MAX_COUNT=10
+SD_MAX_WIDTH=1024
+SD_MAX_HEIGHT=1024
+SD_MAX_STEPS=60
+SD_MAX_CFG=20
+```
+
+安全上の注意:
+
+- 実行できるのは `PC_CONTROL_ALLOWED_USER_IDS` に含まれるDiscordユーザーだけです。
+- ComfyUI APIは家PC内のローカルAPIとして使い、インターネットへ直接公開しないでください。
+- Botは任意コマンドを実行しません。起動できるのは `.env` で固定した `SD_START_FILE` または `COMFYUI_START_FILE` のみです。
+- `SD_BACKEND=comfy` の場合、`/sd_start` は `COMFYUI_START_FILE` の `.bat / .cmd / .exe` だけを起動します。
+- Stability Matrix管理のComfyUIを起動する場合は、同梱の `start_comfyui.bat` を使えます。`.env` には `COMFYUI_START_FILE=C:\Users\PC_User\Documents\Codex\2026-06-23\discord-bot-python-discord-py-pc\start_comfyui.bat` を設定してください。
+- 起動直後はComfyUI APIがまだ応答しない場合があります。`/sd_start` は数秒待って疎通確認し、未応答なら少し待ってから `/sd_status` を確認するよう案内します。
+- 生成枚数、解像度、steps、cfgには上限があります。
+- 生成中は二重実行できないようにロックします。
+- ComfyUIでは、Workflow JSON内のPositive / Negativeノードを自動検出して書き換えます。
+- Seedは `RandomNoise.noise_seed` または `seed` 入力を自動検出し、Bot側で毎回ランダムに設定します。
+- `SaveImage` ノードも自動検出し、生成後の画像をDiscordへ返します。
+
+### ComfyUI Workflow設定
+
+ComfyUIのWorkflowは外部JSONとして差し替えできます。
+
+手順:
+
+1. Stability MatrixでComfyUIを起動します。
+2. ブラウザで `http://127.0.0.1:8188` が開くことを確認します。
+3. ComfyUIで使いたいWorkflowをAPI形式のJSONとして保存します。
+4. 保存したJSONを `workflows/comfy_workflow.json` に置きます。
+5. `.env` に `COMFY_WORKFLOW_FILE=workflows/comfy_workflow.json` を設定します。
+6. `/sd_status` でWorkflowの存在とAPI状態を確認します。
+
+Workflowには以下のノードが必要です。
+
+- Positive用の `CLIPTextEncode`
+- Negative用の `CLIPTextEncode`
+- `RandomNoise` または `seed` 入力を持つサンプラー
+- 完成画像を保存する `SaveImage`
+
+通常はノードID設定は不要です。BotはKSampler系ノードの `positive` / `negative` 接続を辿って `CLIPTextEncode` を検出します。
+
+どうしても自動検出が合わないWorkflowだけ、上書き用にWorkflow JSON内のノードIDを `.env` に設定できます。
+
+```env
+COMFY_POSITIVE_NODE_ID=6
+COMFY_NEGATIVE_NODE_ID=7
+COMFY_SEED_NODE_ID=3
+```
+
+### 時間指定シャットダウン
+
+指定した分数後、または指定した時刻にPCをシャットダウンできます。
+
+使い方:
+- `/pc_shutdown_in minutes:30`
+- `/pc_shutdown_at time:2330`
+- `/pc_shutdown_at time:23:30`
+- `/pc_shutdown_at time:23時30分`
+- `/pc_shutdown_status`
+- `/pc_shutdown_cancel`
+
+動作:
+- `/pc_shutdown_in minutes:30` は30分後に `shutdown /s /t 1800` を予約します。
+- `/pc_shutdown_at` は日本時間で指定時刻までの秒数を計算します。
+- 時刻は `23:30`、`2330`、`0730`、`730`、`7:30`、`23時30分`、`23時`、`1時` の形で指定できます。
+- 指定時刻が現在時刻より前の場合は、翌日の時刻として扱います。
+- 操作パネルの `時間指定シャットダウン` からも、モーダル入力で時刻を指定できます。
+- 予約が成功すると、Botは `data/pc_shutdown_state.json` に予約内容を保存します。
+- `/pc_shutdown_status` は、この保存内容を表示します。Windows側の予約を直接検出するものではありません。
+
+注意:
+- 許可ユーザーだけが使えます。
+- 実行前に確認ボタンが出ます。
+- 確認ボタンを押すまでシャットダウンは予約されません。
+- botが起動しているPCだけを操作できます。
+- shutdown予約後は、Windows側に予約されます。
+- 取り消す場合は `/pc_shutdown_cancel` を使ってください。
+- `/pc_shutdown_cancel` 実行時は、Bot側の予約状態ファイルも削除します。
+- PC自体を再起動した場合、Windows側のshutdown予約は消える可能性があります。
+
+### Bot再起動機能
+
+許可ユーザーだけが、DiscordからBot自身を再起動できます。
+
+使い方:
+
+```text
+/bot_restart
+```
+
+必要な `.env` 設定:
+
+```env
+BOT_START_FILE=C:\Users\PC_User\Documents\Codex\2026-06-23\discord-bot-python-discord-py-pc\start_bot.bat
+```
+
+注意:
+
+- `PC_CONTROL_ALLOWED_USER_IDS` に含まれるユーザーだけが使えます。
+- `BOT_START_FILE` には `.bat / .cmd / .exe` のフルパスだけ指定できます。
+- 任意コマンド実行はしません。指定された固定ファイルだけを起動します。
+- 実行すると新しいBot起動処理を開始してから、現在のBotプロセスを終了します。
+
+## 状態点検・作業ログ整理
+
+`/health_check` で、Botとローカル環境の状態を手動点検できます。
+
+確認する内容:
+
+- Botの起動時刻、稼働時間、Pythonバージョン、作業ディレクトリ
+- `.env` と `.env.example` の存在
+- 必須そうな環境変数の未設定警告
+- `logs/error.log` と `logs/bot.log` の最終更新時刻、直近エラー件数
+- `commands/`、`services/`、`views/`、`README.md`、`.env.example` の直近24時間の更新
+- `SD_API_URL` がある場合のStable Diffusion WebUI API疎通
+- `LM_STUDIO_API_URL` などがある場合のローカルLLM API疎通
+
+秘密情報について:
+
+- Botトークン、APIキー、secret、password の値はDiscordへ表示しません。
+- `.env` の中身そのものは送信せず、設定キーの有無だけを確認します。
+
+使い方:
+
+```text
+/health_check
+```
+
+このコマンドは `PC_CONTROL_ALLOWED_USER_IDS` に含まれる許可ユーザーだけが使えます。
+
+### 状態点検の定期通知
+
+`.env` に以下を設定すると、指定したチャンネルへ定期的に状態点検結果を送信できます。
+
+```env
+HEALTH_CHECK_ENABLED=true
+HEALTH_CHECK_INTERVAL_MINUTES=60
+HEALTH_CHECK_CHANNEL_ID=通知先チャンネルID
+```
+
+注意:
+
+- `HEALTH_CHECK_CHANNEL_ID` が未設定の場合、定期通知は送信されません。
+- 疎通確認に失敗してもBot全体は落ちません。警告として表示します。
+- 通知が長くなりすぎる場合は一部省略します。
+- 直近ログは短く要約し、長文をそのままDiscordへ流さないようにしています。
+
+### LM Studioを点検対象にする場合
+
+LM StudioのOpenAI互換APIを確認したい場合は、`.env` に以下を設定してください。
+
+```env
+LM_STUDIO_API_URL=http://127.0.0.1:1234/v1
+```
+
+LM Studio側でローカルサーバーが起動していない場合、`/health_check` では接続失敗として表示されます。
+
+## LM Studioプロンプト生成
+
+`/prompt` で、日本語の内容からStable Diffusion向けの `Positive` / `Negative` プロンプトを作れます。
+`/generate` では、同じプロンプト生成処理を使って、そのままComfyUIで画像生成まで実行します。
+`/image_analyze` では、参考画像を画像生成に使えそうな要素へ分解できます。
+
+使い方:
+
+```text
+/prompt text:雨の日の小さな喫茶店、窓際、やわらかい光
+/generate text:雨の日の小さな喫茶店、窓際、やわらかい光
+/image_analyze image:参考画像
+/image_analyze image:参考画像 private:true
+/image_memory_list
+/image_memory_show id:1
+/image_memory_delete id:1
+```
+
+動き:
+
+1. `fixed_template_llm_instruction.md` をsystem promptとしてLM Studioへ送ります。
+2. ユーザーの日本語入力をLM Studioへ送ります。
+3. 保存済みメモリがあれば、関連しそうな内容をsystem promptへ短く追記します。
+4. LM StudioのJSON返答を `sd_prompt_template_generator.py` の整形・補正ロジックに通します。
+5. `/prompt` はDiscordに `Positive` / `Negative` 形式で返します。
+6. `/prompt` の返信の `画像生成` ボタンを押すと、表示されたPositive / Negativeをそのまま使ってComfyUI APIへ送信します。
+7. `/generate` は確認ボタンなしで、生成されたPositive / NegativeをそのままComfyUI APIへ送信して画像を返します。
+
+### 画像解析メモ
+
+`/image_analyze image:参考画像` で、添付画像を以下の項目に分解します。
+
+```text
+人物
+髪色・髪型
+目
+表情
+服装
+背景
+構図
+光・雰囲気
+Stable Diffusion向けタグ候補
+```
+
+解析結果は既定では通常メッセージとしてチャンネルに残ります。
+自分だけに表示したい場合は `private:true` を指定してください。
+
+結果に付く `Memoryに保存` ボタンを押すと、以下の3箇所へ保存します。`name` 未指定時は、保存前に自動名入りの名前入力Modalが開きます。
+
+- `data/memory.json`: 既存のMemory反映用に「画像参考メモ」として保存
+- `data/image_memory/ref_0001.json` のような専用JSON: 一覧・詳細表示用に保存
+- `data/image_memory/images/ref_0001.webp` のような画像ファイル: 一覧・詳細の元画像表示用に保存
+
+保存した内容は、以後の `/prompt` や `/generate` で関連しそうな情報として使われます。
+元画像はIDと対応する安全な固定ファイル名で保存します。古い画像参考メモは元画像なしのまま利用できます。
+
+保存済み画像参考メモの確認:
+
+```text
+/image_memory_list
+/image_memory_show id:1
+/image_memory_rate id:1 rating:5
+/image_memory_use id:1 enabled:true
+/image_memory_delete id:1
+```
+
+専用JSONには以下を保存します。
+
+```text
+id, user_id, name, title, created_at, note, analysis_text, image_path,
+rating, use_for_generation,
+person, hair, eyes, expression, outfit, background,
+composition, lighting_mood, sd_tags, memory_id
+```
+
+一覧が長い場合は `page` を指定できます。
+
+```text
+/image_memory_list page:2
+```
+
+必要な `.env` 設定:
+
+```env
+LMSTUDIO_API_URL=http://127.0.0.1:1234/v1
+LMSTUDIO_TEXT_MODEL=テキスト用モデルID
+LMSTUDIO_VISION_MODEL=Vision用モデルID
+
+# 後方互換用のフォールバックです。
+# 上の2つが未設定の場合に使います。
+LMSTUDIO_MODEL=local-model
+```
+
+LM Studio側の確認:
+
+- LM StudioでLocal Serverを起動する
+- OpenAI互換APIが使える状態にする
+- `LMSTUDIO_API_URL` は通常 `http://127.0.0.1:1234/v1` を指定する
+- `/chat`、`/prompt`、`/generate` は `LMSTUDIO_TEXT_MODEL` を使います。
+- `/image_analyze` は `LMSTUDIO_VISION_MODEL` を使います。
+- どちらも未設定の場合は、後方互換用に `LMSTUDIO_MODEL` を使います。
+- `/image_analyze` を使う場合は、画像入力に対応したVisionモデルをLM Studioで読み込む
+
+注意:
+
+- LM Studioが起動していない場合、`/prompt` は接続失敗を返します。
+- `/generate` もLM StudioとComfyUI APIの両方が起動している必要があります。
+- `/image_analyze` はLM Studioのモデルが画像入力に対応していない場合、解析に失敗します。
+- `画像生成` ボタンを使うには、`SD_API_URL` のComfyUI APIが起動している必要があります。
+- `画像生成` ボタンは、`/prompt` を実行した本人だけが押せます。
+- 画像生成は、`PC_CONTROL_ALLOWED_USER_IDS` に含まれる許可ユーザーだけが実行できます。
+- `/prompt` では安全判定は無効化済みです。LM Studioの `safe_check`、`blocked_elements`、`adult`、`consent_ok` による拒否は行わず、Positive/Negative整形を続行します。
+- 返答はDiscordに長く出すぎないよう、整形して返します。
+
+### /prompt の固定整形ルール
+
+`/prompt` の出力品質を安定させるため、LM Studioの返答後に `sd_prompt_template_generator.py` で必ず補正します。
+
+Positiveの先頭には、必ず以下を付けます。
+
+```text
+masterpiece, best quality, anime style, 1girl, solo
+```
+
+NegativeはLLMには生成させず、以下の固定値を使います。
+
+```text
+worst quality, low quality, normal quality, bad anatomy, bad hands, extra fingers, missing fingers, extra limbs, deformed, blurry, text, watermark, logo, jpeg artifacts, bad eyes, distorted eyes, asymmetrical eyes, glowing eyes, overly bright eyes, two-tone hair, multicolored hair, face paint, cheek mark, facial mark, leaf mark, asymmetrical hair color
+```
+
+以下の語はNegativeには入れません。
+
+```text
+cartoonish style, unrealistic proportions, poor lighting, dark tones
+```
+
+また、`short haircut girl` のような自然文タグは、できるだけ `short hair, 1girl` のようなタグ列に正規化します。
+
+日本語でよく使う要素は、入力文にその語がある場合だけ Danbooru 風タグへ展開します。
+重複したタグは自動で削除されます。
+
+```text
+サンタ服 -> santa hat, red santa dress, white fur trim, christmas costume, christmas lights, snow, gift box
+巫女 -> miko, red hakama, white kimono, shrine maiden
+制服 -> school uniform, sailor uniform, pleated skirt, ribbon
+メイド -> maid, maid headdress, apron, frills
+カフェ -> coffee shop, cafe interior, wooden table, coffee cup, counter, dessert, cozy atmosphere, warm interior
+神社 -> shrine, torii, stone pathway, japanese architecture
+雨 -> rain, wet ground, umbrella, cloudy sky
+```
+
+入力文に該当語がある場合だけ、Negativeにも補助タグを追加します。
+
+```text
+カフェ -> classroom, school desk, blackboard
+サンタ服 -> face paint, cheek mark, leaf mark, multicolored hair, two-tone hair
+```
+
+保存済みメモリ由来の背景・服装タグは、今回の入力に別の背景や服装がある場合は混ざりすぎないように抑えています。
+`サンタ服` のときは `red and green colors` のような抽象的な色タグを避け、髪色が入力で指定されていない場合は髪色タグを勝手に混ぜないようにしています。
+
+### /prompt の Animagine XL 4.0 向けタグ整形
+
+`/prompt` の Positive は、Stable Diffusion / ComfyUI に貼りやすい Danbooru 風タグへ整形します。
+
+Positive の先頭には、品質タグとして以下を固定で入れます。
+
+```text
+masterpiece, best quality, newest, very aesthetic, absurdres, anime style, 1girl, solo
+```
+
+その後ろのタグは、以下の順に並べます。
+
+1. 品質タグ
+2. 人物タグ
+3. 髪・目
+4. 表情・視線
+5. ポーズ
+6. 服装
+7. 背景
+8. 光・雰囲気
+
+`cute 1girl` のような複合自然文タグは、`cute, 1girl` のように分解します。
+`cool colors` と `warm lighting` のような矛盾しやすいタグが同時に出た場合は、より先に出た指定を優先して整理します。
+保存済みメモリ由来のタグと今回の入力が矛盾した場合も、今回の入力に近いタグが残りやすいようにしています。
+
+Negative はこれまで通り固定値を使い、LLMには生成させません。
+
+人物の品質を安定させるため、Positive には以下の人物・顔・目・構図タグを標準で追加します。
+
+```text
+detailed face, beautiful face, detailed eyes, expressive eyes, upper body, looking at viewer, centered composition
+```
+
+`kimono` や和服系タグが含まれる場合は、衣装の描き込みを強めるために以下も補います。
+
+```text
+floral kimono, detailed kimono, long sleeves, obi
+```
+
+背景タグよりも人物タグが前に並ぶようにし、夕焼けや暖色系の入力がある場合は、メモリ由来で混ざった `cool colors` / `blue tones` を除外します。
+
+## 画像生成後の画像選別AI連携
+
+初号ちゃんで画像生成したあと、既存の `local_ai_project` にある画像選別AIで、生成直後の画像だけを選別できます。
+
+`.env` に以下を設定してください。
+
+```env
+LOCAL_AI_PROJECT_DIR=C:\Users\PC_User\Documents\Codex\2026-07-04\ai-phase-1-comfyui-outputs-raw\local_ai_project
+SD_SELECT_GENERATE_COUNT=5
+SD_SELECT_RETURN_COUNT=1
+```
+
+動作:
+
+1. `/prompt` の「画像生成」ボタン、`/generate`、または `/sd_generate` で画像を生成します。
+2. 初号ちゃんは今回生成された画像だけを一時フォルダへコピーします。
+3. `LOCAL_AI_PROJECT_DIR\scripts\score_batch_top5.py` にその一時フォルダを渡します。
+4. 選別AIが `outputs\auto_selected\latest_top5` に出力した上位画像をDiscordへ返します。
+
+`/prompt` の「画像生成」ボタンと `/generate` では、画像選別AIが使える場合だけ複数枚生成します。
+
+- `SD_SELECT_GENERATE_COUNT`: 選別AI用に生成する枚数です。5〜20の範囲で指定します。未設定時は5枚です。
+- `SD_SELECT_RETURN_COUNT`: 選別後にDiscordへ返す枚数です。1〜3の範囲で指定します。未設定時は1枚です。
+
+画像選別AIが未設定の場合や、1枚だけ生成した場合は、選別AIの上位表示ではなく通常の「画像を生成しました」という表示になります。
+
+注意:
+
+- `LOCAL_AI_PROJECT_DIR` が未設定の場合は、画像選別AIをスキップして通常の生成画像を返します。
+- `score_batch_top5.py` の実行に失敗した場合も、通常の生成画像を返します。
+- 既存の生成画像保存先 `data\sd_outputs` は変更しません。
+- 選別AI側の `model\ranker.pkl` や依存ライブラリが必要です。
+
+### `/image_analyze` の構造化タグ
+
+Visionモデルの解析結果は、人物・髪・目・表情・服装・背景・構図・光/雰囲気・SDタグ候補のJSONとして受け取り、英語のDanbooru風タグへ正規化します。コードフェンス付きJSONにも対応し、JSONが壊れている場合は従来の自由文解析へフォールバックします。
+
+保存先の `data/image_memory/ref_XXXX.json` では各カテゴリを配列で保持し、`analysis_text` は人間向けの要約として残します。Discordでは「日本語の要約」と「SDタグ候補」を分けて表示します。

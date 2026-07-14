@@ -1,0 +1,7 @@
+discord.py[voice]
+aiohttp>=3.9.0
+python-dotenv
+requests
+tzdata
+deep-translator
+watchdog>=4.0.0

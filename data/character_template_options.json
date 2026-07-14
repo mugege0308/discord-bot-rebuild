@@ -1,0 +1,66 @@
+{
+  "hair_color": {
+    "label": "髪色",
+    "options": [
+      {"label": "黒髪", "value": "黒髪"}, {"label": "茶髪", "value": "茶髪"},
+      {"label": "金髪", "value": "金髪"}, {"label": "銀髪", "value": "銀髪"},
+      {"label": "白髪", "value": "白髪"}, {"label": "赤髪", "value": "赤髪"},
+      {"label": "青髪", "value": "青髪"}, {"label": "ピンク髪", "value": "ピンク髪"}
+    ]
+  },
+  "hair_style": {
+    "label": "髪型",
+    "options": [
+      {"label": "ショート", "value": "ショートヘア"}, {"label": "ボブ", "value": "ボブカット"},
+      {"label": "ロング", "value": "ロングヘア"}, {"label": "ポニーテール", "value": "ポニーテール"},
+      {"label": "ツインテール", "value": "ツインテール"}, {"label": "三つ編み", "value": "三つ編み"},
+      {"label": "ウェーブ", "value": "ウェーブヘア"}
+    ]
+  },
+  "eye_color": {
+    "label": "目の色",
+    "options": [
+      {"label": "黒い目", "value": "黒い瞳"}, {"label": "茶色い目", "value": "茶色い瞳"},
+      {"label": "青い目", "value": "青い瞳"}, {"label": "赤い目", "value": "赤い瞳"},
+      {"label": "緑の目", "value": "緑の瞳"}, {"label": "紫の目", "value": "紫の瞳"},
+      {"label": "金色の目", "value": "金色の瞳"}
+    ]
+  },
+  "expression": {
+    "label": "表情",
+    "options": [
+      {"label": "笑顔", "value": "明るい笑顔"}, {"label": "微笑み", "value": "穏やかな微笑み"},
+      {"label": "元気", "value": "元気な表情"}, {"label": "クール", "value": "クールな表情"},
+      {"label": "眠たげ", "value": "眠たげな表情"}, {"label": "照れ", "value": "少し照れた表情"},
+      {"label": "真剣", "value": "真剣な表情"}
+    ]
+  },
+  "outfit": {
+    "label": "服装",
+    "options": [
+      {"label": "私服", "value": "おしゃれな普段着"}, {"label": "制服", "value": "学校の制服"},
+      {"label": "メイド服", "value": "メイド服"}, {"label": "和服", "value": "華やかな和服"},
+      {"label": "巫女服", "value": "巫女服"}, {"label": "ドレス", "value": "上品なドレス"},
+      {"label": "パーカー", "value": "カジュアルなパーカー"}, {"label": "ファンタジー", "value": "ファンタジー風の衣装"}
+    ]
+  },
+  "background": {
+    "label": "背景",
+    "options": [
+      {"label": "シンプル", "value": "シンプルな背景"}, {"label": "カフェ", "value": "落ち着いたカフェ"},
+      {"label": "教室", "value": "明るい教室"}, {"label": "街", "value": "にぎやかな街"},
+      {"label": "公園", "value": "緑の多い公園"}, {"label": "海辺", "value": "爽やかな海辺"},
+      {"label": "神社", "value": "静かな神社"}, {"label": "夜景", "value": "きらめく夜景"},
+      {"label": "ファンタジー", "value": "幻想的なファンタジー世界"}
+    ]
+  },
+  "atmosphere": {
+    "label": "雰囲気",
+    "options": [
+      {"label": "明るい", "value": "明るく楽しい雰囲気"}, {"label": "かわいい", "value": "かわいらしい雰囲気"},
+      {"label": "落ち着いた", "value": "落ち着いた雰囲気"}, {"label": "幻想的", "value": "幻想的な雰囲気"},
+      {"label": "爽やか", "value": "爽やかな雰囲気"}, {"label": "暖かい", "value": "暖かな光の雰囲気"},
+      {"label": "クール", "value": "クールな寒色系の雰囲気"}
+    ]
+  }
+}
