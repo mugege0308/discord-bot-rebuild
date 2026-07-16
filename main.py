@@ -13,6 +13,8 @@ import daily_log
 from commands import health
 from commands import character_generate
 from commands import claude
+from commands import claude_remote
+from commands import dev_task
 from commands import image_analyze
 from commands import memory
 from commands import prompt
@@ -30,6 +32,8 @@ from services.double_translate import (
     stop_double_translate,
 )
 from services.bot_control import launch_bot_start_file
+from services.claude_remote import claude_remote_manager
+from services.dev_task_store import mark_running_tasks_failed_on_startup
 from services.jockie import (
     build_jockie_shuffle_response,
     build_saved_jockie_shuffle_response,
@@ -95,6 +99,13 @@ REQUIRED_SLASH_COMMANDS = {
     "image_memory_delete",
     "claude_start",
     "claude_status",
+    "claude_remote_start",
+    "claude_remote_status",
+    "claude_remote_link",
+    "claude_remote_stop",
+    "dev_task",
+    "dev_task_status",
+    "dev_task_stop",
     "vc_join",
     "vc_leave",
     "vc_say",
@@ -149,8 +160,14 @@ class SecretaryClient(discord.Client):
         intents.message_content = True
         super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
+        self._dev_task_recovery_lock = asyncio.Lock()
+        self._dev_task_startup_recovery_done = False
 
     async def close(self) -> None:
+        try:
+            await claude_remote_manager.cleanup()
+        except Exception:
+            logger.exception("Failed to clean up Claude Remote Control during Bot shutdown.")
         try:
             await voice.cleanup(self)
         except Exception:
@@ -188,6 +205,8 @@ client = SecretaryClient()
 daily_log.setup(client)
 health.setup(client)
 claude.setup(client)
+claude_remote.setup(client)
+dev_task.setup(client)
 character_generate.setup(client)
 image_analyze.setup(client)
 memory.setup(client)
@@ -259,6 +278,30 @@ async def on_ready() -> None:
     health_check_loop = getattr(client, "health_check_loop", None)
     if health_check_loop is not None and not health_check_loop.is_running():
         health_check_loop.start()
+
+    # on_ready() can fire again after a mere reconnect (not just a genuine
+    # process restart), so this recovery pass - which fails any dev task
+    # still "running" - must only ever run once per process lifetime.
+    # Otherwise a reconnect while a dummy execution is legitimately in
+    # progress would incorrectly mark it failed.
+    #
+    # The lock serializes concurrent on_ready() firings so at most one
+    # recovery attempt ever runs at a time; the "done" flag is only set
+    # AFTER mark_running_tasks_failed_on_startup() actually succeeds, so a
+    # failed attempt (e.g. a transient disk error) is retried on the next
+    # on_ready() instead of being permanently skipped for the rest of the
+    # process.
+    if not client._dev_task_startup_recovery_done:
+        async with client._dev_task_recovery_lock:
+            if not client._dev_task_startup_recovery_done:
+                try:
+                    changed_count = await asyncio.to_thread(mark_running_tasks_failed_on_startup)
+                    client._dev_task_startup_recovery_done = True
+                    if changed_count:
+                        logger.warning("Marked %s dev task(s) as failed after Bot restart.", changed_count)
+                except Exception:
+                    logger.exception("Failed to run dev task startup recovery.")
+
     await send_startup_weather_notification()
 
 

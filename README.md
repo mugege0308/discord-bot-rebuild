@@ -31,6 +31,70 @@ pause
 
 プロセス状態は `data/claude_process_state.json` に原子的に保存します。Bot再起動後はPIDに加えてプロセス名と生成時刻を照合し、停止済みPIDや別プロセスに再利用されたPIDを起動中として扱わないようにします。壊れた状態JSONはログに記録して停止中として扱います。
 
+## Claude Code Remote Control
+
+`PC_CONTROL_ALLOWED_USER_IDS` に登録したユーザーは、外出先のDiscordから、`.env` で固定したプロジェクトのClaude Code Remote Controlを起動・確認・停止できます。
+
+### 事前準備
+
+1. 対象PCへRemote Control対応版のClaude Codeをインストールし、`claude` がPATHから実行できることを確認します。
+2. `CLAUDE_REMOTE_PROJECT_DIR` に設定する対象フォルダで一度Claude Codeを直接起動します。
+3. Claude Codeへのログインと、そのフォルダのワークスペース信頼の承認を完了します。
+4. `.env` を設定してBotを再起動します。
+
+```env
+PC_CONTROL_ALLOWED_USER_IDS=123456789012345678
+CLAUDE_REMOTE_ENABLED=true
+CLAUDE_REMOTE_COMMAND=claude
+CLAUDE_REMOTE_PROJECT_DIR=C:\Users\PC_User\Documents\Codex\対象プロジェクト
+CLAUDE_REMOTE_SESSION_NAME=初号ちゃん
+CLAUDE_REMOTE_START_TIMEOUT_SECONDS=30
+CLAUDE_REMOTE_STOP_TIMEOUT_SECONDS=10
+```
+
+`CLAUDE_REMOTE_COMMAND` にはPATH上の `claude`、または管理者が決めた実行ファイルの固定パスを指定します。Windowsのnpmインストールで `claude.cmd` が解決された場合にも対応します。Discordからパス、コマンド、追加引数、セッション名を指定することはできません。
+
+### Discordコマンド
+
+```text
+/claude_remote_start   Remote Controlを起動し、取得できた接続URLをephemeralで表示
+/claude_remote_status  PID、起動時刻、経過時間、対象フォルダ、URL取得状況、終了コード、エラー概要を表示
+/claude_remote_link    取得済み接続URLをephemeralで再表示
+/claude_remote_stop    通常終了、terminate、killの順で安全に停止
+```
+
+接続できるのはRemote Controlプロセスが動いている間だけです。接続URLは本人だけに見えるephemeral応答で扱い、公開チャンネルへ貼らないでください。Botは接続URLやClaude Codeの全出力を通常ログへ記録しません。
+
+状態はMVPとしてBotのメモリ内だけに保持します。Botを再起動すると接続URLを失うため、その場合はClaudeアプリまたは `https://claude.ai/code` のCode一覧から `CLAUDE_REMOTE_SESSION_NAME` のセッションを探してください。Bot再起動後に古いPIDだけを使ってプロセスを停止することはありません。
+
+### Remote Controlのトラブルシューティング
+
+- 「機能は無効」: `CLAUDE_REMOTE_ENABLED=true` にしてBotを再起動します。
+- 「対象プロジェクトが存在しない」: `CLAUDE_REMOTE_PROJECT_DIR` の絶対パスとフォルダの存在を確認します。
+- 「Claude Codeコマンドが見つからない」: 対象PCで `claude --version` を実行し、PATHまたは `CLAUDE_REMOTE_COMMAND` を確認します。
+- 「未ログイン」: 対象フォルダでClaude Codeを直接起動してログインします。
+- 「ワークスペース信頼が未承認」: 対象フォルダでClaude Codeを直接起動し、信頼を承認します。
+- 「Remote Controlを利用できない」: Claude Codeを更新し、利用中の環境・契約でRemote Controlが提供されているか確認します。
+- 「起動タイムアウト」: プロセスは起動を継続している場合があります。少し待って `/claude_remote_status` と `/claude_remote_link` を実行します。
+- URL取得前に終了する: 対象PCで同じフォルダから `claude remote-control --name "初号ちゃん"` を直接実行し、表示されるログイン・信頼・機能提供エラーを確認します。
+- 停止に失敗する: 対象PCのタスクマネージャーで、Botが起動したClaude Codeプロセスの状態を確認します。
+
+## 開発タスク機能（Phase 3・ダミー実行）
+
+`DEV_TASK_ALLOWED_USER_IDS` に登録したユーザーは、Discordから開発タスクを起票できます。`PC_CONTROL_ALLOWED_USER_IDS` とは別の許可リストです。
+
+```text
+/dev_task task:内容 engine:auto base_branch:任意
+/dev_task_status task_id:任意（省略時は自分の最新タスク）
+/dev_task_stop
+```
+
+**現時点ではダミー実行です。** `/dev_task` で起票すると、内容に応じてCodex/Claudeへの割り振りが判定され、承認ボタン付きのメッセージが表示されます。「承認して実行」を押すと、専用の`work/<タスクID>`にgit worktreeを作成し、短時間待機した後に`git status`/`git diff`を読み取り専用で確認するだけの処理を行います。**実際のCodex CLIやClaude Code CLIは呼び出しません。** 同時に実行できるタスクは1件だけで、他のタスクが実行中の場合は新しい承認を拒否します（キューはありません）。
+
+結果はDiscordの15分の応答制限に依存せず、起票者へのDM、それが失敗した場合は`DEV_TASK_RESULT_CHANNEL_ID`で指定したチャンネルへ通知します。どちらも失敗した場合はログにのみ記録され、Bot自体は落ちません。結果には作業ブランチ名やダミー実行の要約が含まれますが、内部の絶対パスやGitの生のエラー出力はDiscordへ表示しません。結果メッセージには「保持」「破棄」ボタンがあり、破棄を選ぶとworktreeを削除します。別ブランチのworktreeが登録されている場合や安全確認に失敗した場合は、破棄ボタンを押しても強制削除しません。
+
+承認ボタン・結果ボタンはどちらも起票者本人だけが操作できます。**Bot再起動後、これらのボタンは無効になります。** 再起動時に実行中だったタスクは自動的に失敗として記録されますが（Phase 1の起動時リカバリ）、承認待ちのまま再起動をまたいだタスクは、そのボタンが使えなくなるため`/dev_task_status`で状態を確認したうえで、必要なら`/dev_task`から新たに起票し直してください。
+
 ## VOICEVOXによるVC読み上げ
 
 ローカルで起動したVOICEVOXを使い、Discordのボイスチャンネルで指定文を読み上げられます。

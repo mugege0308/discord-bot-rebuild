@@ -32,6 +32,25 @@ class DevTaskStatus(str, Enum):
 # Phase 3+ can extend this table with new statuses/transitions without touching
 # update_task()'s logic. A status with no entry (or an empty set) accepts no
 # further transitions, including transitioning to itself.
+#
+# Phase 3 design note: Phase 3 needed to represent an approval moment, a
+# worktree keep/discard decision, and an approval-timeout outcome. Rather than
+# adding new statuses (approved / awaiting_decision / discarded / kept) for
+# these, every one of them turned out to be representable as a *field* on top
+# of the existing 4 statuses without changing this transition table at all:
+#   - "approved" is not a distinct state - approval and the transition to
+#     running (or straight to failed, if worktree creation fails) happen in
+#     the same atomic call; approved_at records *when* that happened.
+#   - "awaiting_decision" is simply "status == completed or failed, and
+#     decision is still None" - derivable, not worth its own status.
+#   - "discarded"/"kept" are recorded via the new decision field while status
+#     stays completed/failed (both already terminal, already locked against
+#     further status transitions) - not new terminal states of their own.
+#   - an approval timeout transitions pending_approval -> failed, which this
+#     table already allowed before Phase 3.
+# This keeps completed/failed exactly as terminal as they were in Phase 1
+# (DEV_TASK_STATUS_TRANSITIONS entries below are unchanged), and keeps every
+# existing transition test passing unmodified.
 DEV_TASK_STATUS_TRANSITIONS: dict[str, frozenset[str]] = {
     DevTaskStatus.PENDING_APPROVAL.value: frozenset(
         {DevTaskStatus.RUNNING.value, DevTaskStatus.FAILED.value}
@@ -43,7 +62,19 @@ DEV_TASK_STATUS_TRANSITIONS: dict[str, frozenset[str]] = {
     DevTaskStatus.FAILED.value: frozenset(),
 }
 
-# Fields update_task() may change, and fields it must always reject.
+# Fields update_task() may change, and fields it must always reject. This is
+# exactly Phase 1's original set. Every Phase 3 "audit" field (branch_name,
+# approved_at, started_at, finished_at, decision, decided_at,
+# notification_method, result_summary) is deliberately NOT here: a second
+# Codex review found that a single generic update_task() surface made it
+# possible to write these fields more than once, or independently of the
+# status transition they are supposed to accompany. Each of them is now only
+# ever settable through its own dedicated, atomic function below
+# (claim_task_for_execution / fail_pending_approval / finish_task /
+# set_notification_method_once / finalize_decision), each of which re-checks
+# the task's current state fresh under _store_lock immediately before writing
+# - so update_task(task_id, branch_name=...) etc. now fails with
+# ERROR_UNKNOWN_FIELD unconditionally, by construction, not by convention.
 _UPDATABLE_FIELDS = frozenset(
     {
         "status",
@@ -62,13 +93,14 @@ _IMMUTABLE_FIELDS = frozenset(
         "channel_id",
         "requested_at",
         "prompt_text",
+        "base_branch",
     }
 )
 
 # Per-field audit lock: which of the task's *current* statuses a given
-# updatable field may still be changed from. A field with no entry here
-# (currently only "status") is governed solely by DEV_TASK_STATUS_TRANSITIONS
-# instead of a simple current-status membership check.
+# generically-updatable field may still be changed from (Phase 1's original
+# set - see _UPDATABLE_FIELDS above for why the Phase 3 audit fields are not
+# governed here at all anymore).
 #
 # routed_engine / routing_reason / engine_overridden / timeout_seconds record
 # the routing decision made at task creation and are locked as soon as the
@@ -84,6 +116,9 @@ FIELD_ALLOWED_STATUSES: dict[str, frozenset[str]] = {
     "timeout_seconds": frozenset({DevTaskStatus.PENDING_APPROVAL.value}),
     "error_message": frozenset({DevTaskStatus.PENDING_APPROVAL.value, DevTaskStatus.RUNNING.value}),
 }
+
+_VALID_DECISION_VALUES = {"kept", "discarded"}
+_VALID_NOTIFICATION_METHODS = {"dm", "channel", "none"}
 
 _VALID_STATUS_VALUES = {member.value for member in DevTaskStatus}
 _VALID_ENGINE_VALUES = {member.value for member in DevTaskEngine}
@@ -107,6 +142,7 @@ ERROR_INVALID_VALUE = "invalid_value"
 ERROR_INVALID_TRANSITION = "invalid_transition"
 ERROR_FIELD_LOCKED = "field_locked"
 ERROR_SAVE_FAILED = "save_failed"
+ERROR_DECISION_ALREADY_MADE = "decision_already_made"
 
 _ERROR_MESSAGES: dict[str, str] = {
     ERROR_INVALID_TASK_ID: "タスクIDの形式が不正です。",
@@ -119,6 +155,7 @@ _ERROR_MESSAGES: dict[str, str] = {
     ERROR_INVALID_TRANSITION: "その状態遷移は許可されていません。",
     ERROR_FIELD_LOCKED: "現在の状態ではこの項目は変更できません。",
     ERROR_SAVE_FAILED: "タスクの保存に失敗しました。",
+    ERROR_DECISION_ALREADY_MADE: "worktreeの保持・破棄は既に判断済みです。",
 }
 
 
@@ -135,7 +172,19 @@ class DevTask:
     routing_reason: str
     engine_overridden: bool
     timeout_seconds: int
+    base_branch: str
     error_message: str | None = None
+    # Phase 3 additions - all None until the corresponding moment actually
+    # happens; see FIELD_ALLOWED_STATUSES for exactly when each becomes
+    # settable via update_task().
+    branch_name: str | None = None
+    approved_at: str | None = None
+    started_at: str | None = None
+    finished_at: str | None = None
+    decision: str | None = None
+    decided_at: str | None = None
+    notification_method: str | None = None
+    result_summary: str | None = None
 
 
 @dataclass(frozen=True)
@@ -268,6 +317,35 @@ def _is_valid_error_message(value: Any) -> bool:
     return value is None or _is_utf8_safe_str(value)
 
 
+def _is_valid_base_branch_field(value: Any) -> bool:
+    # This only checks "is this a well-formed, non-empty string field" - the
+    # actual git-level safety/existence check (ref grammar, no shell
+    # metacharacters, must resolve to a real local branch) is
+    # services.dev_worktree.validate_base_branch()'s job at approval time,
+    # kept out of this storage-layer module by design.
+    return _is_utf8_safe_str(value) and value.strip() != ""
+
+
+def _is_valid_optional_utf8_str(value: Any) -> bool:
+    return value is None or (_is_utf8_safe_str(value) and value != "")
+
+
+def _is_valid_optional_iso_utc_timestamp(value: Any) -> bool:
+    """Same grammar as _is_valid_requested_at(), but None (not-yet-set) is
+    also accepted - used for the Phase 3 timestamp fields that only ever
+    become non-None once the moment they record has actually happened.
+    """
+    return value is None or _parse_requested_at(value) is not None
+
+
+def _is_valid_decision(value: Any) -> bool:
+    return value is None or (_is_utf8_safe_str(value) and value in _VALID_DECISION_VALUES)
+
+
+def _is_valid_notification_method(value: Any) -> bool:
+    return value is None or (_is_utf8_safe_str(value) and value in _VALID_NOTIFICATION_METHODS)
+
+
 def _is_valid_status_error_message_pair(status: Any, error_message: Any) -> bool:
     """Enforce the invariant between a task's terminal status and its
     error_message, on top of each field's own per-field validation:
@@ -288,6 +366,25 @@ def _is_valid_status_error_message_pair(status: Any, error_message: Any) -> bool
     return True
 
 
+def _is_valid_decision_decided_at_pair(decision: Any, decided_at: Any) -> bool:
+    """decision and decided_at are set together or not at all - a decision
+    recorded with no timestamp, or a timestamp with no decision, is not a
+    state this module ever produces itself.
+    """
+    return (decision is None) == (decided_at is None)
+
+
+def _is_valid_status_result_summary_pair(status: Any, result_summary: Any) -> bool:
+    """result_summary only ever makes sense for a successfully completed
+    run: optional (None or a non-empty str) when status is completed, but
+    forbidden (must be None) for every other status - in particular,
+    never valid alongside failed.
+    """
+    if status == DevTaskStatus.COMPLETED.value:
+        return True  # None or a valid str; already checked individually
+    return result_summary is None
+
+
 # Single source of truth for the semantic type/value of every DevTask field
 # except task_id, which is validated separately via _normalize_task_id() and
 # cross-checked against the filename (see _load_task()). Used, without
@@ -305,7 +402,16 @@ _FIELD_VALIDATORS: dict[str, Callable[[Any], bool]] = {
     "routing_reason": _is_utf8_safe_str,
     "engine_overridden": _is_strict_bool,
     "timeout_seconds": _is_valid_timeout_seconds,
+    "base_branch": _is_valid_base_branch_field,
     "error_message": _is_valid_error_message,
+    "branch_name": _is_valid_optional_utf8_str,
+    "approved_at": _is_valid_optional_iso_utc_timestamp,
+    "started_at": _is_valid_optional_iso_utc_timestamp,
+    "finished_at": _is_valid_optional_iso_utc_timestamp,
+    "decision": _is_valid_decision,
+    "decided_at": _is_valid_optional_iso_utc_timestamp,
+    "notification_method": _is_valid_notification_method,
+    "result_summary": _is_valid_optional_utf8_str,
 }
 
 _CREATE_TASK_FIELDS = frozenset(
@@ -318,6 +424,7 @@ _CREATE_TASK_FIELDS = frozenset(
         "routing_reason",
         "engine_overridden",
         "timeout_seconds",
+        "base_branch",
     }
 )
 
@@ -369,6 +476,20 @@ def _task_from_dict(normalized_task_id: str, data: dict[str, Any]) -> DevTask | 
         )
         return None
 
+    if not _is_valid_decision_decided_at_pair(data["decision"], data["decided_at"]):
+        logger.error(
+            "Dev task JSON violates decision/decided_at invariant: task_id=%s", normalized_task_id
+        )
+        return None
+
+    if not _is_valid_status_result_summary_pair(data["status"], data["result_summary"]):
+        logger.error(
+            "Dev task JSON violates status/result_summary invariant: task_id=%s status=%s",
+            normalized_task_id,
+            data["status"],
+        )
+        return None
+
     return DevTask(
         task_id=normalized_task_id,
         status=data["status"],
@@ -381,7 +502,16 @@ def _task_from_dict(normalized_task_id: str, data: dict[str, Any]) -> DevTask | 
         routing_reason=data["routing_reason"],
         engine_overridden=data["engine_overridden"],
         timeout_seconds=data["timeout_seconds"],
+        base_branch=data["base_branch"],
         error_message=data["error_message"],
+        branch_name=data["branch_name"],
+        approved_at=data["approved_at"],
+        started_at=data["started_at"],
+        finished_at=data["finished_at"],
+        decision=data["decision"],
+        decided_at=data["decided_at"],
+        notification_method=data["notification_method"],
+        result_summary=data["result_summary"],
     )
 
 
@@ -578,6 +708,7 @@ def create_task(
     routing_reason: str,
     engine_overridden: bool,
     timeout_seconds: int,
+    base_branch: str,
 ) -> DevTaskResult:
     candidate_fields = _normalize_field_values(
         {
@@ -589,6 +720,7 @@ def create_task(
             "routing_reason": routing_reason,
             "engine_overridden": engine_overridden,
             "timeout_seconds": timeout_seconds,
+            "base_branch": base_branch,
         }
     )
     field_error_code = _validate_create_fields(candidate_fields)
@@ -609,6 +741,7 @@ def create_task(
         routing_reason=candidate_fields["routing_reason"],
         engine_overridden=candidate_fields["engine_overridden"],
         timeout_seconds=candidate_fields["timeout_seconds"],
+        base_branch=candidate_fields["base_branch"],
         error_message=None,
     )
 
@@ -695,6 +828,295 @@ def update_task(task_id: str, **fields: Any) -> DevTaskResult:
     return DevTaskResult(success=True, task=updated_task, error_message=None, error_code=None)
 
 
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds")
+
+
+def claim_task_for_execution(
+    task_id: str,
+    *,
+    branch_name: str,
+    engine_override: str | None = None,
+    routing_reason_override: str | None = None,
+) -> DevTaskResult:
+    """Atomically transition pending_approval -> running, claiming the
+    single execution slot for this task and recording every audit field
+    that moment produces - approved_at, started_at, branch_name, and
+    (if provided) an engine override - all in the same write.
+
+    This is the ONLY function that ever sets approved_at/started_at/
+    branch_name (update_task() rejects them outright - see
+    _UPDATABLE_FIELDS). Fails, writing nothing, unless the task's current
+    status is exactly pending_approval AND approved_at/started_at/
+    branch_name are all still None at the moment this runs inside
+    _store_lock (not from any snapshot the caller might be holding). Two
+    callers racing to claim the same task_id can therefore only ever have
+    one succeed: whichever reaches _store_lock second sees the state the
+    first one already wrote, and is rejected.
+    """
+    normalized_id = _normalize_task_id(task_id)
+    if normalized_id is None:
+        return _result_error(ERROR_INVALID_TASK_ID)
+    if not _is_utf8_safe_str(branch_name) or branch_name == "":
+        return _result_error(ERROR_INVALID_VALUE)
+    if engine_override is not None and not _is_valid_engine(engine_override):
+        return _result_error(ERROR_INVALID_VALUE)
+
+    with _store_lock:
+        error_code, current_task = _load_task(normalized_id)
+        if error_code is not None:
+            return _result_error(error_code)
+
+        if current_task.status != DevTaskStatus.PENDING_APPROVAL.value:
+            logger.warning(
+                "Rejected claim_task_for_execution: not pending_approval: task_id=%s status=%s",
+                normalized_id,
+                current_task.status,
+            )
+            return _result_error(ERROR_INVALID_TRANSITION)
+
+        if (
+            current_task.approved_at is not None
+            or current_task.started_at is not None
+            or current_task.branch_name is not None
+        ):
+            logger.warning(
+                "Rejected claim_task_for_execution: already claimed: task_id=%s", normalized_id
+            )
+            return _result_error(ERROR_FIELD_LOCKED)
+
+        now = _now_iso()
+        merged = asdict(current_task)
+        merged["status"] = DevTaskStatus.RUNNING.value
+        merged["approved_at"] = now
+        merged["started_at"] = now
+        merged["branch_name"] = branch_name
+        if engine_override is not None:
+            merged["routed_engine"] = engine_override
+            merged["routing_reason"] = routing_reason_override or "承認時に手動で上書きされたため"
+            merged["engine_overridden"] = True
+
+        updated_task = _task_from_dict(normalized_id, merged)
+        if updated_task is None:
+            return _result_error(ERROR_INVALID_VALUE)
+
+        saved = _write_task_atomic(normalized_id, asdict(updated_task))
+        if not saved:
+            return _result_error(ERROR_SAVE_FAILED)
+
+    logger.info("Dev task claimed for execution: task_id=%s branch_name=%s", normalized_id, branch_name)
+    return DevTaskResult(success=True, task=updated_task, error_message=None, error_code=None)
+
+
+def fail_pending_approval(task_id: str, *, reason: str) -> DevTaskResult:
+    """Atomically fail a task that is still pending_approval - used for
+    approval timeout, requester cancellation, and any pre-claim rejection
+    (e.g. the global execution slot could not be reserved).
+
+    Fails, writing nothing, unless the task's current status is exactly
+    pending_approval at the moment of the write. This is what makes it
+    safe to call from on_timeout()/cancel: if a concurrent approval has
+    already claimed the task (moved it to running) by the time this runs,
+    this call is rejected instead of incorrectly failing an
+    already-running task - running -> failed is a valid transition in the
+    abstract, but only finish_task() (below) is allowed to make it.
+    """
+    normalized_id = _normalize_task_id(task_id)
+    if normalized_id is None:
+        return _result_error(ERROR_INVALID_TASK_ID)
+    if not _is_utf8_safe_str(reason) or reason == "":
+        return _result_error(ERROR_INVALID_VALUE)
+
+    with _store_lock:
+        error_code, current_task = _load_task(normalized_id)
+        if error_code is not None:
+            return _result_error(error_code)
+
+        if current_task.status != DevTaskStatus.PENDING_APPROVAL.value:
+            logger.warning(
+                "Rejected fail_pending_approval: not pending_approval: task_id=%s status=%s",
+                normalized_id,
+                current_task.status,
+            )
+            return _result_error(ERROR_INVALID_TRANSITION)
+
+        merged = asdict(current_task)
+        merged["status"] = DevTaskStatus.FAILED.value
+        merged["error_message"] = reason
+        merged["finished_at"] = _now_iso()
+
+        updated_task = _task_from_dict(normalized_id, merged)
+        if updated_task is None:
+            return _result_error(ERROR_INVALID_VALUE)
+
+        saved = _write_task_atomic(normalized_id, asdict(updated_task))
+        if not saved:
+            return _result_error(ERROR_SAVE_FAILED)
+
+    logger.info("Dev task failed while pending approval: task_id=%s reason=%s", normalized_id, reason)
+    return DevTaskResult(success=True, task=updated_task, error_message=None, error_code=None)
+
+
+def finish_task(
+    task_id: str, *, success: bool, error_message: str | None = None, result_summary: str | None = None
+) -> DevTaskResult:
+    """Atomically transition running -> completed (success=True) or
+    running -> failed (success=False), recording finished_at and (per
+    outcome) result_summary or error_message all in the same write.
+
+    Fails, writing nothing, unless the task's current status is exactly
+    running at the moment of the write. This is the ONLY function that
+    ever sets finished_at/result_summary.
+    """
+    normalized_id = _normalize_task_id(task_id)
+    if normalized_id is None:
+        return _result_error(ERROR_INVALID_TASK_ID)
+
+    if success:
+        if error_message is not None:
+            return _result_error(ERROR_INVALID_VALUE)
+    else:
+        if not isinstance(error_message, str) or error_message == "":
+            return _result_error(ERROR_INVALID_VALUE)
+        if result_summary is not None:
+            return _result_error(ERROR_INVALID_VALUE)
+    if result_summary is not None and not _is_valid_optional_utf8_str(result_summary):
+        return _result_error(ERROR_INVALID_VALUE)
+
+    with _store_lock:
+        error_code, current_task = _load_task(normalized_id)
+        if error_code is not None:
+            return _result_error(error_code)
+
+        if current_task.status != DevTaskStatus.RUNNING.value:
+            logger.warning(
+                "Rejected finish_task: not running: task_id=%s status=%s",
+                normalized_id,
+                current_task.status,
+            )
+            return _result_error(ERROR_INVALID_TRANSITION)
+
+        merged = asdict(current_task)
+        merged["status"] = DevTaskStatus.COMPLETED.value if success else DevTaskStatus.FAILED.value
+        merged["finished_at"] = _now_iso()
+        merged["error_message"] = None if success else error_message
+        merged["result_summary"] = result_summary if success else None
+
+        updated_task = _task_from_dict(normalized_id, merged)
+        if updated_task is None:
+            return _result_error(ERROR_INVALID_VALUE)
+
+        saved = _write_task_atomic(normalized_id, asdict(updated_task))
+        if not saved:
+            return _result_error(ERROR_SAVE_FAILED)
+
+    logger.info("Dev task finished: task_id=%s success=%s", normalized_id, success)
+    return DevTaskResult(success=True, task=updated_task, error_message=None, error_code=None)
+
+
+def set_notification_method_once(task_id: str, *, method: str) -> DevTaskResult:
+    """Record how the result notification was delivered ("dm"/"channel"/
+    "none"), exactly once.
+
+    Deliberately decoupled from finish_task(): the notification is only
+    ever attempted after the terminal state is already durably saved (see
+    finish_task()'s docstring and the module-level Phase 3 notes), so the
+    actual delivery method isn't known yet at the moment the terminal
+    state itself is written. Fails, writing nothing, if
+    notification_method is already set; unlike the other CAS functions
+    here, this one does not care what the task's current status is
+    (it can be called after either completed or failed).
+    """
+    normalized_id = _normalize_task_id(task_id)
+    if normalized_id is None:
+        return _result_error(ERROR_INVALID_TASK_ID)
+    if not _is_utf8_safe_str(method) or method not in _VALID_NOTIFICATION_METHODS:
+        return _result_error(ERROR_INVALID_VALUE)
+
+    with _store_lock:
+        error_code, current_task = _load_task(normalized_id)
+        if error_code is not None:
+            return _result_error(error_code)
+
+        if current_task.notification_method is not None:
+            logger.warning(
+                "Rejected set_notification_method_once: already set: task_id=%s existing=%s",
+                normalized_id,
+                current_task.notification_method,
+            )
+            return _result_error(ERROR_FIELD_LOCKED)
+
+        merged = asdict(current_task)
+        merged["notification_method"] = method
+
+        updated_task = _task_from_dict(normalized_id, merged)
+        if updated_task is None:
+            return _result_error(ERROR_INVALID_VALUE)
+
+        saved = _write_task_atomic(normalized_id, asdict(updated_task))
+        if not saved:
+            return _result_error(ERROR_SAVE_FAILED)
+
+    logger.info("Dev task notification method recorded: task_id=%s method=%s", normalized_id, method)
+    return DevTaskResult(success=True, task=updated_task, error_message=None, error_code=None)
+
+
+def finalize_decision(task_id: str, *, decision: str) -> DevTaskResult:
+    """Atomically record the worktree keep/discard decision, exactly once.
+
+    Fails, writing nothing, unless the task's current status is completed
+    or failed AND decision is not already set. This is the ONLY function
+    that ever sets decision/decided_at (update_task() rejects them
+    outright). Callers wanting to serialize concurrent keep/discard
+    attempts within a single process still need their own
+    concurrency guard around the surrounding remove_worktree() call (see
+    services.dev_task_decision) - this function only guarantees the
+    *persisted* decision is written at most once, which is what actually
+    matters once two attempts race here: whichever call reaches this
+    second sees the first one's decision already set and is rejected.
+    """
+    normalized_id = _normalize_task_id(task_id)
+    if normalized_id is None:
+        return _result_error(ERROR_INVALID_TASK_ID)
+    if not _is_utf8_safe_str(decision) or decision not in _VALID_DECISION_VALUES:
+        return _result_error(ERROR_INVALID_VALUE)
+
+    with _store_lock:
+        error_code, current_task = _load_task(normalized_id)
+        if error_code is not None:
+            return _result_error(error_code)
+
+        if current_task.status not in (DevTaskStatus.COMPLETED.value, DevTaskStatus.FAILED.value):
+            logger.warning(
+                "Rejected finalize_decision: not terminal: task_id=%s status=%s",
+                normalized_id,
+                current_task.status,
+            )
+            return _result_error(ERROR_FIELD_LOCKED)
+        if current_task.decision is not None:
+            logger.warning(
+                "Rejected finalize_decision: already decided: task_id=%s existing_decision=%s",
+                normalized_id,
+                current_task.decision,
+            )
+            return _result_error(ERROR_DECISION_ALREADY_MADE)
+
+        merged = asdict(current_task)
+        merged["decision"] = decision
+        merged["decided_at"] = _now_iso()
+
+        updated_task = _task_from_dict(normalized_id, merged)
+        if updated_task is None:
+            return _result_error(ERROR_INVALID_VALUE)
+
+        saved = _write_task_atomic(normalized_id, asdict(updated_task))
+        if not saved:
+            return _result_error(ERROR_SAVE_FAILED)
+
+    logger.info("Dev task decision recorded: task_id=%s decision=%s", normalized_id, decision)
+    return DevTaskResult(success=True, task=updated_task, error_message=None, error_code=None)
+
+
 def get_latest_task_for_user(user_id: int) -> DevTaskResult:
     if not _is_valid_snowflake_id(user_id):
         logger.warning("Rejected get_latest_task_for_user: invalid user_id=%r", user_id)
@@ -740,6 +1162,7 @@ def mark_running_tasks_failed_on_startup() -> int:
             failed_payload = asdict(task)
             failed_payload["status"] = DevTaskStatus.FAILED.value
             failed_payload["error_message"] = "Bot再起動により処理が中断されました。"
+            failed_payload["finished_at"] = datetime.now(timezone.utc).isoformat(timespec="microseconds")
 
             if _write_task_atomic(verified_task_id, failed_payload):
                 changed_count += 1

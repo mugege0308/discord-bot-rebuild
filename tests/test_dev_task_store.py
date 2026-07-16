@@ -30,6 +30,7 @@ class DevTaskStoreTestCase(unittest.TestCase):
             routing_reason="小規模な修正を示すキーワードを検出したため",
             engine_overridden=False,
             timeout_seconds=600,
+            base_branch="master",
         )
         params.update(overrides)
         return store.create_task(**params)
@@ -53,7 +54,16 @@ class DevTaskStoreTestCase(unittest.TestCase):
             "routing_reason": "reason",
             "engine_overridden": False,
             "timeout_seconds": 600,
+            "base_branch": "master",
             "error_message": None,
+            "branch_name": None,
+            "approved_at": None,
+            "started_at": None,
+            "finished_at": None,
+            "decision": None,
+            "decided_at": None,
+            "notification_method": None,
+            "result_summary": None,
         }
         payload.update(overrides)
         return payload
@@ -878,6 +888,418 @@ class DevTaskStoreTestCase(unittest.TestCase):
         self.assertIs(type(result.task.routed_engine), type(reloaded.routed_engine))
         self.assertEqual(result.task.routed_engine, reloaded.routed_engine)
         self.assertIs(type(result.task.status), type(reloaded.status))
+
+    # --- Phase 3: base_branch (create field, immutable) ---
+
+    def test_create_task_stores_base_branch(self):
+        result = self._create_task(base_branch="feature/x")
+        self.assertTrue(result.success)
+        self.assertEqual(result.task.base_branch, "feature/x")
+
+    def test_create_task_rejects_empty_base_branch(self):
+        result = self._create_task(base_branch="")
+        self.assertFalse(result.success)
+        self.assertEqual(result.error_code, store.ERROR_INVALID_VALUE)
+
+    def test_create_task_rejects_whitespace_only_base_branch(self):
+        result = self._create_task(base_branch="   ")
+        self.assertFalse(result.success)
+        self.assertEqual(result.error_code, store.ERROR_INVALID_VALUE)
+
+    def test_update_task_rejects_base_branch_change(self):
+        task = self._create_task(base_branch="master").task
+        result = store.update_task(task.task_id, base_branch="other")
+        self.assertFalse(result.success)
+        self.assertEqual(result.error_code, store.ERROR_IMMUTABLE_FIELD)
+        self.assertEqual(store.get_task(task.task_id).task.base_branch, "master")
+
+    # --- Phase 3 (round 2): audit fields are no longer generic update_task()
+    # targets at all - only the dedicated CAS functions below may touch them.
+
+    def test_update_task_rejects_branch_name_as_unknown_field(self):
+        task = self._create_task().task
+        result = store.update_task(task.task_id, branch_name="dev-task/xyz")
+        self.assertFalse(result.success)
+        self.assertEqual(result.error_code, store.ERROR_UNKNOWN_FIELD)
+
+    def test_update_task_rejects_approved_at_as_unknown_field(self):
+        task = self._create_task().task
+        result = store.update_task(task.task_id, approved_at="2026-07-15T00:00:00.000000+00:00")
+        self.assertFalse(result.success)
+        self.assertEqual(result.error_code, store.ERROR_UNKNOWN_FIELD)
+
+    def test_update_task_rejects_finished_at_as_unknown_field(self):
+        task = self._create_task().task
+        result = store.update_task(task.task_id, finished_at="2026-07-15T00:00:00.000000+00:00")
+        self.assertFalse(result.success)
+        self.assertEqual(result.error_code, store.ERROR_UNKNOWN_FIELD)
+
+    def test_update_task_rejects_notification_method_as_unknown_field(self):
+        task = self._create_task().task
+        result = store.update_task(task.task_id, notification_method="dm")
+        self.assertFalse(result.success)
+        self.assertEqual(result.error_code, store.ERROR_UNKNOWN_FIELD)
+
+    def test_update_task_rejects_decision_as_unknown_field(self):
+        task = self._create_task().task
+        result = store.update_task(task.task_id, decision="kept", decided_at="2026-07-15T00:00:00.000000+00:00")
+        self.assertFalse(result.success)
+        self.assertEqual(result.error_code, store.ERROR_UNKNOWN_FIELD)
+
+    # --- claim_task_for_execution: pending_approval -> running, atomically ---
+
+    def test_claim_task_for_execution_succeeds_from_pending_approval(self):
+        task = self._create_task().task
+        result = store.claim_task_for_execution(task.task_id, branch_name="dev-task/abc")
+        self.assertTrue(result.success)
+        self.assertEqual(result.task.status, store.DevTaskStatus.RUNNING.value)
+        self.assertEqual(result.task.branch_name, "dev-task/abc")
+        self.assertIsNotNone(result.task.approved_at)
+        self.assertIsNotNone(result.task.started_at)
+
+    def test_claim_task_for_execution_applies_engine_override(self):
+        task = self._create_task(routed_engine="codex").task
+        result = store.claim_task_for_execution(
+            task.task_id, branch_name="dev-task/abc", engine_override="claude"
+        )
+        self.assertTrue(result.success)
+        self.assertEqual(result.task.routed_engine, "claude")
+        self.assertTrue(result.task.engine_overridden)
+
+    def test_claim_task_for_execution_rejects_invalid_engine_override(self):
+        task = self._create_task().task
+        result = store.claim_task_for_execution(
+            task.task_id, branch_name="dev-task/abc", engine_override="gpt"
+        )
+        self.assertFalse(result.success)
+        self.assertEqual(result.error_code, store.ERROR_INVALID_VALUE)
+        self.assertEqual(store.get_task(task.task_id).task.status, store.DevTaskStatus.PENDING_APPROVAL.value)
+
+    def test_claim_task_for_execution_rejects_when_not_pending_approval(self):
+        task = self._create_task().task
+        store.claim_task_for_execution(task.task_id, branch_name="dev-task/abc")
+
+        result = store.claim_task_for_execution(task.task_id, branch_name="dev-task/abc-again")
+        self.assertFalse(result.success)
+        self.assertEqual(result.error_code, store.ERROR_INVALID_TRANSITION)
+
+    def test_claim_task_for_execution_is_all_or_nothing_race_safe(self):
+        # Simulates two concurrent approvals of the SAME task_id: only the
+        # first claim may succeed; the second must be rejected outright,
+        # without touching anything the first one wrote.
+        task = self._create_task().task
+        first = store.claim_task_for_execution(task.task_id, branch_name="dev-task/first")
+        second = store.claim_task_for_execution(task.task_id, branch_name="dev-task/second")
+
+        self.assertTrue(first.success)
+        self.assertFalse(second.success)
+        self.assertEqual(second.error_code, store.ERROR_INVALID_TRANSITION)
+        self.assertEqual(store.get_task(task.task_id).task.branch_name, "dev-task/first")
+
+    def test_claim_task_for_execution_rejects_empty_branch_name(self):
+        task = self._create_task().task
+        result = store.claim_task_for_execution(task.task_id, branch_name="")
+        self.assertFalse(result.success)
+        self.assertEqual(result.error_code, store.ERROR_INVALID_VALUE)
+
+    def test_claim_task_for_execution_rejects_invalid_task_id(self):
+        result = store.claim_task_for_execution("not-a-uuid", branch_name="dev-task/abc")
+        self.assertFalse(result.success)
+        self.assertEqual(result.error_code, store.ERROR_INVALID_TASK_ID)
+
+    # --- fail_pending_approval: timeout/cancel/pre-claim rejection ---
+
+    def test_fail_pending_approval_succeeds_from_pending_approval(self):
+        task = self._create_task().task
+        result = store.fail_pending_approval(task.task_id, reason="承認が時間内に行われませんでした。")
+        self.assertTrue(result.success)
+        self.assertEqual(result.task.status, store.DevTaskStatus.FAILED.value)
+        self.assertEqual(result.task.error_message, "承認が時間内に行われませんでした。")
+        self.assertIsNotNone(result.task.finished_at)
+
+    def test_fail_pending_approval_never_fails_an_already_claimed_task(self):
+        # This is the exact race Codex flagged: on_timeout()/cancel firing
+        # after a concurrent approval has already claimed (and started
+        # running) the same task must never flip it to failed.
+        task = self._create_task().task
+        claim_result = store.claim_task_for_execution(task.task_id, branch_name="dev-task/abc")
+        self.assertTrue(claim_result.success)
+
+        result = store.fail_pending_approval(task.task_id, reason="遅すぎたタイムアウト処理")
+        self.assertFalse(result.success)
+        self.assertEqual(result.error_code, store.ERROR_INVALID_TRANSITION)
+        self.assertEqual(store.get_task(task.task_id).task.status, store.DevTaskStatus.RUNNING.value)
+
+    def test_fail_pending_approval_rejects_empty_reason(self):
+        task = self._create_task().task
+        result = store.fail_pending_approval(task.task_id, reason="")
+        self.assertFalse(result.success)
+        self.assertEqual(result.error_code, store.ERROR_INVALID_VALUE)
+
+    # --- finish_task: running -> completed/failed, atomically ---
+
+    def test_finish_task_success_sets_completed_and_result_summary(self):
+        task = self._create_task().task
+        store.claim_task_for_execution(task.task_id, branch_name="dev-task/abc")
+
+        result = store.finish_task(task.task_id, success=True, result_summary="0 files changed")
+        self.assertTrue(result.success)
+        self.assertEqual(result.task.status, store.DevTaskStatus.COMPLETED.value)
+        self.assertEqual(result.task.result_summary, "0 files changed")
+        self.assertIsNotNone(result.task.finished_at)
+        self.assertIsNone(result.task.error_message)
+
+    def test_finish_task_failure_sets_failed_and_error_message(self):
+        task = self._create_task().task
+        store.claim_task_for_execution(task.task_id, branch_name="dev-task/abc")
+
+        result = store.finish_task(task.task_id, success=False, error_message="ダミー実行に失敗しました。")
+        self.assertTrue(result.success)
+        self.assertEqual(result.task.status, store.DevTaskStatus.FAILED.value)
+        self.assertEqual(result.task.error_message, "ダミー実行に失敗しました。")
+        self.assertIsNone(result.task.result_summary)
+
+    def test_finish_task_rejects_when_not_running(self):
+        task = self._create_task().task  # still pending_approval
+        result = store.finish_task(task.task_id, success=True)
+        self.assertFalse(result.success)
+        self.assertEqual(result.error_code, store.ERROR_INVALID_TRANSITION)
+
+    def test_finish_task_rejects_success_with_error_message(self):
+        task = self._create_task().task
+        store.claim_task_for_execution(task.task_id, branch_name="dev-task/abc")
+        result = store.finish_task(task.task_id, success=True, error_message="matters not")
+        self.assertFalse(result.success)
+        self.assertEqual(result.error_code, store.ERROR_INVALID_VALUE)
+
+    def test_finish_task_rejects_failure_without_error_message(self):
+        task = self._create_task().task
+        store.claim_task_for_execution(task.task_id, branch_name="dev-task/abc")
+        result = store.finish_task(task.task_id, success=False)
+        self.assertFalse(result.success)
+        self.assertEqual(result.error_code, store.ERROR_INVALID_VALUE)
+
+    def test_finish_task_cannot_double_finish(self):
+        task = self._create_task().task
+        store.claim_task_for_execution(task.task_id, branch_name="dev-task/abc")
+        first = store.finish_task(task.task_id, success=True, result_summary="ok")
+        self.assertTrue(first.success)
+
+        second = store.finish_task(task.task_id, success=False, error_message="too late")
+        self.assertFalse(second.success)
+        self.assertEqual(second.error_code, store.ERROR_INVALID_TRANSITION)
+        self.assertEqual(store.get_task(task.task_id).task.status, store.DevTaskStatus.COMPLETED.value)
+
+    # --- set_notification_method_once: decoupled from finish_task() ---
+
+    def test_set_notification_method_once_succeeds_after_finish(self):
+        task = self._create_task().task
+        store.claim_task_for_execution(task.task_id, branch_name="dev-task/abc")
+        store.finish_task(task.task_id, success=True, result_summary="ok")
+
+        result = store.set_notification_method_once(task.task_id, method="dm")
+        self.assertTrue(result.success)
+        self.assertEqual(result.task.notification_method, "dm")
+
+    def test_set_notification_method_once_rejects_second_call(self):
+        task = self._create_task().task
+        store.claim_task_for_execution(task.task_id, branch_name="dev-task/abc")
+        store.finish_task(task.task_id, success=True, result_summary="ok")
+        store.set_notification_method_once(task.task_id, method="dm")
+
+        result = store.set_notification_method_once(task.task_id, method="channel")
+        self.assertFalse(result.success)
+        self.assertEqual(result.error_code, store.ERROR_FIELD_LOCKED)
+        self.assertEqual(store.get_task(task.task_id).task.notification_method, "dm")
+
+    def test_set_notification_method_once_rejects_invalid_value(self):
+        task = self._create_task().task
+        store.claim_task_for_execution(task.task_id, branch_name="dev-task/abc")
+        store.finish_task(task.task_id, success=True, result_summary="ok")
+
+        result = store.set_notification_method_once(task.task_id, method="carrier_pigeon")
+        self.assertFalse(result.success)
+        self.assertEqual(result.error_code, store.ERROR_INVALID_VALUE)
+
+    def test_finish_task_does_not_set_notification_method(self):
+        # finish_task() must never itself claim a delivery method - that is
+        # only known after the notification is actually attempted.
+        task = self._create_task().task
+        store.claim_task_for_execution(task.task_id, branch_name="dev-task/abc")
+        result = store.finish_task(task.task_id, success=True, result_summary="ok")
+        self.assertIsNone(result.task.notification_method)
+
+    # --- finalize_decision: terminal-only, once ---
+
+    def test_finalize_decision_succeeds_when_completed(self):
+        task = self._create_task().task
+        store.claim_task_for_execution(task.task_id, branch_name="dev-task/abc")
+        store.finish_task(task.task_id, success=True, result_summary="ok")
+
+        result = store.finalize_decision(task.task_id, decision="kept")
+        self.assertTrue(result.success)
+        self.assertEqual(result.task.decision, "kept")
+        self.assertIsNotNone(result.task.decided_at)
+
+    def test_finalize_decision_succeeds_when_failed(self):
+        task = self._create_task().task
+        store.claim_task_for_execution(task.task_id, branch_name="dev-task/abc")
+        store.finish_task(task.task_id, success=False, error_message="失敗理由")
+
+        result = store.finalize_decision(task.task_id, decision="discarded")
+        self.assertTrue(result.success)
+
+    def test_finalize_decision_rejects_while_pending_approval(self):
+        task = self._create_task().task
+        result = store.finalize_decision(task.task_id, decision="kept")
+        self.assertFalse(result.success)
+        self.assertEqual(result.error_code, store.ERROR_FIELD_LOCKED)
+
+    def test_finalize_decision_rejects_while_running(self):
+        task = self._create_task().task
+        store.claim_task_for_execution(task.task_id, branch_name="dev-task/abc")
+        result = store.finalize_decision(task.task_id, decision="kept")
+        self.assertFalse(result.success)
+        self.assertEqual(result.error_code, store.ERROR_FIELD_LOCKED)
+
+    def test_finalize_decision_rejects_invalid_value(self):
+        task = self._create_task().task
+        store.claim_task_for_execution(task.task_id, branch_name="dev-task/abc")
+        store.finish_task(task.task_id, success=True, result_summary="ok")
+
+        result = store.finalize_decision(task.task_id, decision="deleted_forever")
+        self.assertFalse(result.success)
+        self.assertEqual(result.error_code, store.ERROR_INVALID_VALUE)
+
+    def test_finalize_decision_rejects_second_call(self):
+        task = self._create_task().task
+        store.claim_task_for_execution(task.task_id, branch_name="dev-task/abc")
+        store.finish_task(task.task_id, success=True, result_summary="ok")
+        store.finalize_decision(task.task_id, decision="kept")
+
+        result = store.finalize_decision(task.task_id, decision="discarded")
+        self.assertFalse(result.success)
+        self.assertEqual(result.error_code, store.ERROR_DECISION_ALREADY_MADE)
+        self.assertEqual(store.get_task(task.task_id).task.decision, "kept")
+
+    def test_finalize_decision_concurrent_keep_and_discard_only_one_wins(self):
+        task = self._create_task().task
+        store.claim_task_for_execution(task.task_id, branch_name="dev-task/abc")
+        store.finish_task(task.task_id, success=True, result_summary="ok")
+
+        keep_result = store.finalize_decision(task.task_id, decision="kept")
+        discard_result = store.finalize_decision(task.task_id, decision="discarded")
+
+        self.assertTrue(keep_result.success)
+        self.assertFalse(discard_result.success)
+        self.assertEqual(store.get_task(task.task_id).task.decision, "kept")
+
+    def test_get_task_rejects_stored_decision_without_decided_at(self):
+        task_id = str(uuid.uuid4())
+        self._write_raw(
+            task_id,
+            self._valid_payload(
+                task_id, status=store.DevTaskStatus.COMPLETED.value, decision="kept", decided_at=None
+            ),
+        )
+        result = store.get_task(task_id)
+        self.assertFalse(result.success)
+        self.assertEqual(result.error_code, store.ERROR_CORRUPTED)
+
+    def test_get_task_rejects_stored_decided_at_without_decision(self):
+        task_id = str(uuid.uuid4())
+        self._write_raw(
+            task_id,
+            self._valid_payload(
+                task_id,
+                status=store.DevTaskStatus.COMPLETED.value,
+                decision=None,
+                decided_at="2026-07-15T01:00:00.000000+00:00",
+            ),
+        )
+        result = store.get_task(task_id)
+        self.assertFalse(result.success)
+        self.assertEqual(result.error_code, store.ERROR_CORRUPTED)
+
+    def test_get_task_rejects_invalid_notification_method_in_record(self):
+        task_id = str(uuid.uuid4())
+        self._write_raw(task_id, self._valid_payload(task_id, notification_method="carrier_pigeon"))
+        result = store.get_task(task_id)
+        self.assertFalse(result.success)
+        self.assertEqual(result.error_code, store.ERROR_CORRUPTED)
+
+    def test_get_task_accepts_completed_record_without_result_summary(self):
+        # result_summary is optional even for a completed record (e.g. an
+        # older record from before this field existed) - only forbidden
+        # outright on non-completed statuses.
+        task_id = str(uuid.uuid4())
+        self._write_raw(
+            task_id,
+            self._valid_payload(task_id, status=store.DevTaskStatus.COMPLETED.value, result_summary=None),
+        )
+        result = store.get_task(task_id)
+        self.assertTrue(result.success)
+
+    def test_get_task_rejects_pending_record_with_result_summary(self):
+        task_id = str(uuid.uuid4())
+        self._write_raw(
+            task_id,
+            self._valid_payload(
+                task_id,
+                status=store.DevTaskStatus.PENDING_APPROVAL.value,
+                result_summary="not allowed yet",
+            ),
+        )
+        result = store.get_task(task_id)
+        self.assertFalse(result.success)
+        self.assertEqual(result.error_code, store.ERROR_CORRUPTED)
+
+    def test_get_task_rejects_missing_base_branch_field(self):
+        task_id = str(uuid.uuid4())
+        payload = self._valid_payload(task_id)
+        del payload["base_branch"]
+        self._write_raw(task_id, payload)
+        result = store.get_task(task_id)
+        self.assertFalse(result.success)
+        self.assertEqual(result.error_code, store.ERROR_CORRUPTED)
+
+    # --- Phase 3: startup recovery also records finished_at ---
+
+    def test_mark_running_failed_on_startup_sets_finished_at(self):
+        task = self._create_task().task
+        store.update_task(task.task_id, status=store.DevTaskStatus.RUNNING.value)
+
+        store.mark_running_tasks_failed_on_startup()
+
+        after = store.get_task(task.task_id).task
+        self.assertEqual(after.status, store.DevTaskStatus.FAILED.value)
+        self.assertIsNotNone(after.finished_at)
+
+    # --- Phase 3: full happy-path lifecycle through the new fields ---
+
+    def test_full_lifecycle_with_phase3_fields(self):
+        task = self._create_task(base_branch="master").task
+
+        claim_result = store.claim_task_for_execution(
+            task.task_id, branch_name=f"dev-task/{task.task_id}"
+        )
+        self.assertTrue(claim_result.success)
+
+        finish_result = store.finish_task(task.task_id, success=True, result_summary="0 files changed")
+        self.assertTrue(finish_result.success)
+
+        notify_result = store.set_notification_method_once(task.task_id, method="dm")
+        self.assertTrue(notify_result.success)
+
+        decide_result = store.finalize_decision(task.task_id, decision="discarded")
+        self.assertTrue(decide_result.success)
+
+        final = store.get_task(task.task_id).task
+        self.assertEqual(final.status, store.DevTaskStatus.COMPLETED.value)
+        self.assertEqual(final.branch_name, f"dev-task/{task.task_id}")
+        self.assertEqual(final.result_summary, "0 files changed")
+        self.assertEqual(final.decision, "discarded")
+        self.assertEqual(final.notification_method, "dm")
 
 
 if __name__ == "__main__":
