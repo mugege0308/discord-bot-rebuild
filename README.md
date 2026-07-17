@@ -79,7 +79,7 @@ CLAUDE_REMOTE_STOP_TIMEOUT_SECONDS=10
 - URL取得前に終了する: 対象PCで同じフォルダから `claude remote-control --name "初号ちゃん"` を直接実行し、表示されるログイン・信頼・機能提供エラーを確認します。
 - 停止に失敗する: 対象PCのタスクマネージャーで、Botが起動したClaude Codeプロセスの状態を確認します。
 
-## 開発タスク機能（Phase 3・ダミー実行）
+## 開発タスク機能（Phase 4A-v2・隔離コピーによるClaude Code試験実行）
 
 `DEV_TASK_ALLOWED_USER_IDS` に登録したユーザーは、Discordから開発タスクを起票できます。`PC_CONTROL_ALLOWED_USER_IDS` とは別の許可リストです。
 
@@ -89,9 +89,40 @@ CLAUDE_REMOTE_STOP_TIMEOUT_SECONDS=10
 /dev_task_stop
 ```
 
-**現時点ではダミー実行です。** `/dev_task` で起票すると、内容に応じてCodex/Claudeへの割り振りが判定され、承認ボタン付きのメッセージが表示されます。「承認して実行」を押すと、専用の`work/<タスクID>`にgit worktreeを作成し、短時間待機した後に`git status`/`git diff`を読み取り専用で確認するだけの処理を行います。**実際のCodex CLIやClaude Code CLIは呼び出しません。** 同時に実行できるタスクは1件だけで、他のタスクが実行中の場合は新しい承認を拒否します（キューはありません）。
+`/dev_task` で起票すると、内容に応じてCodex/Claudeへの割り振りが判定され、承認ボタン付きのメッセージが表示されます。**現時点では、承認してもCodex・Claudeのどちらのエンジンも実際には実行されません。** 「承認して実行」を押すと、エンジンによらず安全な理由付きで失敗として記録されます（worktreeもサンドボックスも一切作成されません）。これは意図的な暫定状態です:
 
-結果はDiscordの15分の応答制限に依存せず、起票者へのDM、それが失敗した場合は`DEV_TASK_RESULT_CHANNEL_ID`で指定したチャンネルへ通知します。どちらも失敗した場合はログにのみ記録され、Bot自体は落ちません。結果には作業ブランチ名やダミー実行の要約が含まれますが、内部の絶対パスやGitの生のエラー出力はDiscordへ表示しません。結果メッセージには「保持」「破棄」ボタンがあり、破棄を選ぶとworktreeを削除します。別ブランチのworktreeが登録されている場合や安全確認に失敗した場合は、破棄ボタンを押しても強制削除しません。
+- 旧方式（タスク専用git worktree内でClaude Codeを実行する方式）は廃止し、二度と実Claude実行には使いません。
+- 新方式（後述する隔離コピー・サンドボックス方式）は実装済みですが、この`/dev_task`承認フローへはまだ接続していません。理由は、結果ビューの「保持」「破棄」ボタンが今もgit worktreeの削除（`services.dev_worktree.remove_worktree`）だけを呼び出す設計のためです。中途半端に接続すると、サンドボックスに対して「破棄」を押してもサンドボックス自体は削除されず、Storeにだけ「破棄済み」と記録される、気づきにくい放置バグを生みます。この接続（結果ビューをサンドボックス対応させること）は今後のフェーズの課題です。
+
+### 隔離コピー（isolated copy）によるClaude Code試験実行
+
+`/dev_task`とは別に、Claude Codeをheadlessで安全に試験実行するための独立したモジュール一式があります（現時点ではDiscordから直接は呼び出せず、手動/スクリプトから利用する想定です）。
+
+1. `services.dev_copy_workspace.create_sandbox(task_id)` が、本体リポジトリから許可された拡張子・ファイル名だけを`DEV_TASK_SANDBOX_ROOT/<task_id>`へコピーします。`.git`・`.env`（`.env.example`を除く）・`data`/`outputs`/`logs`/`work`・認証情報・キャッシュ・`.claude`/`.codex`など本体固有のディレクトリは除外します。symlink/junction/reparse pointは追跡もコピーもしません。ハードリンク共有がないこと、本体と独立した実体であることをコピー時・検証時それぞれで確認します。`DEV_TASK_SANDBOX_ROOT`が本体リポジトリと同一・その配下・その親（結果的に本体を包含する配置）になっている場合は、`Path.resolve()`で正規化したうえで（大文字小文字や区切り文字の違い、表記ゆれも吸収します）コピー開始前に安全に拒否します（`create_sandbox`だけでなく、Claude起動直前に再検証する`services.claude_headless.run`側の`verify_sandbox_safe`、および`discard_sandbox`でも同じ判定が働きます）。
+2. `services.claude_headless.run(task_id=..., prompt_text=..., timeout_seconds=...)` が、Claude起動の直前にサンドボックスを再検証し、そのサンドボックスだけをカレントディレクトリとしてClaude Code CLIを1回だけheadless実行します。タスク内容は標準入力で渡し、シェル展開やコマンド連結は一切行いません。
+3. 権限は`--permission-mode dontAsk`＋`--tools Read,Edit,Write,Glob,Grep`（Bash/PowerShell/WebFetch/WebSearch/MCP/slash command/browser連携はすべて利用不可）に固定しています。`--dangerously-skip-permissions`/`bypassPermissions`は使用しません。`--bare --strict-mcp-config --disable-slash-commands --no-chrome --no-session-persistence`も付与します。
+4. Botプロセスの環境変数は継承しません。`SystemRoot`/`WINDIR`/`PATH`/`TEMP`/`TMP`のみの許可リストから環境変数を構築します。`DISCORD_TOKEN`やAPIキー・トークン・AWS/GitHub/SSH認証情報などは子プロセスへ絶対に渡しません。Claude自体の認証にAPIキーが必要な場合は`CLAUDE_HEADLESS_ANTHROPIC_API_KEY`を専用に設定してください（Botの他の環境変数からの継承はしません）。
+5. 変更確認はgitを使わず、コピー時に記録したSHA256ハッシュとの比較で行います（`services.dev_copy_workspace.diff_sandbox_against_baseline`）。
+6. Claude実行中またはプロセス終了未確認の間は、サンドボックスの破棄を拒否します（`services.dev_copy_workspace.discard_sandbox`）。破棄可能になるのは、OSプロセス終了・子プロセス終了確認・標準入力書き込みスレッド終了・標準出力/標準エラー読み取りスレッド終了・結果保存がすべて完了した後だけです。
+7. 本体への自動反映・自動commit・自動merge・自動patch適用は一切行いません。人間が変更内容を確認したうえで、保持するか破棄するかを判断してください。
+
+`.env`設定:
+
+```env
+CLAUDE_HEADLESS_ENABLED=false
+CLAUDE_CLI_PATH=C:\Users\PC_User\.local\bin\claude.exe
+CLAUDE_HEADLESS_TIMEOUT_SECONDS=1800
+CLAUDE_HEADLESS_MAX_OUTPUT_BYTES=1048576
+CLAUDE_HEADLESS_ANTHROPIC_API_KEY=
+CLAUDE_HEADLESS_WORKSPACE_MODE=isolated_copy
+DEV_TASK_SANDBOX_ROOT=C:\Users\PC_User\Documents\Codex\dev-task-sandboxes
+DEV_TASK_SANDBOX_MAX_FILES=5000
+DEV_TASK_SANDBOX_MAX_TOTAL_BYTES=524288000
+```
+
+`CLAUDE_HEADLESS_ENABLED`が未設定・不正な値の場合は無効として扱われ、`CLAUDE_HEADLESS_WORKSPACE_MODE`が`isolated_copy`以外の場合や`DEV_TASK_SANDBOX_ROOT`が未設定の場合も安全に拒否されます。いずれもBot全体の起動には影響しません。`CLAUDE_CLI_PATH`が未設定・存在しない・ディレクトリ・許可されていない拡張子（Windowsでは`.exe`/`.cmd`/`.bat`のみ）の場合も同様です。`--bare`使用によりOAuth/keychain認証は使えないため、実際にClaude Codeを試験実行する前に、ログイン済みのOAuthセッションではなく`CLAUDE_HEADLESS_ANTHROPIC_API_KEY`（APIキー）を用意する必要があります。
+
+結果はDiscordの15分の応答制限に依存せず、起票者へのDM、それが失敗した場合は`DEV_TASK_RESULT_CHANNEL_ID`で指定したチャンネルへ通知します。どちらも失敗した場合はログにのみ記録され、Bot自体は落ちません。結果メッセージには「保持」「破棄」ボタンがあり、破棄を選ぶとworktreeを削除します（現時点では上記のとおりworktree専用で、サンドボックスには未接続です）。別ブランチのworktreeが登録されている場合や安全確認に失敗した場合は、破棄ボタンを押しても強制削除しません。
 
 承認ボタン・結果ボタンはどちらも起票者本人だけが操作できます。**Bot再起動後、これらのボタンは無効になります。** 再起動時に実行中だったタスクは自動的に失敗として記録されますが（Phase 1の起動時リカバリ）、承認待ちのまま再起動をまたいだタスクは、そのボタンが使えなくなるため`/dev_task_status`で状態を確認したうえで、必要なら`/dev_task`から新たに起票し直してください。
 

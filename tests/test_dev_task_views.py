@@ -505,9 +505,18 @@ class SendResultNotificationTestCase(unittest.IsolatedAsyncioTestCase):
 
 
 class StartDevTaskExecutionTestCase(unittest.IsolatedAsyncioTestCase):
-    """Integration-style tests exercising the full approve -> worktree ->
-    dummy-execute -> notify -> persist pipeline against a real temp git
-    repo, with only the Discord-facing client faked out.
+    """Integration-style tests exercising the full approve -> (safely
+    rejected) -> notify -> persist pipeline against a real temp git repo,
+    with only the Discord-facing client faked out.
+
+    Phase 4A-v2: execute_approved_task() safely rejects every engine right
+    now, for every value of CLAUDE_HEADLESS_ENABLED - see
+    services.dev_task_executor's module-level note on why real Claude
+    execution (the isolated-copy sandbox mechanism) is not wired into this
+    live pipeline yet. These tests confirm that rejection happens
+    consistently, before any worktree is ever created, and that the
+    Discord-facing notification/Store bookkeeping around that rejection
+    still works correctly.
     """
 
     def setUp(self):
@@ -531,11 +540,6 @@ class StartDevTaskExecutionTestCase(unittest.IsolatedAsyncioTestCase):
         store.DATA_DIR = self._original_data_dir
         wt.REPO_ROOT = self._original_repo_root
         self._tmp_dir.cleanup()
-        # A test that swaps out dev_task_executor.run_dummy_execution itself
-        # (e.g. test_full_flow_dummy_execution_failure_still_offers_result_view)
-        # bypasses that function's own release_slot() finally-block entirely,
-        # which would otherwise leak the module-level execution slot as
-        # permanently reserved into every later test in this process.
         dev_task_executor._current_task_id = None
         dev_task_executor._current_asyncio_task = None
         if dev_task_executor._execution_lock.locked():
@@ -547,7 +551,7 @@ class StartDevTaskExecutionTestCase(unittest.IsolatedAsyncioTestCase):
             guild_id=333,
             channel_id=444,
             prompt_text="バグを修正して",
-            routed_engine="codex",
+            routed_engine="claude",
             routing_reason="test",
             engine_overridden=False,
             timeout_seconds=600,
@@ -556,34 +560,44 @@ class StartDevTaskExecutionTestCase(unittest.IsolatedAsyncioTestCase):
         params.update(overrides)
         return store.create_task(**params).task
 
-    async def test_full_flow_success(self):
+    async def test_full_flow_claude_disabled_is_rejected_and_notified(self):
         task = self._create_task()
         user = FakeUser(REQUESTER_ID)
         client = FakeClient(user=user)
 
-        with mock.patch("services.dev_task_executor._DUMMY_EXECUTION_SECONDS", 0.01):
+        with mock.patch.dict("os.environ", {"CLAUDE_HEADLESS_ENABLED": "false"}):
             await dev_task_view.start_dev_task_execution(client, task.task_id)
 
         final = store.get_task(task.task_id).task
-        self.assertEqual(final.status, store.DevTaskStatus.COMPLETED.value)
-        self.assertIsNotNone(final.branch_name)
-        self.assertIsNotNone(final.result_summary)
+        self.assertEqual(final.status, store.DevTaskStatus.FAILED.value)
+        self.assertIsNotNone(final.error_message)
         self.assertEqual(final.notification_method, "dm")
         self.assertEqual(len(user.sent_messages), 1)
         content = user.sent_messages[0][0]
         self.assertNotIn(str(self.repo_root), content)  # no raw absolute path leaked
-        self.assertIn("ダミー実行", content)
 
         info = wt.get_worktree_info(task.task_id).info
-        self.assertTrue(info.path_entry_exists)
-        self.assertTrue(info.registered_in_git_worktree)
+        self.assertEqual(info.consistency, wt.CONSISTENCY_NOT_FOUND)
 
-    async def test_full_flow_worktree_creation_failure(self):
-        task = self._create_task(base_branch="does-not-exist-branch")
+        # No Result View offered - no worktree/sandbox was ever created.
+        sent_view = user.sent_messages[0][1]
+        self.assertIsNone(sent_view)
+
+    async def test_full_flow_claude_enabled_is_still_rejected_before_worktree_creation(self):
+        # Enabling CLAUDE_HEADLESS_ENABLED must not change this live
+        # pipeline's behavior - the isolated-copy sandbox mechanism is
+        # intentionally not wired into it yet (see the module-level note
+        # in services.dev_task_executor).
+        task = self._create_task()
         user = FakeUser(REQUESTER_ID)
         client = FakeClient(user=user)
 
-        await dev_task_view.start_dev_task_execution(client, task.task_id)
+        with mock.patch.dict("os.environ", {"CLAUDE_HEADLESS_ENABLED": "true"}), mock.patch(
+            "services.dev_task_executor.reserve_slot", new=mock.AsyncMock()
+        ) as reserve_slot_mock:
+            await dev_task_view.start_dev_task_execution(client, task.task_id)
+
+        reserve_slot_mock.assert_not_called()
 
         final = store.get_task(task.task_id).task
         self.assertEqual(final.status, store.DevTaskStatus.FAILED.value)
@@ -593,52 +607,45 @@ class StartDevTaskExecutionTestCase(unittest.IsolatedAsyncioTestCase):
         info = wt.get_worktree_info(task.task_id).info
         self.assertEqual(info.consistency, wt.CONSISTENCY_NOT_FOUND)
 
-        # No Result View offered when no worktree was ever created.
         sent_view = user.sent_messages[0][1]
         self.assertIsNone(sent_view)
 
-    async def test_full_flow_dummy_execution_failure_still_offers_result_view(self):
-        task = self._create_task()
+    async def test_full_flow_codex_engine_is_rejected_before_worktree_creation(self):
+        task = self._create_task(routed_engine="codex")
         user = FakeUser(REQUESTER_ID)
         client = FakeClient(user=user)
 
-        failed_execution = dev_task_executor.DevTaskExecutionResult(
-            success=False,
-            changed_file_count=0,
-            diff_summary="",
-            duration_seconds=0.5,
-            error_message="ダミー実行中に問題が発生しました。",
-        )
         with mock.patch(
-            "services.dev_task_executor.run_dummy_execution",
-            new=mock.AsyncMock(return_value=failed_execution),
-        ):
+            "services.dev_task_executor.reserve_slot", new=mock.AsyncMock()
+        ) as reserve_slot_mock:
             await dev_task_view.start_dev_task_execution(client, task.task_id)
+
+        # Rejected before ever reserving the execution slot or touching a
+        # worktree - never falls back to Claude, never falls back to dummy
+        # execution.
+        reserve_slot_mock.assert_not_called()
 
         final = store.get_task(task.task_id).task
         self.assertEqual(final.status, store.DevTaskStatus.FAILED.value)
-        self.assertIsNotNone(final.branch_name)
-
-        sent_view = user.sent_messages[0][1]
-        self.assertIsInstance(sent_view, dev_task_view.DevTaskResultView)
+        self.assertIsNotNone(final.error_message)
+        self.assertNotEqual(final.error_message, "")
 
         info = wt.get_worktree_info(task.task_id).info
-        self.assertTrue(info.path_entry_exists)  # worktree left in place, not auto-deleted
+        self.assertEqual(info.consistency, wt.CONSISTENCY_NOT_FOUND)
 
-    async def test_full_flow_rejects_when_executor_busy(self):
-        task = self._create_task()
+    async def test_full_flow_engine_override_to_codex_is_rejected(self):
+        # Even though the task itself was routed to claude, an approval-time
+        # override to codex must still be safely rejected - never executed.
+        task = self._create_task(routed_engine="claude")
         user = FakeUser(REQUESTER_ID)
         client = FakeClient(user=user)
 
-        # execute_approved_task() calls reserve_slot() directly (checking
-        # the real _execution_lock), never the public is_busy() accessor -
-        # so reserve_slot() itself, not is_busy(), is what must be faked to
-        # simulate "another dev task is already executing".
-        with mock.patch(
-            "services.dev_task_executor.reserve_slot", new=mock.AsyncMock(return_value=False)
-        ):
-            await dev_task_view.start_dev_task_execution(client, task.task_id)
+        with mock.patch.dict("os.environ", {"CLAUDE_HEADLESS_ENABLED": "true"}), mock.patch(
+            "services.dev_task_executor.reserve_slot", new=mock.AsyncMock()
+        ) as reserve_slot_mock:
+            await dev_task_view.start_dev_task_execution(client, task.task_id, engine_override="codex")
 
+        reserve_slot_mock.assert_not_called()
         final = store.get_task(task.task_id).task
         self.assertEqual(final.status, store.DevTaskStatus.FAILED.value)
         info = wt.get_worktree_info(task.task_id).info

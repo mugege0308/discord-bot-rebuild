@@ -8,18 +8,33 @@ from pathlib import Path
 
 from services import dev_task_store as store
 from services.dev_git_runner import run_git
-from services.dev_worktree import create_worktree
+from services.dev_task_router import DevTaskEngine
 
 
 logger = logging.getLogger("secretary-bot.dev_task_executor")
 
-# Phase 3 never runs Codex or Claude Code - this module only ever performs a
-# short, read-only, no-op "execution" so the rest of the pipeline (worktree
-# lifecycle, Discord approval/result UI, notification delivery) can be built
-# and tested end-to-end before any real headless engine exists. It never
-# writes to the worktree, never uses shell=True, and only ever runs `git
-# status`/`git diff` (both read-only) via services.dev_git_runner.run_git(),
-# the same hardened subprocess wrapper Phase 2 uses.
+# Phase 3 never ran Codex or Claude Code - it only performed a short,
+# read-only, no-op "execution" so the rest of the pipeline (worktree
+# lifecycle, Discord approval/result UI, notification delivery) could be
+# built and tested end-to-end before any real headless engine existed. That
+# dummy path (run_dummy_execution()/reserve_slot()/release_slot()/
+# cancel_dummy_execution_and_wait()) is kept exactly as-is below - still
+# fully functional and still covered by its own tests.
+#
+# Phase 4A pivoted real Claude Code execution away from a git worktree of
+# the real repository to a disposable, allowlisted isolated-copy sandbox
+# (services.dev_copy_workspace + services.claude_headless) that shares
+# nothing - not even a hardlink - with the real repository or its secrets.
+# That mechanism is deliberately NOT wired into this Store-backed
+# execute_approved_task() pipeline yet: doing so naively would also require
+# updating the keep/discard Result View (services.dev_task_decision /
+# views.dev_task) to call services.dev_copy_workspace.discard_sandbox()
+# instead of services.dev_worktree.remove_worktree() for a sandbox-based
+# task - without that, a sandbox could be silently left orphaned on disk
+# forever while the Store still records "discarded". That follow-up is
+# left to a future phase; until then, execute_approved_task() safely
+# rejects every engine (see _engine_gate_failure_reason()), and real
+# execution is only ever exercised directly via services.claude_headless.run().
 _DUMMY_EXECUTION_SECONDS = 2.0
 _GIT_READ_TIMEOUT_SECONDS = 30.0
 _MAX_DIFF_SUMMARY_LENGTH = 1500
@@ -49,6 +64,14 @@ class DevTaskExecutionResult:
     duration_seconds: float
     error_message: str | None
     cancelled: bool = False
+    # Additional fields some future execution mechanism may want to
+    # populate - always the dummy-path defaults (False/None/False/False/
+    # False) when this result came from run_dummy_execution().
+    timed_out: bool = False
+    returncode: int | None = None
+    stdout_truncated: bool = False
+    stderr_truncated: bool = False
+    manual_review_required: bool = False
 
 
 @dataclass(frozen=True)
@@ -136,12 +159,6 @@ async def cancel_dummy_execution_and_wait(task_id: str, *, timeout: float = 10.0
     of whether the wait completed before `timeout` - since the request
     itself was made either way; a timeout is logged so an operator can
     notice if the dummy executor is ever stuck.
-
-    Named specifically for Phase 3's dummy execution. A future Phase 4+
-    stop of a REAL headless engine process is a fundamentally different
-    operation (terminating an actual OS process, not cancelling an asyncio
-    Task) and must use its own, differently-named API rather than being
-    folded into this one.
     """
     if task_id != _current_task_id or _current_asyncio_task is None:
         return False
@@ -156,6 +173,33 @@ async def cancel_dummy_execution_and_wait(task_id: str, *, timeout: float = 10.0
         )
     except Exception:
         logger.exception("Unexpected error while waiting for cancelled dummy execution: task_id=%s", task_id)
+    return True
+
+
+async def cancel_current_execution_and_wait(task_id: str, *, timeout: float = 30.0) -> bool:
+    """Request cancellation of whichever execution is currently running for
+    `task_id` and wait for it to actually finish observing the
+    cancellation before returning. This is what /dev_task_stop calls.
+
+    Currently identical to cancel_dummy_execution_and_wait() (only the
+    Phase 3 dummy asyncio-task path is ever reachable via the live
+    /dev_task pipeline right now - see the module-level note on why real
+    Claude execution isn't wired into execute_approved_task() yet). Kept
+    as its own, separately-named function so a future phase that wires a
+    real, cancel-token-based execution mechanism into this module has a
+    stable name to extend without another rename.
+    """
+    if task_id != _current_task_id or _current_asyncio_task is None:
+        return False
+
+    target_task = _current_asyncio_task
+    target_task.cancel()
+    try:
+        await asyncio.wait_for(asyncio.shield(target_task), timeout=timeout)
+    except asyncio.TimeoutError:
+        logger.error("Timed out waiting for execution to observe cancellation: task_id=%s", task_id)
+    except Exception:
+        logger.exception("Unexpected error while waiting for cancelled execution: task_id=%s", task_id)
     return True
 
 
@@ -232,100 +276,69 @@ async def run_dummy_execution(task_id: str, worktree_path: Path, timeout_seconds
         release_slot(task_id)
 
 
+def _engine_gate_failure_reason(engine: str) -> str | None:
+    """The live /dev_task Store-backed pipeline does not execute ANY engine
+    right now - this always returns a non-None, safe, Discord-displayable
+    reason. See the module-level note above for why: Phase 4A's real
+    Claude execution mechanism (isolated-copy sandbox) is intentionally
+    not wired into execute_approved_task() yet, and the old
+    worktree-based real-execution path it replaced must never be used for
+    real Claude Code execution again. Codex remains entirely unimplemented.
+    Neither engine ever falls back to the other, and neither falls back to
+    Phase 3's dummy execution.
+    """
+    if engine == DevTaskEngine.CODEX.value:
+        return "このエンジンでの実行には対応していません（Codexは未実装です）。"
+    if engine == DevTaskEngine.CLAUDE.value:
+        return (
+            "Claude Codeの実行は安全な隔離コピー（isolated copy）方式へ移行中のため、"
+            "現時点では/dev_taskからの自動実行には対応していません。"
+        )
+    return "未対応のエンジンが指定されています。"
+
+
 async def execute_approved_task(
     task_id: str,
     *,
     base_branch: str,
     timeout_seconds: int,
     branch_name: str,
+    engine: str,
+    prompt_text: str,
     engine_override: str | None = None,
     routing_reason_override: str | None = None,
 ) -> DevTaskExecutionOutcome:
-    """Full approval -> slot reservation -> store claim -> worktree
-    creation -> dummy execution -> terminal-state save pipeline, entirely
-    independent of discord.py (no Discord objects are touched anywhere in
-    this module) so it can be exercised and unit-tested without discord.py
-    installed. Callers (views/dev_task.py) are responsible for everything
-    Discord-specific: building/sending the notification from the returned
-    DevTaskExecutionOutcome, and recording how that notification was
-    delivered via store.set_notification_method_once() afterward.
+    """Approval entry point for the live /dev_task pipeline.
 
-    Every step is ordered so that nothing later ever runs unless the step
-    before it durably succeeded: the execution slot is reserved before the
-    store claim; the store claim (pending_approval -> running) is confirmed
-    before create_worktree() is ever called; and the terminal
-    completed/failed state is saved via finish_task() - and its success
-    checked - before this function returns anything a caller could mistake
-    for a confirmed outcome (see DevTaskExecutionOutcome.final_task).
+    In Phase 4A-v2 this always safely rejects (see
+    _engine_gate_failure_reason()) - claimed=False, no slot ever reserved,
+    no worktree/sandbox ever created, nothing else touched beyond
+    recording the rejection via store.fail_pending_approval(). This is
+    entirely independent of discord.py (no Discord objects are touched
+    anywhere in this module) so it can be exercised and unit-tested
+    without discord.py installed.
+
+    base_branch/timeout_seconds/branch_name/engine_override/
+    routing_reason_override are accepted (and currently unused) so the
+    call site in views/dev_task.py does not need to change when a future
+    phase re-enables real execution here.
     """
-    reserved = await reserve_slot(task_id)
-    if not reserved:
-        reason = "他の開発タスクが実行中のため開始できませんでした。"
-        fail_result = store.fail_pending_approval(task_id, reason=reason)
-        return DevTaskExecutionOutcome(
-            task_id=task_id,
-            claimed=False,
-            worktree_created=False,
-            branch_name=None,
-            execution_result=None,
-            final_task=fail_result.task if fail_result.success else None,
-            failure_reason=reason,
-        )
+    gate_reason = _engine_gate_failure_reason(engine)
+    if gate_reason is None:
+        # Should never happen - _engine_gate_failure_reason() always
+        # rejects in Phase 4A-v2. Fail safely rather than silently
+        # proceeding through unreviewed/removed execution machinery if
+        # this ever changes without this function being updated too.
+        logger.error("_engine_gate_failure_reason() unexpectedly returned None for engine=%r", engine)
+        gate_reason = "内部エラーのため実行できませんでした。"
 
-    claim_result = store.claim_task_for_execution(
-        task_id,
-        branch_name=branch_name,
-        engine_override=engine_override,
-        routing_reason_override=routing_reason_override,
-    )
-    if not claim_result.success:
-        release_slot(task_id)
-        reason = f"タスクの確保に失敗しました: {claim_result.error_message}"
-        return DevTaskExecutionOutcome(
-            task_id=task_id,
-            claimed=False,
-            worktree_created=False,
-            branch_name=None,
-            execution_result=None,
-            final_task=None,
-            failure_reason=reason,
-        )
-
-    worktree_result = await asyncio.to_thread(create_worktree, task_id, base_branch)
-    if not worktree_result.success:
-        release_slot(task_id)
-        reason = worktree_result.error_message or "worktreeの作成に失敗しました。"
-        finish_result = store.finish_task(task_id, success=False, error_message=reason)
-        return DevTaskExecutionOutcome(
-            task_id=task_id,
-            claimed=True,
-            worktree_created=False,
-            branch_name=worktree_result.branch_name,
-            execution_result=None,
-            final_task=finish_result.task if finish_result.success else None,
-            failure_reason=reason,
-        )
-
-    execution_result = await run_dummy_execution(task_id, worktree_result.worktree_path, timeout_seconds)
-
-    if execution_result.success:
-        result_summary = (
-            f"{execution_result.changed_file_count}件のファイル変更 / "
-            f"{execution_result.diff_summary[:_MAX_RESULT_SUMMARY_LENGTH]}"
-        )
-        finish_result = store.finish_task(task_id, success=True, result_summary=result_summary)
-        failure_reason = None if finish_result.success else finish_result.error_message
-    else:
-        reason = execution_result.error_message or "ダミー実行に失敗しました。"
-        finish_result = store.finish_task(task_id, success=False, error_message=reason)
-        failure_reason = reason if finish_result.success else finish_result.error_message
-
+    fail_result = store.fail_pending_approval(task_id, reason=gate_reason)
     return DevTaskExecutionOutcome(
         task_id=task_id,
-        claimed=True,
-        worktree_created=True,
-        branch_name=worktree_result.branch_name,
-        execution_result=execution_result,
-        final_task=finish_result.task if finish_result.success else None,
-        failure_reason=failure_reason,
+        claimed=False,
+        worktree_created=False,
+        branch_name=None,
+        execution_result=None,
+        final_task=fail_result.task if fail_result.success else None,
+        failure_reason=gate_reason,
     )

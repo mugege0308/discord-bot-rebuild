@@ -239,7 +239,7 @@ def setup(client: discord.Client) -> None:
         await interaction.response.send_message(_build_status_message(result.task), ephemeral=True)
 
     @client.tree.command(
-        name="dev_task_stop", description="実行中の開発タスク（ダミー実行）を停止します。"
+        name="dev_task_stop", description="実行中の開発タスクを停止します。"
     )
     async def slash_dev_task_stop(interaction: discord.Interaction) -> None:
         if not is_dev_task_allowed(interaction.user.id):
@@ -260,7 +260,7 @@ def setup(client: discord.Client) -> None:
             return
 
         await interaction.response.defer(ephemeral=True)
-        cancelled = await dev_task_executor.cancel_dummy_execution_and_wait(current_task_id)
+        cancelled = await dev_task_executor.cancel_current_execution_and_wait(current_task_id)
         if cancelled:
             await interaction.followup.send("停止しました。結果は通知先を確認してください。", ephemeral=True)
         else:

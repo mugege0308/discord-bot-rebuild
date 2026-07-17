@@ -736,6 +736,22 @@ def _cleanup_failed_create(normalized_id: str, worktree_path: Path, branch_name:
     )
 
 
+def validate_worktree_boundary_for_task(task_id: Any) -> WorktreeValidationResult:
+    """Public wrapper around the same path-boundary validation
+    create_worktree()/remove_worktree() perform internally
+    (_validate_path_boundary()), for callers outside this module that need
+    to re-verify - immediately before doing something as consequential as
+    launching an external command with this path as cwd - that a task's
+    worktree path is still genuinely inside WORK_ROOT on the real
+    filesystem, without reaching into this module's private
+    _validate_path_boundary()/_worktree_path_for() helpers directly.
+    """
+    normalized_id = _normalize_task_id(task_id)
+    if normalized_id is None:
+        return _validation_error(ERROR_INVALID_TASK_ID)
+    return _validate_path_boundary(_worktree_path_for(normalized_id))
+
+
 def create_worktree(task_id: Any, base_branch: Any) -> WorktreeResult:
     """Create a dev task worktree at work/<task_id> on a new branch
     dev-task/<task_id> (the full UUID4) branched from `base_branch`.

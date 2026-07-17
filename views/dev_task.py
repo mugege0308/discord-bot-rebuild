@@ -17,8 +17,6 @@ NOT_REQUESTER_MESSAGE = "この操作は、起票した本人だけができま�
 DENIED_MESSAGE = "この操作は、許可されたユーザーだけが実行できます。"
 ALREADY_PROCESSED_MESSAGE = "このタスクは既に処理されています。"
 
-_DUMMY_EXECUTION_NOTICE = "（ダミー実行です。実際のCodex/Claude Codeは実行していません）"
-
 _APPROVAL_VIEW_TIMEOUT_SECONDS = 900  # 15 minutes
 
 # Guild channel types this bot knows how to check privacy for. Anything
@@ -178,26 +176,29 @@ async def _send_and_record_notification(
 
 
 def _build_success_message(task_id: str, engine: str, branch_name: str | None, execution_result) -> str:
-    return "\n".join(
-        [
-            f"【開発タスク結果】{_DUMMY_EXECUTION_NOTICE}",
-            f"タスクID: {_short_task_id(task_id)}",
-            f"エンジン: {engine}",
-            "状態: 完了",
-            f"所要時間: {execution_result.duration_seconds:.1f}秒",
-            f"ブランチ: {branch_name or '不明'}",
-            f"変更ファイル数: {execution_result.changed_file_count}",
-            "git diff概要:",
-            f"```\n{execution_result.diff_summary}\n```",
-        ]
-    )
+    lines = [
+        "【開発タスク結果】",
+        f"タスクID: {_short_task_id(task_id)}",
+        f"エンジン: {engine}",
+        "状態: 完了",
+        f"所要時間: {execution_result.duration_seconds:.1f}秒",
+        f"ブランチ: {branch_name or '不明'}",
+        f"変更ファイル数: {execution_result.changed_file_count}",
+    ]
+    if getattr(execution_result, "stdout_truncated", False) or getattr(execution_result, "stderr_truncated", False):
+        lines.append("（出力が上限を超えたため一部切り詰められました）")
+    if getattr(execution_result, "manual_review_required", False):
+        lines.append("（変更内容の自動確認ができなかったため、手動確認をお願いします）")
+    lines.append("git diff概要:")
+    lines.append(f"```\n{execution_result.diff_summary}\n```")
+    return "\n".join(lines)
 
 
 def _build_failure_message(
     task_id: str, engine: str, reason: str, *, branch_name: str | None = None, duration_seconds: float | None = None
 ) -> str:
     lines = [
-        f"【開発タスク結果】{_DUMMY_EXECUTION_NOTICE}",
+        "【開発タスク結果】",
         f"タスクID: {_short_task_id(task_id)}",
         f"エンジン: {engine}",
         "状態: 失敗",
@@ -424,17 +425,24 @@ async def start_dev_task_execution(
     client: discord.Client, task_id: str, *, engine_override: str | None = None
 ) -> None:
     """Approval -> (slot reservation -> store claim -> worktree creation ->
-    dummy execution -> terminal-state save), all via
+    worktree re-verification -> real Claude headless execution ->
+    terminal-state save), all via
     services.dev_task_executor.execute_approved_task() - then, ONLY once
     that terminal state is confirmed durably saved, builds and sends the
     Discord notification (DM, falling back to a verified-private channel),
     decoupled from the approval interaction's token lifetime.
+
+    `engine_override` (from the approval view's Select) is resolved against
+    the task's own routed_engine here into a single effective_engine, which
+    is what actually gets checked and either executed or safely rejected by
+    execute_approved_task() - never "auto", always a concrete engine value.
     """
     task_result = store.get_task(task_id)
     if not task_result.success:
         logger.error("Dev task disappeared before execution could start: task_id=%s", task_id)
         return
     dev_task = task_result.task
+    effective_engine = engine_override or dev_task.routed_engine
 
     branch_name = f"dev-task/{task_id}"
     outcome = await dev_task_executor.execute_approved_task(
@@ -442,15 +450,20 @@ async def start_dev_task_execution(
         base_branch=dev_task.base_branch,
         timeout_seconds=dev_task.timeout_seconds,
         branch_name=branch_name,
+        engine=effective_engine,
+        prompt_text=dev_task.prompt_text,
         engine_override=engine_override,
         routing_reason_override="承認時に手動で上書きされたため" if engine_override else None,
     )
 
     if not outcome.claimed:
         # No worktree was ever created - nothing to keep/discard, and the
-        # failure reason is already a safe, curated message.
+        # failure reason is already a safe, curated message (this covers
+        # both "another task is already executing" and an unsupported
+        # engine / disabled Claude headless execution being rejected
+        # before ever reserving the execution slot).
         content = _build_failure_message(
-            task_id, engine_override or dev_task.routed_engine, outcome.failure_reason or "不明なエラー"
+            task_id, effective_engine, outcome.failure_reason or "不明なエラー"
         )
         await _send_and_record_notification(client, task_id, dev_task.requested_by_user_id, content, view=None)
         return
@@ -462,7 +475,7 @@ async def start_dev_task_execution(
         logger.error("Dev task finished but final state could not be saved: task_id=%s", task_id)
         content = "\n".join(
             [
-                f"【開発タスク結果】{_DUMMY_EXECUTION_NOTICE}",
+                "【開発タスク結果】",
                 f"タスクID: {_short_task_id(task_id)}",
                 "状態を保存できなかったため、結果を確定できませんでした。",
                 "/dev_task_status で最新の状態を確認してください。",
