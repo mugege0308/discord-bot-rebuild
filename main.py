@@ -91,6 +91,7 @@ PC_CONTROL_WINDOWS_ONLY_MESSAGE = "PCシャットダウン機能はWindowsでだ
 PC_SHUTDOWN_CANCEL_FAILED_MESSAGE = "シャットダウン予約のキャンセルに失敗したみたい。Botのログを確認してね。"
 GUILD_ONLY_MESSAGE = "このコマンドはサーバー内で使ってね。"
 REQUIRED_SLASH_COMMANDS = {
+    "generate_raw",
     "image_memory_list",
     "image_memory_show",
     "image_memory_rename",

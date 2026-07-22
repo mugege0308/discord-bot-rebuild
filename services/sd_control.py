@@ -46,6 +46,7 @@ _shutdown_after_done = False
 class SdGenerationOptions:
     prompt: str
     negative_prompt: str | None = None
+    preserve_prompt_text: bool = False
     count: int = 1
     width: int = 512
     height: int = 512
@@ -149,13 +150,19 @@ def validate_options(options: SdGenerationOptions) -> SdGenerationOptions:
     max_steps = _max_int("SD_MAX_STEPS", 60)
     max_cfg = _max_float("SD_MAX_CFG", 20.0)
 
-    prompt = options.prompt.strip()
-    if not prompt:
+    prompt = options.prompt if options.preserve_prompt_text else options.prompt.strip()
+    if not prompt.strip():
         raise ValueError("prompt is empty.")
+
+    if options.preserve_prompt_text:
+        negative_prompt = options.negative_prompt if options.negative_prompt is not None else ""
+    else:
+        negative_prompt = get_negative_prompt(options.negative_prompt)
 
     return SdGenerationOptions(
         prompt=prompt,
-        negative_prompt=get_negative_prompt(options.negative_prompt),
+        negative_prompt=negative_prompt,
+        preserve_prompt_text=options.preserve_prompt_text,
         count=_clamp_int(options.count, 1, max_count),
         width=_clamp_int(options.width, 256, max_width),
         height=_clamp_int(options.height, 256, max_height),

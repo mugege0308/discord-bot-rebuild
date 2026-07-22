@@ -13,7 +13,7 @@ from services.image_selection import (
 )
 from services.pc_control import is_pc_control_allowed
 from services.prompt_generator import PromptGeneratorError, PromptGeneratorTimeout, generate_sd_prompt_result
-from services.sd_control import SdGenerationOptions, generate_images
+from services.sd_control import SdGenerationOptions, generate_images, get_negative_prompt
 
 
 logger = logging.getLogger("secretary-bot.prompt")
@@ -21,6 +21,7 @@ logger = logging.getLogger("secretary-bot.prompt")
 SD_DENIED_MESSAGE = "画像生成は、許可されたユーザーだけが実行できます。"
 ONLY_OWNER_MESSAGE = "この画像生成ボタンは、/prompt を実行した本人だけが押せます。"
 GENERATING_MESSAGE = "画像生成中です。少し待っててね。"
+RAW_PROMPT_MAX_LENGTH = 4000
 
 
 async def _safe_followup_send(
@@ -41,7 +42,10 @@ async def _safe_followup_send(
         ephemeral,
     )
     try:
-        kwargs = {"ephemeral": ephemeral}
+        kwargs = {
+            "ephemeral": ephemeral,
+            "allowed_mentions": discord.AllowedMentions.none(),
+        }
         if content is not None:
             kwargs["content"] = content
         if files is not None:
@@ -100,8 +104,10 @@ def _selection_message(selection, send_count: int, generated_count: int) -> str:
 def _truncate_prompt(value: str, limit: int = 900) -> str:
     text = value.strip()
     if len(text) <= limit:
-        return text
-    return text[:limit].rstrip() + "..."
+        truncated = text
+    else:
+        truncated = text[:limit].rstrip() + "..."
+    return truncated.replace("```", "``\u200b`")
 
 
 def _build_generated_image_message(
@@ -121,7 +127,12 @@ def _build_generated_image_message(
     )
 
 
-def _build_generation_options(positive_prompt: str, negative_prompt: str) -> SdGenerationOptions:
+def _build_generation_options(
+    positive_prompt: str,
+    negative_prompt: str,
+    *,
+    preserve_prompt_text: bool = False,
+) -> SdGenerationOptions:
     selection_available = is_image_selection_available()
     count = get_selection_generate_count() if selection_available else 1
     logger.info(
@@ -132,6 +143,7 @@ def _build_generation_options(positive_prompt: str, negative_prompt: str) -> SdG
     return SdGenerationOptions(
         prompt=positive_prompt,
         negative_prompt=negative_prompt,
+        preserve_prompt_text=preserve_prompt_text,
         count=count,
         width=512,
         height=512,
@@ -148,8 +160,14 @@ async def _generate_images_from_prompts(
     positive_prompt: str,
     negative_prompt: str,
     label_prefix: str,
+    preserve_prompt_text: bool = False,
+    result_ephemeral: bool = True,
 ) -> None:
-    options = _build_generation_options(positive_prompt, negative_prompt)
+    options = _build_generation_options(
+        positive_prompt,
+        negative_prompt,
+        preserve_prompt_text=preserve_prompt_text,
+    )
     try:
         paths = await asyncio.to_thread(generate_images, options)
     except Exception as exc:
@@ -171,7 +189,7 @@ async def _generate_images_from_prompts(
         len(send_paths),
         len(paths),
     )
-    await _send_image_files(interaction, message, send_paths, ephemeral=True)
+    await _send_image_files(interaction, message, send_paths, ephemeral=result_ephemeral)
 
 
 class PromptImageGenerateView(discord.ui.View):
@@ -300,3 +318,66 @@ def setup(client: discord.Client) -> None:
             negative_prompt=result.negative_prompt,
             label_prefix="generate",
         )
+
+    @client.tree.command(name="generate_raw", description="入力したPositive / Negativeをそのまま使って画像生成します。")
+    @app_commands.describe(
+        positive="ComfyUIへそのまま渡すPositive。必須です。",
+        negative="ComfyUIへそのまま渡すNegative。省略できます。",
+        use_default_negative="negative省略時に既定Negativeを使うか。falseなら空欄です。",
+        public="生成結果をチャンネルへ公開するか。既定はtrueです。",
+    )
+    async def slash_generate_raw(
+        interaction: discord.Interaction,
+        positive: str,
+        negative: str | None = None,
+        use_default_negative: bool = True,
+        public: bool = True,
+    ) -> None:
+        await interaction.response.defer(ephemeral=True)
+        if not is_pc_control_allowed(interaction.user.id):
+            logger.warning("Denied /generate_raw by user_id=%s", interaction.user.id)
+            await _send_error(interaction, SD_DENIED_MESSAGE, label="generate_raw.denied")
+            return
+
+        if not positive.strip():
+            await _send_error(
+                interaction,
+                "Positiveは必須です。空白以外の内容を入力してください。",
+                label="generate_raw.positive_empty",
+            )
+            return
+        if len(positive) > RAW_PROMPT_MAX_LENGTH:
+            await _send_error(
+                interaction,
+                f"Positiveは{RAW_PROMPT_MAX_LENGTH}文字以内で入力してください。",
+                label="generate_raw.positive_too_long",
+            )
+            return
+        if negative is not None and len(negative) > RAW_PROMPT_MAX_LENGTH:
+            await _send_error(
+                interaction,
+                f"Negativeは{RAW_PROMPT_MAX_LENGTH}文字以内で入力してください。",
+                label="generate_raw.negative_too_long",
+            )
+            return
+
+        effective_negative = negative
+        if effective_negative is None:
+            effective_negative = get_negative_prompt(None) if use_default_negative else ""
+
+        await _safe_followup_send(
+            interaction,
+            label="generate_raw.started",
+            content=GENERATING_MESSAGE,
+            ephemeral=True,
+        )
+        await _generate_images_from_prompts(
+            interaction,
+            positive_prompt=positive,
+            negative_prompt=effective_negative,
+            label_prefix="generate_raw",
+            preserve_prompt_text=True,
+            result_ephemeral=not public,
+        )
+
+    logger.info("Registered prompt slash commands: prompt, generate, generate_raw")

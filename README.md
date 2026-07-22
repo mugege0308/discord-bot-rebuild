@@ -406,6 +406,7 @@ Botトークンや `.env` の読み込みは、これまで通り `main.py` 側�
 - `/health_check`
 - `/prompt`
 - `/generate`
+- `/generate_raw`
 - `/image_analyze`
 - `/image_memory_list`
 - `/image_memory_show`
@@ -1105,6 +1106,7 @@ LM Studio側でローカルサーバーが起動していない場合、`/health
 
 `/prompt` で、日本語の内容からStable Diffusion向けの `Positive` / `Negative` プロンプトを作れます。
 `/generate` では、同じプロンプト生成処理を使って、そのままComfyUIで画像生成まで実行します。
+`/generate_raw` では、入力した `Positive` / `Negative` をLM Studioの生成・後処理やMemory追加に通さず、そのままComfyUIへ渡します。
 `/image_analyze` では、参考画像を画像生成に使えそうな要素へ分解できます。
 
 使い方:
@@ -1112,6 +1114,9 @@ LM Studio側でローカルサーバーが起動していない場合、`/health
 ```text
 /prompt text:雨の日の小さな喫茶店、窓際、やわらかい光
 /generate text:雨の日の小さな喫茶店、窓際、やわらかい光
+/generate_raw positive:masterpiece, 1girl, detailed background negative:low quality, blurry
+/generate_raw positive:masterpiece, landscape use_default_negative:false
+/generate_raw positive:masterpiece, portrait public:false
 /image_analyze image:参考画像
 /image_analyze image:参考画像 private:true
 /image_memory_list
@@ -1128,6 +1133,19 @@ LM Studio側でローカルサーバーが起動していない場合、`/health
 5. `/prompt` はDiscordに `Positive` / `Negative` 形式で返します。
 6. `/prompt` の返信の `画像生成` ボタンを押すと、表示されたPositive / Negativeをそのまま使ってComfyUI APIへ送信します。
 7. `/generate` は確認ボタンなしで、生成されたPositive / NegativeをそのままComfyUI APIへ送信して画像を返します。
+
+`/generate_raw` の動作:
+
+- `positive` は必須、`negative` は省略可能です。各入力は4,000文字までです。
+- `negative` を省略すると、既存の `SD_DEFAULT_NEGATIVE_PROMPT` を使います。
+- `negative` を省略し、`use_default_negative:false` を指定するとNegativeを空欄にします。
+- `negative` を入力した場合は、`use_default_negative` に関係なく入力値を使います。
+- `public` の既定値は `true` です。生成成功時の画像・Positive・Negative・画像選別AIの結果は通常のチャンネルメッセージとして投稿され、そのチャンネルを閲覧できる全員に見えます。
+- 自分だけに結果を表示したい場合は `public:false` を指定します。この場合だけ、従来どおり生成結果をephemeralで表示します。
+- コマンド受付中の表示、権限拒否、入力エラー、生成エラーは `public` に関係なくephemeralです。
+- LM Studio、プロンプト後処理、通常Memory、Image Memory、`reference_id` は使いません。
+- 生成枚数と生成後の画像選別AIは既存の `/generate` と同じです。
+- 生成結果のDiscord表示は長くなりすぎないよう、Positive / Negativeを一部省略する場合があります。ComfyUIへ渡す入力自体は省略しません。
 
 ### 画像解析メモ
 
@@ -1317,12 +1335,12 @@ SD_SELECT_RETURN_COUNT=1
 
 動作:
 
-1. `/prompt` の「画像生成」ボタン、`/generate`、または `/sd_generate` で画像を生成します。
+1. `/prompt` の「画像生成」ボタン、`/generate`、`/generate_raw`、または `/sd_generate` で画像を生成します。
 2. 初号ちゃんは今回生成された画像だけを一時フォルダへコピーします。
 3. `LOCAL_AI_PROJECT_DIR\scripts\score_batch_top5.py` にその一時フォルダを渡します。
 4. 選別AIが `outputs\auto_selected\latest_top5` に出力した上位画像をDiscordへ返します。
 
-`/prompt` の「画像生成」ボタンと `/generate` では、画像選別AIが使える場合だけ複数枚生成します。
+`/prompt` の「画像生成」ボタン、`/generate`、`/generate_raw` では、画像選別AIが使える場合だけ複数枚生成します。
 
 - `SD_SELECT_GENERATE_COUNT`: 選別AI用に生成する枚数です。5〜20の範囲で指定します。未設定時は5枚です。
 - `SD_SELECT_RETURN_COUNT`: 選別後にDiscordへ返す枚数です。1〜3の範囲で指定します。未設定時は1枚です。
