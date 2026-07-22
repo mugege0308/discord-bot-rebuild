@@ -1,4 +1,5 @@
 import base64
+import hashlib
 import json
 import logging
 import os
@@ -54,6 +55,29 @@ class SdGenerationOptions:
     cfg: float = 7.0
     sampler: str = "Euler a"
     seed: int = -1
+
+
+@dataclass(frozen=True)
+class GeneratedImage:
+    """One generated image plus the generation conditions actually used to
+    produce it. All condition fields except path/batch_index are Optional -
+    when a value cannot be safely read back from the workflow that was
+    actually queued (or, for the webui backend, is simply not knowable),
+    None is stored rather than a guessed or .env-derived value.
+    """
+
+    path: Path
+    batch_index: int
+    seed: int | None = None
+    checkpoint_name: str | None = None
+    sampler_name: str | None = None
+    scheduler: str | None = None
+    steps: int | None = None
+    cfg: float | None = None
+    width: int | None = None
+    height: int | None = None
+    workflow_file: str | None = None
+    workflow_hash: str | None = None
 
 
 def _now_text() -> str:
@@ -516,6 +540,76 @@ def _find_save_image_nodes(workflow: dict[str, Any]) -> list[str]:
     ]
 
 
+def _extract_checkpoint_name(workflow: dict[str, Any]) -> str | None:
+    for node in workflow.values():
+        if not isinstance(node, dict):
+            continue
+        if str(node.get("class_type", "")) != "CheckpointLoaderSimple":
+            continue
+        inputs = node.get("inputs")
+        if not isinstance(inputs, dict):
+            continue
+        ckpt_name = inputs.get("ckpt_name")
+        if isinstance(ckpt_name, str) and ckpt_name:
+            return ckpt_name
+    return None
+
+
+def _extract_sampler_settings(
+    workflow: dict[str, Any], sampler_node_id: str | None
+) -> tuple[int | None, float | None, str | None, str | None]:
+    if not sampler_node_id:
+        return None, None, None, None
+    inputs = _node_inputs(workflow, sampler_node_id) or {}
+
+    steps = inputs.get("steps")
+    steps = steps if isinstance(steps, int) else None
+
+    cfg = inputs.get("cfg")
+    cfg = float(cfg) if isinstance(cfg, (int, float)) else None
+
+    sampler_name = inputs.get("sampler_name")
+    sampler_name = sampler_name if isinstance(sampler_name, str) and sampler_name else None
+
+    scheduler = inputs.get("scheduler")
+    scheduler = scheduler if isinstance(scheduler, str) and scheduler else None
+
+    return steps, cfg, sampler_name, scheduler
+
+
+def _extract_latent_dimensions(workflow: dict[str, Any]) -> tuple[int | None, int | None]:
+    # Prefer an exact EmptyLatentImage match (what this project's workflow
+    # actually uses); only fall back to a looser "class name contains
+    # Latent, and both width/height are present" match if no exact match is
+    # found, so we don't misattribute dimensions from an unrelated node.
+    fallback_match: tuple[int, int] | None = None
+    for node in workflow.values():
+        if not isinstance(node, dict):
+            continue
+        inputs = node.get("inputs")
+        if not isinstance(inputs, dict):
+            continue
+        width = inputs.get("width")
+        height = inputs.get("height")
+        if not (isinstance(width, int) and isinstance(height, int)):
+            continue
+        class_type = str(node.get("class_type", ""))
+        if class_type == "EmptyLatentImage":
+            return width, height
+        if fallback_match is None and "Latent" in class_type:
+            fallback_match = (width, height)
+    return fallback_match if fallback_match is not None else (None, None)
+
+
+def _safe_workflow_file_hash(workflow_file: Path) -> str | None:
+    try:
+        data = workflow_file.read_bytes()
+    except OSError:
+        logger.warning("Could not read workflow file to compute its hash: %s", workflow_file)
+        return None
+    return hashlib.sha256(data).hexdigest()
+
+
 def _set_node_input(workflow: dict[str, Any], node_id: str, key: str, value: Any) -> None:
     node = workflow.get(node_id)
     if not isinstance(node, dict):
@@ -526,7 +620,9 @@ def _set_node_input(workflow: dict[str, Any], node_id: str, key: str, value: Any
     inputs[key] = value
 
 
-def _apply_comfy_options(workflow: dict[str, Any], options: SdGenerationOptions) -> dict[str, Any]:
+def _apply_comfy_options(
+    workflow: dict[str, Any], options: SdGenerationOptions
+) -> tuple[dict[str, Any], str | None, str | None]:
     save_nodes = _find_save_image_nodes(workflow)
     if not save_nodes:
         raise RuntimeError("ComfyUI workflow に SaveImage ノードが見つかりません。完成画像を保存するWorkflowを指定してください。")
@@ -565,7 +661,7 @@ def _apply_comfy_options(workflow: dict[str, Any], options: SdGenerationOptions)
     else:
         logger.warning("ComfyUI seed input was not found. Workflow seed was left unchanged.")
 
-    return workflow
+    return workflow, seed_node_id, seed_key
 
 
 def _queue_comfy_prompt(workflow: dict[str, Any], client_id: str) -> str:
@@ -707,18 +803,78 @@ def _generate_webui_images(options: SdGenerationOptions) -> list[Path]:
     return paths
 
 
-def _generate_comfy_images(options: SdGenerationOptions) -> list[Path]:
-    paths: list[Path] = []
+def _generate_comfy_images_with_metadata(options: SdGenerationOptions) -> list[GeneratedImage]:
+    workflow_file = _get_comfy_workflow_file()
+    workflow_file_text = str(workflow_file)
+    workflow_hash = _safe_workflow_file_hash(workflow_file)
+
+    images: list[GeneratedImage] = []
     client_id = str(uuid.uuid4())
     for batch_index in range(1, options.count + 1):
-        workflow = _apply_comfy_options(_load_comfy_workflow(), options)
+        workflow, seed_node_id, seed_key = _apply_comfy_options(_load_comfy_workflow(), options)
+
+        seed_value: int | None = None
+        if seed_node_id and seed_key:
+            seed_inputs = _node_inputs(workflow, seed_node_id) or {}
+            raw_seed = seed_inputs.get(seed_key)
+            seed_value = raw_seed if isinstance(raw_seed, int) else None
+
+        checkpoint_name = _extract_checkpoint_name(workflow)
+        sampler_node_id = _find_sampler_node(workflow)
+        steps, cfg, sampler_name, scheduler = _extract_sampler_settings(workflow, sampler_node_id)
+        width, height = _extract_latent_dimensions(workflow)
+
         prompt_id = _queue_comfy_prompt_with_logging(workflow, client_id)
         history = _wait_comfy_history(prompt_id)
-        paths.extend(_download_comfy_images(history, batch_index))
-    return paths
+        paths = _download_comfy_images(history, batch_index)
+
+        for path in paths:
+            images.append(
+                GeneratedImage(
+                    path=path,
+                    batch_index=batch_index,
+                    seed=seed_value,
+                    checkpoint_name=checkpoint_name,
+                    sampler_name=sampler_name,
+                    scheduler=scheduler,
+                    steps=steps,
+                    cfg=cfg,
+                    width=width,
+                    height=height,
+                    workflow_file=workflow_file_text,
+                    workflow_hash=workflow_hash,
+                )
+            )
+    return images
 
 
-def generate_images(options: SdGenerationOptions) -> list[Path]:
+def _generate_webui_images_with_metadata(options: SdGenerationOptions) -> list[GeneratedImage]:
+    # The webui backend has no ComfyUI-style workflow file/checkpoint-loader
+    # node to read back, and the actual per-image seed used by the webui API
+    # is not currently parsed out of its response - those fields are left as
+    # None (see GeneratedImage's docstring) rather than guessed. The
+    # remaining fields reflect the request options actually sent, unchanged.
+    paths = _generate_webui_images(options)
+    return [
+        GeneratedImage(
+            path=path,
+            batch_index=index,
+            seed=None,
+            checkpoint_name=None,
+            sampler_name=options.sampler or None,
+            scheduler=None,
+            steps=options.steps,
+            cfg=options.cfg,
+            width=options.width,
+            height=options.height,
+            workflow_file=None,
+            workflow_hash=None,
+        )
+        for index, path in enumerate(paths, start=1)
+    ]
+
+
+def generate_images_with_metadata(options: SdGenerationOptions) -> list[GeneratedImage]:
     global _shutdown_after_done
 
     if not _generate_lock.acquire(blocking=False):
@@ -727,13 +883,13 @@ def generate_images(options: SdGenerationOptions) -> list[Path]:
     safe_options = validate_options(options)
     try:
         if _backend() == "comfy":
-            paths = _generate_comfy_images(safe_options)
+            images = _generate_comfy_images_with_metadata(safe_options)
         elif _backend() == "webui":
-            paths = _generate_webui_images(safe_options)
+            images = _generate_webui_images_with_metadata(safe_options)
         else:
             raise RuntimeError("SD_BACKEND は comfy または webui を指定してね。")
 
-        _save_latest_paths(paths)
+        _save_latest_paths([image.path for image in images])
 
         if _shutdown_after_done:
             _shutdown_after_done = False
@@ -742,9 +898,13 @@ def generate_images(options: SdGenerationOptions) -> list[Path]:
             else:
                 logger.warning("Shutdown-after-done was requested, but OS is not Windows.")
 
-        return paths
+        return images
     finally:
         _generate_lock.release()
+
+
+def generate_images(options: SdGenerationOptions) -> list[Path]:
+    return [image.path for image in generate_images_with_metadata(options)]
 
 
 def set_shutdown_after_done(enabled: bool = True) -> str:

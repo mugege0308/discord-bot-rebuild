@@ -6,6 +6,7 @@ import discord
 from discord import app_commands
 
 from sd_prompt_template_generator import build_discord_prompt_message
+from services.generation_history import GenerationRequestRecord, save_generation_history
 from services.image_selection import (
     get_selection_generate_count,
     is_image_selection_available,
@@ -13,7 +14,13 @@ from services.image_selection import (
 )
 from services.pc_control import is_pc_control_allowed
 from services.prompt_generator import PromptGeneratorError, PromptGeneratorTimeout, generate_sd_prompt_result
-from services.sd_control import SdGenerationOptions, generate_images, get_negative_prompt
+from services.sd_control import (
+    GeneratedImage,
+    SdGenerationOptions,
+    generate_images,
+    generate_images_with_metadata,
+    get_negative_prompt,
+)
 from services.shogou_prompt_designer import ShogouPromptResult, generate_shogou_prompt_result
 
 
@@ -231,11 +238,60 @@ def _build_shogou_generated_image_message(
     return message
 
 
+async def _save_generation_history_safely(
+    *,
+    user_id: int,
+    request_text: str,
+    reference_id: int | None,
+    result: ShogouPromptResult,
+    generated_images: list[GeneratedImage],
+    selection,
+) -> None:
+    # Best-effort only: a history-save failure must never block the Discord
+    # result from being sent, and must never crash the bot. Any exception
+    # here (including one raised while building the record itself, before
+    # save_generation_history's own internal try/except is even reached) is
+    # caught and logged.
+    try:
+        workflow_file = generated_images[0].workflow_file if generated_images else None
+        workflow_hash = generated_images[0].workflow_hash if generated_images else None
+        request_record = GenerationRequestRecord(
+            user_id=user_id,
+            request_text=request_text,
+            reference_id=reference_id,
+            positive=result.positive,
+            negative=result.negative,
+            summary=result.summary,
+            assumptions=result.assumptions,
+            workflow_file=workflow_file,
+            workflow_hash=workflow_hash,
+            selection_used=selection.used_selection,
+            selection_message=selection.message or selection.error or "",
+        )
+        request_id = await asyncio.to_thread(
+            save_generation_history,
+            request_record,
+            generated_images,
+            selected_paths=selection.selected_paths,
+        )
+        if request_id is None:
+            logger.error(
+                "Generation history save reported failure for /generate_ai "
+                "(see services.generation_history logs); continuing without blocking Discord delivery."
+            )
+    except Exception:
+        logger.exception(
+            "Unexpected error while saving generation history; continuing without blocking Discord delivery."
+        )
+
+
 async def _generate_images_from_shogou_result(
     interaction: discord.Interaction,
     result: ShogouPromptResult,
     *,
     label_prefix: str,
+    request_text: str = "",
+    reference_id: int | None = None,
     result_ephemeral: bool = False,
 ) -> None:
     # Mirrors _generate_images_from_prompts' preserve_prompt_text=True path exactly,
@@ -246,7 +302,7 @@ async def _generate_images_from_shogou_result(
         preserve_prompt_text=True,
     )
     try:
-        paths = await asyncio.to_thread(generate_images, options)
+        generated_images = await asyncio.to_thread(generate_images_with_metadata, options)
     except Exception as exc:
         logger.exception("Failed to generate image: label=%s", label_prefix)
         error_text = str(exc).strip() or "unknown error"
@@ -257,6 +313,7 @@ async def _generate_images_from_shogou_result(
         )
         return
 
+    paths = [image.path for image in generated_images]
     selection = await asyncio.to_thread(select_generated_images, paths)
     send_paths = selection.selected_paths or paths
     message = _build_shogou_generated_image_message(
@@ -265,6 +322,16 @@ async def _generate_images_from_shogou_result(
         len(send_paths),
         len(paths),
     )
+
+    await _save_generation_history_safely(
+        user_id=interaction.user.id,
+        request_text=request_text,
+        reference_id=reference_id,
+        result=result,
+        generated_images=generated_images,
+        selection=selection,
+    )
+
     await _send_image_files(interaction, message, send_paths, ephemeral=result_ephemeral)
 
 
@@ -528,6 +595,8 @@ def setup(client: discord.Client) -> None:
             interaction,
             result,
             label_prefix="generate_ai",
+            request_text=request,
+            reference_id=reference_id,
         )
 
     logger.info("Registered prompt slash commands: prompt, generate, generate_raw, generate_ai")

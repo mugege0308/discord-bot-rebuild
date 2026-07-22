@@ -159,6 +159,8 @@
             "/generate_ai は日本語の request を shogou-chan-prompt-designer 用のプロンプト設計に渡し、Positive・Negative・Summary・Assumptionsを作ってそのままComfyUIで画像生成するよ。",
             "reference_id を指定するとそのImage Memoryを優先するよ。未指定なら通常の自動関連判定を使うよ。",
             "生成成功時は /generate_raw と同じく通常投稿になるよ。JSONの形式に問題があった場合は画像生成せず、理由だけを本人に返すよ。",
+            "/generate_ai の生成履歴（依頼内容・生成条件・選別AI結果など）は data/generation_history.db に保存するよ。評価ボタンや再学習はまだ未実装だよ。",
+            "履歴には画像のパスだけを記録して、画像そのものはコピーも移動もしないよ。元の画像を消すと履歴からたどれなくなるから気をつけてね。",
             "/character_generate は髪・目・表情・服装・背景・雰囲気を選び、確認後に画像生成するよ。",
             "/image_analyze は参考画像を人物・髪・服装・背景・タグ候補に分解して、Memoryに保存するボタンも出せるよ。",
             "nameを省略した場合は、保存ボタンを押した時に自動名入りの入力画面が開くよ。",

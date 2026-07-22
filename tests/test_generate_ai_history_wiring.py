@@ -1,0 +1,213 @@
+import ast
+import unittest
+from pathlib import Path
+from unittest import mock
+
+import commands.prompt as prompt_module
+from services.image_selection import ImageSelectionResult
+from services.sd_control import GeneratedImage
+from services.shogou_prompt_designer import ShogouPromptResult
+
+
+PROMPT_SOURCE = Path(__file__).resolve().parents[1] / "commands" / "prompt.py"
+
+
+def _find_function(tree: ast.AST, name: str):
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef)) and node.name == name:
+            return node
+    raise AssertionError(f"function not found: {name}")
+
+
+def _find_calls(function, name: str) -> list[ast.Call]:
+    return [
+        node
+        for node in ast.walk(function)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == name
+    ]
+
+
+def _references_name(function, name: str) -> bool:
+    # generate_images / generate_images_with_metadata are passed as bare
+    # references to asyncio.to_thread(...), not called directly, so they
+    # show up as ast.Name nodes rather than ast.Call nodes.
+    return any(
+        isinstance(node, ast.Name) and node.id == name
+        for node in ast.walk(function)
+    )
+
+
+def _make_result() -> ShogouPromptResult:
+    return ShogouPromptResult(
+        positive="1girl, safe, masterpiece, high score, great score, absurdres",
+        negative="lowres, bad anatomy",
+        summary="テスト用の要約",
+        assumptions=("背景を補完",),
+    )
+
+
+def _make_generated_images(count: int = 1) -> list[GeneratedImage]:
+    return [
+        GeneratedImage(path=Path(f"data/sd_outputs/test_{index}.png"), batch_index=index, seed=100 + index)
+        for index in range(1, count + 1)
+    ]
+
+
+class HistorySaveDoesNotBlockDiscordDeliveryTestCase(unittest.IsolatedAsyncioTestCase):
+    async def test_db_save_returning_none_still_sends_images(self):
+        interaction = mock.MagicMock()
+        interaction.user.id = 555
+        images = _make_generated_images(1)
+        selection = ImageSelectionResult(selected_paths=[], used_selection=False, message="", error="")
+
+        with mock.patch(
+            "commands.prompt.generate_images_with_metadata", return_value=images
+        ) as generate_mock, mock.patch(
+            "commands.prompt.select_generated_images", return_value=selection
+        ), mock.patch(
+            "commands.prompt.save_generation_history", return_value=None
+        ) as save_mock, mock.patch(
+            "commands.prompt._send_image_files"
+        ) as send_mock, mock.patch(
+            "commands.prompt._send_error"
+        ) as error_mock:
+            await prompt_module._generate_images_from_shogou_result(
+                interaction,
+                _make_result(),
+                label_prefix="generate_ai",
+                request_text="テスト依頼",
+                reference_id=None,
+            )
+
+        generate_mock.assert_called_once()
+        save_mock.assert_called_once()
+        send_mock.assert_called_once()
+        error_mock.assert_not_called()
+
+    async def test_db_save_raising_exception_still_sends_images(self):
+        interaction = mock.MagicMock()
+        interaction.user.id = 555
+        images = _make_generated_images(1)
+        selection = ImageSelectionResult(selected_paths=[], used_selection=False, message="", error="")
+
+        with mock.patch(
+            "commands.prompt.generate_images_with_metadata", return_value=images
+        ), mock.patch(
+            "commands.prompt.select_generated_images", return_value=selection
+        ), mock.patch(
+            "commands.prompt.save_generation_history", side_effect=RuntimeError("db exploded")
+        ), mock.patch(
+            "commands.prompt._send_image_files"
+        ) as send_mock, mock.patch(
+            "commands.prompt._send_error"
+        ) as error_mock:
+            await prompt_module._generate_images_from_shogou_result(
+                interaction,
+                _make_result(),
+                label_prefix="generate_ai",
+                request_text="テスト依頼",
+                reference_id=None,
+            )
+
+        send_mock.assert_called_once()
+        error_mock.assert_not_called()
+
+
+class ComfyFailureSkipsHistorySaveTestCase(unittest.IsolatedAsyncioTestCase):
+    async def test_comfy_failure_never_calls_save_generation_history(self):
+        interaction = mock.MagicMock()
+        interaction.user.id = 555
+
+        with mock.patch(
+            "commands.prompt.generate_images_with_metadata", side_effect=RuntimeError("comfy down")
+        ), mock.patch(
+            "commands.prompt.save_generation_history"
+        ) as save_mock, mock.patch(
+            "commands.prompt._send_error"
+        ) as error_mock, mock.patch(
+            "commands.prompt._send_image_files"
+        ) as send_mock:
+            await prompt_module._generate_images_from_shogou_result(
+                interaction,
+                _make_result(),
+                label_prefix="generate_ai",
+                request_text="テスト依頼",
+                reference_id=None,
+            )
+
+        save_mock.assert_not_called()
+        error_mock.assert_called_once()
+        send_mock.assert_not_called()
+
+
+class SelectionAiWasSelectedWiringTestCase(unittest.IsolatedAsyncioTestCase):
+    async def test_selected_paths_and_selection_flags_are_forwarded_to_history(self):
+        interaction = mock.MagicMock()
+        interaction.user.id = 777
+        images = _make_generated_images(2)
+        selection = ImageSelectionResult(
+            selected_paths=[Path("data/sd_outputs/test_1.png")],
+            used_selection=True,
+            message="画像選別AIで上位1枚を選びました。",
+            error="",
+        )
+
+        with mock.patch(
+            "commands.prompt.generate_images_with_metadata", return_value=images
+        ), mock.patch(
+            "commands.prompt.select_generated_images", return_value=selection
+        ), mock.patch(
+            "commands.prompt.save_generation_history", return_value=1
+        ) as save_mock, mock.patch(
+            "commands.prompt._send_image_files"
+        ):
+            await prompt_module._generate_images_from_shogou_result(
+                interaction,
+                _make_result(),
+                label_prefix="generate_ai",
+                request_text="猫耳の女の子",
+                reference_id=3,
+            )
+
+        save_mock.assert_called_once()
+        _, kwargs = save_mock.call_args
+        args = save_mock.call_args.args
+        request_record = args[0]
+        saved_images = args[1]
+        self.assertEqual(request_record.user_id, 777)
+        self.assertEqual(request_record.request_text, "猫耳の女の子")
+        self.assertEqual(request_record.reference_id, 3)
+        self.assertTrue(request_record.selection_used)
+        self.assertEqual(saved_images, images)
+        self.assertEqual(kwargs["selected_paths"], selection.selected_paths)
+
+
+class ExistingCommandsUnaffectedByHistoryIntegrationTestCase(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.tree = ast.parse(PROMPT_SOURCE.read_text(encoding="utf-8"), filename=str(PROMPT_SOURCE))
+
+    def test_generate_images_from_prompts_still_uses_plain_generate_images(self):
+        function = _find_function(self.tree, "_generate_images_from_prompts")
+
+        self.assertTrue(_references_name(function, "generate_images"))
+        self.assertFalse(_references_name(function, "generate_images_with_metadata"))
+        self.assertFalse(_references_name(function, "save_generation_history"))
+
+    def test_slash_generate_raw_is_unaffected(self):
+        function = _find_function(self.tree, "slash_generate_raw")
+        arg_names = [arg.arg for arg in function.args.args]
+
+        self.assertEqual(arg_names, ["interaction", "positive", "negative", "use_default_negative", "public"])
+        self.assertTrue(_find_calls(function, "_generate_images_from_prompts"))
+        self.assertFalse(_find_calls(function, "save_generation_history"))
+
+    def test_only_generate_ai_path_uses_the_detailed_generation_api(self):
+        shogou_function = _find_function(self.tree, "_generate_images_from_shogou_result")
+
+        self.assertTrue(_references_name(shogou_function, "generate_images_with_metadata"))
+        self.assertFalse(_references_name(shogou_function, "generate_images"))
+
+
+if __name__ == "__main__":
+    unittest.main()

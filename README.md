@@ -1163,6 +1163,14 @@ LM Studio側でローカルサーバーが起動していない場合、`/health
 - 生成成功時は `/generate_raw` の既定（`public:true`相当）と同じく通常投稿になり、画像・Summary・Assumptions・Positive・Negative・画像選別AIの結果がチャンネル内の全員に見えます。コマンド受付中の表示、権限拒否、入力エラー、生成エラー、JSON検証エラーは常にephemeralです。
 - 生成枚数と生成後の画像選別AIは既存の `/generate` `/generate_raw` と同じです。
 
+`/generate_ai` の生成履歴（Phase 1A・評価収集の土台）:
+
+- 元の依頼（`request`）、生成された `positive`/`negative`/`summary`/`assumptions`、`reference_id`、実際にComfyUIへ送信したワークフローから読み取った生成条件（checkpoint・seed・sampler・scheduler・steps・cfg・width/height・ワークフローファイルとそのハッシュ）、画像選別AIの利用有無と結果を `data/generation_history.db`（SQLite）へ保存します。
+- LM StudioのJSON検証成功・ComfyUI生成成功・画像選別AI処理後の3条件がそろったときだけ、1回の `/generate_ai` 呼び出し分をまとめて1トランザクションで保存します。JSON検証失敗・LM Studio呼び出し失敗・ComfyUI生成失敗の場合は履歴を保存しません。画像選別AI自体が使えなかった／失敗した場合は、生成自体は成功しているため「画像選別AI未使用」として保存します。
+- 現時点では画像ファイルのコピー・移動は行わず、生成時点のパスをそのまま記録します。そのため元画像が後から削除・移動されると、履歴上のパスは無効になる可能性があります。
+- 履歴の保存に失敗しても（DB破損・ディスク容量不足など）、画像生成自体とDiscordへの結果送信は継続されます。失敗はログにのみ記録されます。
+- 現時点では画像への評価ボタン・永続的な評価UI・Selection AIの再学習は未実装です（将来のPhaseで追加予定）。
+
 ### 画像解析メモ
 
 `/image_analyze image:参考画像` で、添付画像を以下の項目に分解します。
