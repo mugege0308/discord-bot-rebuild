@@ -407,6 +407,7 @@ Botトークンや `.env` の読み込みは、これまで通り `main.py` 側�
 - `/prompt`
 - `/generate`
 - `/generate_raw`
+- `/generate_ai`
 - `/image_analyze`
 - `/image_memory_list`
 - `/image_memory_show`
@@ -1107,6 +1108,7 @@ LM Studio側でローカルサーバーが起動していない場合、`/health
 `/prompt` で、日本語の内容からStable Diffusion向けの `Positive` / `Negative` プロンプトを作れます。
 `/generate` では、同じプロンプト生成処理を使って、そのままComfyUIで画像生成まで実行します。
 `/generate_raw` では、入力した `Positive` / `Negative` をLM Studioの生成・後処理やMemory追加に通さず、そのままComfyUIへ渡します。
+`/generate_ai` では、日本語の要望を `shogou-chan-prompt-designer` 用のプロンプト設計で `positive` / `negative` / `summary` / `assumptions` のJSONに変換し、`positive` / `negative` をそのままComfyUIへ渡します。
 `/image_analyze` では、参考画像を画像生成に使えそうな要素へ分解できます。
 
 使い方:
@@ -1117,6 +1119,8 @@ LM Studio側でローカルサーバーが起動していない場合、`/health
 /generate_raw positive:masterpiece, 1girl, detailed background negative:low quality, blurry
 /generate_raw positive:masterpiece, landscape use_default_negative:false
 /generate_raw positive:masterpiece, portrait public:false
+/generate_ai request:雨の日の小さな喫茶店、窓際、やわらかい光
+/generate_ai request:黒髪ロングの女の子 reference_id:1
 /image_analyze image:参考画像
 /image_analyze image:参考画像 private:true
 /image_memory_list
@@ -1146,6 +1150,18 @@ LM Studio側でローカルサーバーが起動していない場合、`/health
 - LM Studio、プロンプト後処理、通常Memory、Image Memory、`reference_id` は使いません。
 - 生成枚数と生成後の画像選別AIは既存の `/generate` と同じです。
 - 生成結果のDiscord表示は長くなりすぎないよう、Positive / Negativeを一部省略する場合があります。ComfyUIへ渡す入力自体は省略しません。
+
+`/generate_ai` の動作:
+
+- 入力項目は `request`（日本語の要望、必須）と `reference_id`（画像参考メモID、任意）だけです。
+- system promptには、リポジトリ直下の `shogou_chan_prompt_designer_instruction.md`（`outputs/shogou-chan-prompt-designer/SKILL.md` からClaude Code向けの記述を除いて作成した専用ファイル）を使います。`fixed_template_llm_instruction.md` を使う `/prompt` `/generate` とは別の指示文です。
+- 通常Memoryと画像参考Memory（Image Memory）はどちらも使います。`reference_id` を指定した場合はそのMemoryのタグを優先し、未指定の場合は既存の自動関連判定をそのまま使います。
+- LM Studioの返答は次の順で解析します: `<think>...</think>` の除去 → Markdownコードフェンスの除去 → 前後の説明文からのJSON抽出 → `positive` / `negative` / `summary` / `assumptions` の4キー・型・必須項目の検証。
+- `<think>` の閉じタグが無い場合でも、レスポンス全体を誤って消さない実装になっています（閉じタグが見つからない場合は除去処理をスキップし、後続のJSON抽出へそのまま進みます）。
+- JSON抽出失敗、必須キー不足、`positive`/`negative`が空、`assumptions`が配列でない、`summary`が文字列でない、のいずれかに該当する場合はComfyUIでの画像生成を開始せず、理由だけを本人に返します。
+- `positive` / `negative` は `sd_prompt_template_generator.py` 側のタグ再構成・並び替え・品質タグ付与などのレガシー後処理を一切通さず、LM Studioが返した文字列をそのまま `/generate_raw` と同じ経路でComfyUIへ渡します。
+- 生成成功時は `/generate_raw` の既定（`public:true`相当）と同じく通常投稿になり、画像・Summary・Assumptions・Positive・Negative・画像選別AIの結果がチャンネル内の全員に見えます。コマンド受付中の表示、権限拒否、入力エラー、生成エラー、JSON検証エラーは常にephemeralです。
+- 生成枚数と生成後の画像選別AIは既存の `/generate` `/generate_raw` と同じです。
 
 ### 画像解析メモ
 
@@ -1335,12 +1351,12 @@ SD_SELECT_RETURN_COUNT=1
 
 動作:
 
-1. `/prompt` の「画像生成」ボタン、`/generate`、`/generate_raw`、または `/sd_generate` で画像を生成します。
+1. `/prompt` の「画像生成」ボタン、`/generate`、`/generate_raw`、`/generate_ai`、または `/sd_generate` で画像を生成します。
 2. 初号ちゃんは今回生成された画像だけを一時フォルダへコピーします。
 3. `LOCAL_AI_PROJECT_DIR\scripts\score_batch_top5.py` にその一時フォルダを渡します。
 4. 選別AIが `outputs\auto_selected\latest_top5` に出力した上位画像をDiscordへ返します。
 
-`/prompt` の「画像生成」ボタン、`/generate`、`/generate_raw` では、画像選別AIが使える場合だけ複数枚生成します。
+`/prompt` の「画像生成」ボタン、`/generate`、`/generate_raw`、`/generate_ai` では、画像選別AIが使える場合だけ複数枚生成します。
 
 - `SD_SELECT_GENERATE_COUNT`: 選別AI用に生成する枚数です。5〜20の範囲で指定します。未設定時は5枚です。
 - `SD_SELECT_RETURN_COUNT`: 選別後にDiscordへ返す枚数です。1〜3の範囲で指定します。未設定時は1枚です。

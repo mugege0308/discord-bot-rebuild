@@ -92,6 +92,7 @@ PC_SHUTDOWN_CANCEL_FAILED_MESSAGE = "シャットダウン予約のキャンセ�
 GUILD_ONLY_MESSAGE = "このコマンドはサーバー内で使ってね。"
 REQUIRED_SLASH_COMMANDS = {
     "generate_raw",
+    "generate_ai",
     "image_memory_list",
     "image_memory_show",
     "image_memory_rename",

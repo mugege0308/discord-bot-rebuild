@@ -14,6 +14,7 @@ from services.image_selection import (
 from services.pc_control import is_pc_control_allowed
 from services.prompt_generator import PromptGeneratorError, PromptGeneratorTimeout, generate_sd_prompt_result
 from services.sd_control import SdGenerationOptions, generate_images, get_negative_prompt
+from services.shogou_prompt_designer import ShogouPromptResult, generate_shogou_prompt_result
 
 
 logger = logging.getLogger("secretary-bot.prompt")
@@ -22,6 +23,10 @@ SD_DENIED_MESSAGE = "画像生成は、許可されたユーザーだけが実�
 ONLY_OWNER_MESSAGE = "この画像生成ボタンは、/prompt を実行した本人だけが押せます。"
 GENERATING_MESSAGE = "画像生成中です。少し待っててね。"
 RAW_PROMPT_MAX_LENGTH = 4000
+SHOGOU_MAX_ASSUMPTIONS_DISPLAY = 5
+SHOGOU_ASSUMPTION_ITEM_LIMIT = 200
+SHOGOU_SUMMARY_LIMIT = 300
+SHOGOU_MESSAGE_LIMIT = 1900
 
 
 async def _safe_followup_send(
@@ -190,6 +195,112 @@ async def _generate_images_from_prompts(
         len(paths),
     )
     await _send_image_files(interaction, message, send_paths, ephemeral=result_ephemeral)
+
+
+def _format_shogou_assumptions(assumptions: tuple[str, ...]) -> str:
+    if not assumptions:
+        return "（なし）"
+    shown = assumptions[:SHOGOU_MAX_ASSUMPTIONS_DISPLAY]
+    lines = [f"- {_truncate_prompt(item, limit=SHOGOU_ASSUMPTION_ITEM_LIMIT)}" for item in shown]
+    remaining = len(assumptions) - len(shown)
+    if remaining > 0:
+        lines.append(f"...(他{remaining}件省略)")
+    return "\n".join(lines)
+
+
+def _build_shogou_generated_image_message(
+    result: ShogouPromptResult,
+    selection,
+    send_count: int,
+    generated_count: int,
+) -> str:
+    selection_text = _selection_message(selection, send_count, generated_count)
+    message = (
+        f"{selection_text}\n\n"
+        "Summary:\n"
+        f"{_truncate_prompt(result.summary, limit=SHOGOU_SUMMARY_LIMIT)}\n\n"
+        "Assumptions:\n"
+        f"{_format_shogou_assumptions(result.assumptions)}\n\n"
+        "Positive:\n"
+        f"```text\n{_truncate_prompt(result.positive)}\n```\n"
+        "Negative:\n"
+        f"```text\n{_truncate_prompt(result.negative)}\n```"
+    )
+    if len(message) > SHOGOU_MESSAGE_LIMIT:
+        message = message[: SHOGOU_MESSAGE_LIMIT - 3].rstrip() + "..."
+    return message
+
+
+async def _generate_images_from_shogou_result(
+    interaction: discord.Interaction,
+    result: ShogouPromptResult,
+    *,
+    label_prefix: str,
+    result_ephemeral: bool = False,
+) -> None:
+    # Mirrors _generate_images_from_prompts' preserve_prompt_text=True path exactly,
+    # but keeps its own message builder so /generate_raw's behavior stays untouched.
+    options = _build_generation_options(
+        result.positive,
+        result.negative,
+        preserve_prompt_text=True,
+    )
+    try:
+        paths = await asyncio.to_thread(generate_images, options)
+    except Exception as exc:
+        logger.exception("Failed to generate image: label=%s", label_prefix)
+        error_text = str(exc).strip() or "unknown error"
+        await _send_error(
+            interaction,
+            f"画像生成に失敗しました: {error_text[:300]}",
+            label=f"{label_prefix}.generate.error",
+        )
+        return
+
+    selection = await asyncio.to_thread(select_generated_images, paths)
+    send_paths = selection.selected_paths or paths
+    message = _build_shogou_generated_image_message(
+        result,
+        selection,
+        len(send_paths),
+        len(paths),
+    )
+    await _send_image_files(interaction, message, send_paths, ephemeral=result_ephemeral)
+
+
+async def _build_shogou_prompt_result(
+    interaction: discord.Interaction,
+    text: str,
+    *,
+    label_prefix: str,
+    reference_id: int | None = None,
+) -> ShogouPromptResult | None:
+    try:
+        result = await asyncio.to_thread(generate_shogou_prompt_result, text, interaction.user.id, reference_id)
+        logger.info(
+            "%s result received: positive_length=%s negative_length=%s blocked=%s",
+            label_prefix,
+            len(result.positive),
+            len(result.negative),
+            result.blocked,
+        )
+        return result
+    except PromptGeneratorTimeout:
+        logger.exception("%s timed out.", label_prefix)
+        await _send_error(interaction, "LM Studioから応答がありませんでした。", label=f"{label_prefix}.timeout")
+        return None
+    except PromptGeneratorError as exc:
+        logger.exception("%s failed.", label_prefix)
+        await _send_error(interaction, str(exc), label=f"{label_prefix}.generator_error")
+        return None
+    except Exception:
+        logger.exception("Unexpected %s error.", label_prefix)
+        await _send_error(
+            interaction,
+            "プロンプト生成に失敗しました。LM Studioの起動状態を確認してください。",
+            label=f"{label_prefix}.unexpected_error",
+        )
+        return None
 
 
 class PromptImageGenerateView(discord.ui.View):
@@ -380,4 +491,43 @@ def setup(client: discord.Client) -> None:
             result_ephemeral=not public,
         )
 
-    logger.info("Registered prompt slash commands: prompt, generate, generate_raw")
+    @client.tree.command(
+        name="generate_ai",
+        description="日本語の要望からshogou-chan-prompt-designerでプロンプト生成し画像生成します。",
+    )
+    @app_commands.describe(
+        request="作りたい画像の日本語要望。",
+        reference_id="任意。全タグを使う画像参考メモID",
+    )
+    async def slash_generate_ai(
+        interaction: discord.Interaction,
+        request: str,
+        reference_id: int | None = None,
+    ) -> None:
+        await interaction.response.defer(ephemeral=True)
+        if not is_pc_control_allowed(interaction.user.id):
+            logger.warning("Denied /generate_ai by user_id=%s", interaction.user.id)
+            await _send_error(interaction, SD_DENIED_MESSAGE, label="generate_ai.denied")
+            return
+
+        result = await _build_shogou_prompt_result(interaction, request, label_prefix="generate_ai", reference_id=reference_id)
+        if result is None:
+            return
+
+        if result.blocked:
+            await _send_error(interaction, result.blocked_reason, label="generate_ai.blocked")
+            return
+
+        await _safe_followup_send(
+            interaction,
+            label="generate_ai.started",
+            content=GENERATING_MESSAGE,
+            ephemeral=True,
+        )
+        await _generate_images_from_shogou_result(
+            interaction,
+            result,
+            label_prefix="generate_ai",
+        )
+
+    logger.info("Registered prompt slash commands: prompt, generate, generate_raw, generate_ai")
