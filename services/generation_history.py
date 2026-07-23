@@ -24,6 +24,10 @@ SCHEMA_VERSION = 1
 
 _HASH_CHUNK_SIZE = 1024 * 1024
 
+# The only rating values image_ratings.rating may hold. Anything else is
+# rejected before the DB is touched.
+ALLOWED_RATINGS = ("like", "meh")
+
 
 @dataclass(frozen=True)
 class GenerationRequestRecord:
@@ -38,6 +42,15 @@ class GenerationRequestRecord:
     workflow_hash: str | None
     selection_used: bool
     selection_message: str
+
+
+@dataclass(frozen=True)
+class SavedGeneration:
+    request_id: int
+    # Index-aligned with the images passed to save_generation_history_detailed,
+    # so image_ids[i] is the row id of images[i]. This alignment is what lets
+    # sent images be tied back to their DB rows without guessing.
+    image_ids: list[int]
 
 
 def _now_text() -> str:
@@ -212,14 +225,14 @@ def _is_selected(image_path: Path, selected_paths: set[Path], selected_digests: 
     return digest is not None and digest in selected_digests
 
 
-def save_generation_history(
+def save_generation_history_detailed(
     request: GenerationRequestRecord,
     images: Sequence[GeneratedImage],
     *,
     selected_paths: Sequence[Path] = (),
-) -> int | None:
+) -> SavedGeneration | None:
     """Persists one /generate_ai request and all of its generated images in
-    a single transaction. Returns the new request id on success.
+    a single transaction. Returns the new row ids on success.
 
     Never raises: any failure (DB corruption, disk full, locked file, ...)
     is caught, logged, and reported back as None so callers can continue
@@ -258,11 +271,12 @@ def save_generation_history(
             )
             request_id = int(cursor.lastrowid)
 
+            image_ids: list[int] = []
             for image in images:
                 was_selected = request.selection_used and _is_selected(
                     image.path, selected_resolved, selected_digests
                 )
-                connection.execute(
+                image_cursor = connection.execute(
                     """
                     INSERT INTO generation_images (
                         request_id, image_path, seed, batch_index,
@@ -288,6 +302,7 @@ def save_generation_history(
                         None,
                     ),
                 )
+                image_ids.append(int(image_cursor.lastrowid))
             # sqlite3.Connection's context manager commits here on a clean
             # exit, or rolls back the whole transaction (request + images
             # together) if any of the statements above raised.
@@ -297,7 +312,121 @@ def save_generation_history(
             len(images),
             request.selection_used,
         )
-        return request_id
+        return SavedGeneration(request_id=request_id, image_ids=image_ids)
     except Exception:
         logger.exception("Failed to save generation history; continuing without blocking Discord delivery.")
         return None
+
+
+def save_generation_history(
+    request: GenerationRequestRecord,
+    images: Sequence[GeneratedImage],
+    *,
+    selected_paths: Sequence[Path] = (),
+) -> int | None:
+    """Backward-compatible wrapper returning only the request id."""
+    saved = save_generation_history_detailed(request, images, selected_paths=selected_paths)
+    return None if saved is None else saved.request_id
+
+
+def resolve_image_ids_for_paths(
+    images: Sequence[GeneratedImage],
+    image_ids: Sequence[int],
+    paths: Sequence[Path],
+) -> list[int | None]:
+    """Maps each path actually sent to Discord back to its generation_images
+    row id, returning None for any path that cannot be matched.
+
+    Uses the same exact-identity rules as _is_selected - resolved-path
+    equality first, then SHA-256 content equality - so a path that went
+    through Selection AI's rename chain still resolves. Filenames are never
+    used to guess. `image_ids` is index-aligned with `images`, which is how
+    save_generation_history_detailed returns them.
+    """
+    by_resolved: dict[Path, int] = {}
+    by_digest: dict[str, int] = {}
+    for image, image_id in zip(images, image_ids):
+        resolved = _resolved(image.path)
+        if resolved is not None:
+            by_resolved.setdefault(resolved, image_id)
+        digest = _file_digest(image.path)
+        if digest is not None:
+            # setdefault: if two generated images are byte-identical, the
+            # first one wins rather than the mapping flip-flopping.
+            by_digest.setdefault(digest, image_id)
+
+    matched: list[int | None] = []
+    for raw_path in paths:
+        path = Path(raw_path)
+        resolved = _resolved(path)
+        if resolved is not None and resolved in by_resolved:
+            matched.append(by_resolved[resolved])
+            continue
+        digest = _file_digest(path)
+        if digest is not None and digest in by_digest:
+            matched.append(by_digest[digest])
+            continue
+        logger.warning("Sent image could not be matched to a generation_images row: path=%s", path)
+        matched.append(None)
+    return matched
+
+
+def upsert_image_rating(image_id: int, user_id: int, rating: str) -> bool:
+    """Records one user's rating for one image, replacing that user's
+    previous rating if there is one. Returns True only when stored.
+
+    rated_at keeps the first-rating timestamp; updated_at moves every time,
+    including when the rating value changes. Never raises: an unknown rating,
+    a missing image_id (foreign key violation) or any DB error is logged and
+    reported as False so the caller can show a short message instead.
+    """
+    if rating not in ALLOWED_RATINGS:
+        logger.warning("Rejected unknown rating value: rating=%r image_id=%s user_id=%s", rating, image_id, user_id)
+        return False
+    try:
+        now = _now_text()
+        with _connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO image_ratings (image_id, user_id, rating, rated_at, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(image_id, user_id) DO UPDATE SET
+                    rating = excluded.rating,
+                    updated_at = excluded.updated_at
+                """,
+                (image_id, user_id, rating, now, now),
+            )
+        return True
+    except Exception:
+        logger.exception("Failed to save image rating: image_id=%s user_id=%s rating=%s", image_id, user_id, rating)
+        return False
+
+
+def set_image_discord_message(
+    image_ids: Sequence[int],
+    message_id: int,
+    channel_id: int,
+) -> bool:
+    """Attaches the Discord message/channel the images were posted in.
+
+    Best-effort: returns False on any failure instead of raising, so a
+    bookkeeping problem never breaks image delivery or rating.
+    """
+    ids = [int(image_id) for image_id in image_ids if image_id is not None]
+    if not ids:
+        return False
+    try:
+        with _connect() as connection:
+            connection.executemany(
+                "UPDATE generation_images SET discord_message_id = ?, discord_channel_id = ? WHERE id = ?",
+                [(int(message_id), int(channel_id), image_id) for image_id in ids],
+            )
+        return True
+    except Exception:
+        logger.exception(
+            "Failed to store Discord message info: message_id=%s channel_id=%s image_count=%s",
+            message_id,
+            channel_id,
+            len(ids),
+        )
+        return False

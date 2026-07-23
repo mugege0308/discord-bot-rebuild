@@ -4,6 +4,7 @@ from pathlib import Path
 from unittest import mock
 
 import commands.prompt as prompt_module
+from services.generation_history import SavedGeneration
 from services.image_selection import ImageSelectionResult
 from services.sd_control import GeneratedImage
 from services.shogou_prompt_designer import ShogouPromptResult
@@ -65,7 +66,7 @@ class HistorySaveDoesNotBlockDiscordDeliveryTestCase(unittest.IsolatedAsyncioTes
         ) as generate_mock, mock.patch(
             "commands.prompt.select_generated_images", return_value=selection
         ), mock.patch(
-            "commands.prompt.save_generation_history", return_value=None
+            "commands.prompt.save_generation_history_detailed", return_value=None
         ) as save_mock, mock.patch(
             "commands.prompt._send_image_files"
         ) as send_mock, mock.patch(
@@ -95,7 +96,7 @@ class HistorySaveDoesNotBlockDiscordDeliveryTestCase(unittest.IsolatedAsyncioTes
         ), mock.patch(
             "commands.prompt.select_generated_images", return_value=selection
         ), mock.patch(
-            "commands.prompt.save_generation_history", side_effect=RuntimeError("db exploded")
+            "commands.prompt.save_generation_history_detailed", side_effect=RuntimeError("db exploded")
         ), mock.patch(
             "commands.prompt._send_image_files"
         ) as send_mock, mock.patch(
@@ -121,7 +122,7 @@ class ComfyFailureSkipsHistorySaveTestCase(unittest.IsolatedAsyncioTestCase):
         with mock.patch(
             "commands.prompt.generate_images_with_metadata", side_effect=RuntimeError("comfy down")
         ), mock.patch(
-            "commands.prompt.save_generation_history"
+            "commands.prompt.save_generation_history_detailed"
         ) as save_mock, mock.patch(
             "commands.prompt._send_error"
         ) as error_mock, mock.patch(
@@ -157,9 +158,16 @@ class SelectionAiWasSelectedWiringTestCase(unittest.IsolatedAsyncioTestCase):
         ), mock.patch(
             "commands.prompt.select_generated_images", return_value=selection
         ), mock.patch(
-            "commands.prompt.save_generation_history", return_value=1
+            "commands.prompt.save_generation_history_detailed",
+            return_value=SavedGeneration(request_id=1, image_ids=[11, 22]),
         ) as save_mock, mock.patch(
             "commands.prompt._send_image_files"
+        ), mock.patch(
+            # Keep the Phase 1B bookkeeping out of this test: without it the
+            # real set_image_discord_message would create data/generation_history.db
+            # in the repo.
+            "commands.prompt.set_image_discord_message",
+            return_value=True,
         ):
             await prompt_module._generate_images_from_shogou_result(
                 interaction,
@@ -192,7 +200,7 @@ class ExistingCommandsUnaffectedByHistoryIntegrationTestCase(unittest.TestCase):
 
         self.assertTrue(_references_name(function, "generate_images"))
         self.assertFalse(_references_name(function, "generate_images_with_metadata"))
-        self.assertFalse(_references_name(function, "save_generation_history"))
+        self.assertFalse(_references_name(function, "save_generation_history_detailed"))
 
     def test_slash_generate_raw_is_unaffected(self):
         function = _find_function(self.tree, "slash_generate_raw")
@@ -200,7 +208,7 @@ class ExistingCommandsUnaffectedByHistoryIntegrationTestCase(unittest.TestCase):
 
         self.assertEqual(arg_names, ["interaction", "positive", "negative", "use_default_negative", "public"])
         self.assertTrue(_find_calls(function, "_generate_images_from_prompts"))
-        self.assertFalse(_find_calls(function, "save_generation_history"))
+        self.assertFalse(_find_calls(function, "save_generation_history_detailed"))
 
     def test_only_generate_ai_path_uses_the_detailed_generation_api(self):
         shogou_function = _find_function(self.tree, "_generate_images_from_shogou_result")

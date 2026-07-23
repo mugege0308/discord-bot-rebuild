@@ -6,7 +6,14 @@ import discord
 from discord import app_commands
 
 from sd_prompt_template_generator import build_discord_prompt_message
-from services.generation_history import GenerationRequestRecord, save_generation_history
+from services.generation_history import (
+    GenerationRequestRecord,
+    SavedGeneration,
+    resolve_image_ids_for_paths,
+    save_generation_history_detailed,
+    set_image_discord_message,
+    upsert_image_rating,
+)
 from services.image_selection import (
     get_selection_generate_count,
     is_image_selection_available,
@@ -36,6 +43,88 @@ SHOGOU_SUMMARY_LIMIT = 300
 SHOGOU_MESSAGE_LIMIT = 1900
 
 
+# Discord allows at most 10 attachments per message; the rating UI is built
+# to match, so every sent image can carry its own pair of buttons.
+MAX_SEND_IMAGE_FILES = 10
+# 2 buttons per image, laid out 2 images (4 buttons) per action row, so 10
+# images fill exactly 5 rows of 4 - inside Discord's 5-row / 5-per-row limit.
+RATING_IMAGES_PER_ROW = 2
+RATING_VIEW_TIMEOUT_SECONDS = 3600
+RATING_LABELS = {"like": "好き", "meh": "微妙"}
+RATING_EMOJI = {"like": "👍", "meh": "👎"}
+
+
+class ImageRatingButton(discord.ui.Button):
+    def __init__(self, *, image_id: int, rating: str, display_index: int, row: int) -> None:
+        super().__init__(
+            style=discord.ButtonStyle.secondary,
+            label=f"{RATING_EMOJI[rating]} {RATING_LABELS[rating]} {display_index}",
+            custom_id=f"genai_rate:{image_id}:{rating}",
+            row=row,
+        )
+        self.image_id = image_id
+        self.rating = rating
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        # Anyone may press: image_ratings is keyed by (image_id, user_id), so
+        # each presser's rating is stored as their own, and pressing again
+        # replaces only that user's previous value.
+        try:
+            stored = await asyncio.to_thread(
+                upsert_image_rating, self.image_id, interaction.user.id, self.rating
+            )
+        except Exception:
+            logger.exception("Unexpected error while saving image rating: image_id=%s", self.image_id)
+            stored = False
+
+        if stored:
+            text = f"{RATING_LABELS[self.rating]}として保存しました。"
+        else:
+            # Never surface the DB error itself to Discord.
+            text = "評価を保存できませんでした。時間をおいてもう一度試してね。"
+        try:
+            await interaction.response.send_message(text, ephemeral=True)
+        except Exception:
+            logger.exception("Failed to reply to rating button: image_id=%s", self.image_id)
+
+
+class ImageRatingView(discord.ui.View):
+    """Buttons for rating the images /generate_ai actually sent.
+
+    Not a persistent view: after RATING_VIEW_TIMEOUT_SECONDS (or a bot
+    restart) the buttons stop working. Restoring them is out of scope for
+    Phase 1B; the generated images and saved history are unaffected.
+    """
+
+    def __init__(self, rateable_images: list[tuple[int, int]]) -> None:
+        super().__init__(timeout=RATING_VIEW_TIMEOUT_SECONDS)
+        self.message: discord.Message | None = None
+        self.rateable_images = rateable_images
+        for position, (display_index, image_id) in enumerate(rateable_images[:MAX_SEND_IMAGE_FILES]):
+            row = position // RATING_IMAGES_PER_ROW
+            for rating in ("like", "meh"):
+                self.add_item(
+                    ImageRatingButton(
+                        image_id=image_id,
+                        rating=rating,
+                        display_index=display_index,
+                        row=row,
+                    )
+                )
+
+    async def on_timeout(self) -> None:
+        for child in self.children:
+            child.disabled = True
+        if self.message is None:
+            return
+        try:
+            await self.message.edit(view=self)
+        except Exception:
+            # The message may be gone or no longer editable; the already
+            # delivered images and stored ratings still stand.
+            logger.info("Could not disable rating buttons after timeout.", exc_info=True)
+
+
 async def _safe_followup_send(
     interaction: discord.Interaction,
     *,
@@ -44,7 +133,8 @@ async def _safe_followup_send(
     files: list[discord.File] | None = None,
     view: discord.ui.View | None = None,
     ephemeral: bool = True,
-) -> None:
+    wait: bool = False,
+) -> "discord.Message | None":
     logger.info(
         "Discord followup.send before: label=%s content_length=%s file_count=%s has_view=%s ephemeral=%s",
         label,
@@ -64,9 +154,15 @@ async def _safe_followup_send(
             kwargs["files"] = files
         if view is not None:
             kwargs["view"] = view
-        await interaction.followup.send(**kwargs)
+        # wait=True is only requested by callers that need the resulting
+        # Message back; existing callers keep the previous fire-and-forget
+        # behavior untouched.
+        if wait:
+            kwargs["wait"] = True
+        return await interaction.followup.send(**kwargs)
     except Exception:
         logger.exception("Discord followup.send failed: label=%s", label)
+        return None
         raise
     logger.info("Discord followup.send after: label=%s", label)
 
@@ -84,17 +180,24 @@ async def _send_image_files(
     paths: list[Path],
     *,
     ephemeral: bool = True,
-) -> None:
+    view: discord.ui.View | None = None,
+    wait: bool = False,
+) -> "discord.Message | None":
+    # view/wait are optional additions for /generate_ai's rating buttons.
+    # Callers that omit them (/generate, /generate_raw, /character_generate)
+    # behave exactly as before and can keep ignoring the return value.
     files: list[discord.File] = []
     try:
-        for path in list(paths)[:10]:
+        for path in list(paths)[:MAX_SEND_IMAGE_FILES]:
             files.append(discord.File(str(path), filename=path.name))
-        await _safe_followup_send(
+        return await _safe_followup_send(
             interaction,
             label="prompt.image_files",
             content=message,
             files=files,
             ephemeral=ephemeral,
+            view=view,
+            wait=wait,
         )
     finally:
         for file in files:
@@ -246,12 +349,12 @@ async def _save_generation_history_safely(
     result: ShogouPromptResult,
     generated_images: list[GeneratedImage],
     selection,
-) -> None:
+) -> SavedGeneration | None:
     # Best-effort only: a history-save failure must never block the Discord
     # result from being sent, and must never crash the bot. Any exception
     # here (including one raised while building the record itself, before
-    # save_generation_history's own internal try/except is even reached) is
-    # caught and logged.
+    # save_generation_history_detailed's own internal try/except is even
+    # reached) is caught and logged.
     try:
         workflow_file = generated_images[0].workflow_file if generated_images else None
         workflow_hash = generated_images[0].workflow_hash if generated_images else None
@@ -268,21 +371,79 @@ async def _save_generation_history_safely(
             selection_used=selection.used_selection,
             selection_message=selection.message or selection.error or "",
         )
-        request_id = await asyncio.to_thread(
-            save_generation_history,
+        saved = await asyncio.to_thread(
+            save_generation_history_detailed,
             request_record,
             generated_images,
             selected_paths=selection.selected_paths,
         )
-        if request_id is None:
+        if saved is None:
             logger.error(
                 "Generation history save reported failure for /generate_ai "
                 "(see services.generation_history logs); continuing without blocking Discord delivery."
             )
+        return saved
     except Exception:
         logger.exception(
             "Unexpected error while saving generation history; continuing without blocking Discord delivery."
         )
+        return None
+
+
+async def _build_rating_view(
+    saved: SavedGeneration | None,
+    generated_images: list[GeneratedImage],
+    send_paths: list[Path],
+) -> tuple["ImageRatingView | None", list[int]]:
+    """Builds the rating buttons for the images actually sent to Discord.
+
+    Only sent images get buttons - anything Selection AI dropped is never
+    rateable. display_index follows the attachment order so the button label
+    matches what the user sees, even when one image fails to map.
+    """
+    if saved is None or not saved.image_ids:
+        return None, []
+    try:
+        matched = await asyncio.to_thread(
+            resolve_image_ids_for_paths,
+            generated_images,
+            saved.image_ids,
+            send_paths[:MAX_SEND_IMAGE_FILES],
+        )
+    except Exception:
+        logger.exception("Failed to map sent images to history rows; skipping rating buttons.")
+        return None, []
+
+    rateable = [
+        (display_index, image_id)
+        for display_index, image_id in enumerate(matched, start=1)
+        if image_id is not None
+    ]
+    if not rateable:
+        logger.warning("No sent image could be matched to a history row; rating buttons skipped.")
+        return None, []
+    return ImageRatingView(rateable), [image_id for _, image_id in rateable]
+
+
+async def _store_discord_message_safely(
+    image_ids: list[int],
+    sent_message: "discord.Message | None",
+) -> None:
+    # Bookkeeping only: a failure here must not affect the delivered images
+    # or the rating buttons that are already live.
+    if sent_message is None or not image_ids:
+        return
+    try:
+        channel = getattr(sent_message, "channel", None)
+        channel_id = getattr(channel, "id", None)
+        if channel_id is None:
+            logger.info("Sent message has no channel id; skipping Discord message bookkeeping.")
+            return
+        await asyncio.to_thread(
+            set_image_discord_message, image_ids, sent_message.id, channel_id
+        )
+    except Exception:
+        logger.exception("Failed to store Discord message info for rated images.")
 
 
 async def _generate_images_from_shogou_result(
@@ -323,7 +484,7 @@ async def _generate_images_from_shogou_result(
         len(paths),
     )
 
-    await _save_generation_history_safely(
+    saved = await _save_generation_history_safely(
         user_id=interaction.user.id,
         request_text=request_text,
         reference_id=reference_id,
@@ -332,7 +493,20 @@ async def _generate_images_from_shogou_result(
         selection=selection,
     )
 
-    await _send_image_files(interaction, message, send_paths, ephemeral=result_ephemeral)
+    view, rated_image_ids = await _build_rating_view(saved, generated_images, send_paths)
+    sent_message = await _send_image_files(
+        interaction,
+        message,
+        send_paths,
+        ephemeral=result_ephemeral,
+        view=view,
+        # Only ask Discord for the Message back when we have something to
+        # record against it.
+        wait=view is not None,
+    )
+    if view is not None:
+        view.message = sent_message
+        await _store_discord_message_safely(rated_image_ids, sent_message)
 
 
 async def _build_shogou_prompt_result(
