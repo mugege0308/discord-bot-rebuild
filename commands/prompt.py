@@ -43,15 +43,18 @@ SHOGOU_SUMMARY_LIMIT = 300
 SHOGOU_MESSAGE_LIMIT = 1900
 
 
-# Discord allows at most 10 attachments per message; the rating UI is built
-# to match, so every sent image can carry its own pair of buttons.
+# Discord allows at most 10 attachments per message.
 MAX_SEND_IMAGE_FILES = 10
-# 2 buttons per image, laid out 2 images (4 buttons) per action row, so 10
-# images fill exactly 5 rows of 4 - inside Discord's 5-row / 5-per-row limit.
-RATING_IMAGES_PER_ROW = 2
+RATING_ORDER = ("like", "meh", "off_target")
 RATING_VIEW_TIMEOUT_SECONDS = 3600
-RATING_LABELS = {"like": "好き", "meh": "微妙"}
-RATING_EMOJI = {"like": "👍", "meh": "👎"}
+RATING_LABELS = {"like": "好き", "meh": "微妙", "off_target": "想定と違う"}
+RATING_EMOJI = {"like": "👍", "meh": "👎", "off_target": "🎯"}
+# 3 buttons per image, so 1 image per action row (3 buttons/row, within
+# Discord's 5-per-row limit). With Discord's 5-row cap, only the first 5
+# rateable images (in attachment order) get buttons; the rest are still
+# sent, just without rating buttons.
+RATING_IMAGES_PER_ROW = 1
+MAX_RATEABLE_IMAGES = 5 * RATING_IMAGES_PER_ROW
 
 
 class ImageRatingButton(discord.ui.Button):
@@ -100,9 +103,9 @@ class ImageRatingView(discord.ui.View):
         super().__init__(timeout=RATING_VIEW_TIMEOUT_SECONDS)
         self.message: discord.Message | None = None
         self.rateable_images = rateable_images
-        for position, (display_index, image_id) in enumerate(rateable_images[:MAX_SEND_IMAGE_FILES]):
+        for position, (display_index, image_id) in enumerate(rateable_images[:MAX_RATEABLE_IMAGES]):
             row = position // RATING_IMAGES_PER_ROW
-            for rating in ("like", "meh"):
+            for rating in RATING_ORDER:
                 self.add_item(
                     ImageRatingButton(
                         image_id=image_id,

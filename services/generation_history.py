@@ -26,7 +26,7 @@ _HASH_CHUNK_SIZE = 1024 * 1024
 
 # The only rating values image_ratings.rating may hold. Anything else is
 # rejected before the DB is touched.
-ALLOWED_RATINGS = ("like", "meh")
+ALLOWED_RATINGS = ("like", "meh", "off_target")
 
 
 @dataclass(frozen=True)

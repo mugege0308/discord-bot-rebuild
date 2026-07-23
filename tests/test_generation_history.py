@@ -316,6 +316,43 @@ class ImageRatingTestCase(GenerationHistoryTestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["rating"], "meh")
 
+    def test_off_target_is_stored_on_first_rating(self):
+        image_id = self._save_one_image()
+
+        self.assertTrue(upsert_image_rating(image_id, user_id=42, rating="off_target"))
+
+        rows = self._rating_rows(image_id)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["rating"], "off_target")
+
+    def test_like_rating_updated_to_off_target_keeps_rated_at(self):
+        image_id = self._save_one_image()
+        self.assertTrue(upsert_image_rating(image_id, user_id=42, rating="like"))
+        first = self._rating_rows(image_id)[0]
+
+        with mock.patch("services.generation_history._now_text", return_value="2026-07-23T12:00:00+09:00"):
+            self.assertTrue(upsert_image_rating(image_id, user_id=42, rating="off_target"))
+
+        rows = self._rating_rows(image_id)
+        self.assertEqual(len(rows), 1, "an update must not add a second row")
+        self.assertEqual(rows[0]["rating"], "off_target")
+        self.assertEqual(rows[0]["rated_at"], first["rated_at"])
+        self.assertEqual(rows[0]["updated_at"], "2026-07-23T12:00:00+09:00")
+
+    def test_off_target_rating_updated_to_meh_keeps_rated_at(self):
+        image_id = self._save_one_image()
+        self.assertTrue(upsert_image_rating(image_id, user_id=42, rating="off_target"))
+        first = self._rating_rows(image_id)[0]
+
+        with mock.patch("services.generation_history._now_text", return_value="2026-07-23T13:00:00+09:00"):
+            self.assertTrue(upsert_image_rating(image_id, user_id=42, rating="meh"))
+
+        rows = self._rating_rows(image_id)
+        self.assertEqual(len(rows), 1, "an update must not add a second row")
+        self.assertEqual(rows[0]["rating"], "meh")
+        self.assertEqual(rows[0]["rated_at"], first["rated_at"])
+        self.assertEqual(rows[0]["updated_at"], "2026-07-23T13:00:00+09:00")
+
     def test_repeated_rating_updates_value_and_keeps_rated_at(self):
         image_id = self._save_one_image()
         self.assertTrue(upsert_image_rating(image_id, user_id=42, rating="like"))
@@ -348,8 +385,8 @@ class ImageRatingTestCase(GenerationHistoryTestCase):
 
         self.assertEqual(self._rating_rows(image_id), [])
 
-    def test_allowed_ratings_are_exactly_like_and_meh(self):
-        self.assertEqual(set(ALLOWED_RATINGS), {"like", "meh"})
+    def test_allowed_ratings_are_exactly_like_meh_and_off_target(self):
+        self.assertEqual(set(ALLOWED_RATINGS), {"like", "meh", "off_target"})
 
     def test_unknown_image_id_is_rejected_and_returns_false(self):
         self._save_one_image()

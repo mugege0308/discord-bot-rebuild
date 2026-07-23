@@ -27,17 +27,30 @@ def _make_generated_images(count: int = 1) -> list[GeneratedImage]:
 
 
 class ImageRatingViewLayoutTestCase(unittest.TestCase):
-    def test_each_image_gets_a_like_and_a_meh_button(self):
+    def test_each_image_gets_like_meh_and_off_target_buttons(self):
         view = ImageRatingView([(1, 101), (2, 202)])
 
         ratings = [(child.image_id, child.rating) for child in view.children]
-        self.assertEqual(ratings, [(101, "like"), (101, "meh"), (202, "like"), (202, "meh")])
+        self.assertEqual(
+            ratings,
+            [
+                (101, "like"),
+                (101, "meh"),
+                (101, "off_target"),
+                (202, "like"),
+                (202, "meh"),
+                (202, "off_target"),
+            ],
+        )
 
     def test_custom_id_contains_the_db_image_id(self):
         view = ImageRatingView([(1, 4242)])
 
         custom_ids = [child.custom_id for child in view.children]
-        self.assertEqual(custom_ids, ["genai_rate:4242:like", "genai_rate:4242:meh"])
+        self.assertEqual(
+            custom_ids,
+            ["genai_rate:4242:like", "genai_rate:4242:meh", "genai_rate:4242:off_target"],
+        )
         for custom_id in custom_ids:
             self.assertLessEqual(len(custom_id), 100, "Discord custom_id limit")
 
@@ -47,18 +60,35 @@ class ImageRatingViewLayoutTestCase(unittest.TestCase):
         view = ImageRatingView([(1, 101), (3, 303)])
 
         labels = [child.label for child in view.children]
-        self.assertEqual(labels, ["👍 好き 1", "👎 微妙 1", "👍 好き 3", "👎 微妙 3"])
+        self.assertEqual(
+            labels,
+            ["👍 好き 1", "👎 微妙 1", "🎯 想定と違う 1", "👍 好き 3", "👎 微妙 3", "🎯 想定と違う 3"],
+        )
 
     def test_ten_images_stay_within_discord_component_limits(self):
+        # 3 buttons/image means only the first MAX_RATEABLE_IMAGES (5, in
+        # attachment order) get buttons - 10 images would need 30 button
+        # slots, which exceeds Discord's 5-row x 5-per-row (25) cap.
         view = ImageRatingView([(index, index * 10) for index in range(1, 11)])
 
-        self.assertEqual(len(view.children), 20)
+        self.assertEqual(len(view.children), 15)
+        self.assertEqual(
+            sorted({child.image_id for child in view.children}),
+            [10, 20, 30, 40, 50],
+            "only the first 5 images (by attachment order) become rateable",
+        )
         rows = {}
         for child in view.children:
             rows.setdefault(child.row, []).append(child)
         self.assertLessEqual(len(rows), 5, "Discord allows at most 5 action rows")
         for row, children in rows.items():
             self.assertLessEqual(len(children), 5, f"row {row} exceeds 5 components")
+
+    def test_five_images_all_get_buttons_within_limits(self):
+        view = ImageRatingView([(index, index * 10) for index in range(1, 6)])
+
+        self.assertEqual(len(view.children), 15)
+        self.assertEqual(sorted({child.image_id for child in view.children}), [10, 20, 30, 40, 50])
 
     def test_timeout_is_one_hour(self):
         self.assertEqual(ImageRatingView([(1, 1)]).timeout, 3600)
@@ -97,6 +127,18 @@ class ImageRatingButtonCallbackTestCase(unittest.IsolatedAsyncioTestCase):
 
         args, kwargs = interaction.response.send_message.call_args
         self.assertIn("微妙", args[0])
+        self.assertTrue(kwargs["ephemeral"])
+
+    async def test_off_target_press_saves_and_replies_ephemerally(self):
+        button = ImageRatingButton(image_id=101, rating="off_target", display_index=1, row=0)
+        interaction = self._interaction()
+
+        with mock.patch("commands.prompt.upsert_image_rating", return_value=True) as upsert:
+            await button.callback(interaction)
+
+        upsert.assert_called_once_with(101, 42, "off_target")
+        args, kwargs = interaction.response.send_message.call_args
+        self.assertIn("想定と違う", args[0])
         self.assertTrue(kwargs["ephemeral"])
 
     async def test_other_user_press_is_saved_as_that_users_rating(self):
@@ -182,7 +224,7 @@ class RatingViewBuildTestCase(unittest.IsolatedAsyncioTestCase):
             view, rated_ids = await prompt_module._build_rating_view(saved, images, send_paths)
 
         self.assertEqual(rated_ids, [22])
-        self.assertEqual([child.image_id for child in view.children], [22, 22])
+        self.assertEqual([child.image_id for child in view.children], [22, 22, 22])
         # The unsent images must never be offered for rating.
         self.assertNotIn(11, rated_ids)
         self.assertNotIn(33, rated_ids)
@@ -213,7 +255,10 @@ class RatingViewBuildTestCase(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(rated_ids, [22])
-        self.assertEqual([child.label for child in view.children], ["👍 好き 2", "👎 微妙 2"])
+        self.assertEqual(
+            [child.label for child in view.children],
+            ["👍 好き 2", "👎 微妙 2", "🎯 想定と違う 2"],
+        )
 
     async def test_mapping_failure_skips_buttons_without_raising(self):
         images = _make_generated_images(1)
@@ -293,7 +338,7 @@ class GenerateAiEndToEndWiringTestCase(unittest.IsolatedAsyncioTestCase):
         view = send_mock.call_args.kwargs["view"]
         self.assertIsInstance(view, ImageRatingView)
         self.assertTrue(send_mock.call_args.kwargs["wait"])
-        self.assertEqual([child.image_id for child in view.children], [11, 11])
+        self.assertEqual([child.image_id for child in view.children], [11, 11, 11])
         self.assertIs(view.message, sent_message)
         store_mock.assert_called_once_with([11], 999, 888)
 
