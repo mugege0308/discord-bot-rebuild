@@ -1155,6 +1155,7 @@ LM Studio側でローカルサーバーが起動していない場合、`/health
 
 - 入力項目は `request`（日本語の要望、必須）と `reference_id`（画像参考メモID、任意）だけです。
 - system promptには、リポジトリ直下の `shogou_chan_prompt_designer_instruction.md`（`outputs/shogou-chan-prompt-designer/SKILL.md` からClaude Code向けの記述を除いて作成した専用ファイル）を使います。`fixed_template_llm_instruction.md` を使う `/prompt` `/generate` とは別の指示文です。
+- 色彩・明るさの判断は、`shogou_chan_prompt_designer_instruction.md` の「色彩・光の設計」セクションで決まります（Phase 1E）。ユーザーの明示指定 → 既知キャラクターの配色 → 髪色・瞳色・衣装 → シーンの種類 → 指定が弱い場合はニュートラルな明るさ、の優先順位で判断し、指定が弱いときの既定は `neutral lighting` / `natural lighting` / `balanced color palette` です。寒色・暗さ・強い逆光をデフォルトで追加しません。
 - 通常Memoryと画像参考Memory（Image Memory）はどちらも使います。`reference_id` を指定した場合はそのMemoryのタグを優先し、未指定の場合は既存の自動関連判定をそのまま使います。
 - LM Studioの返答は次の順で解析します: `<think>...</think>` の除去 → Markdownコードフェンスの除去 → 前後の説明文からのJSON抽出 → `positive` / `negative` / `summary` / `assumptions` の4キー・型・必須項目の検証。
 - `<think>` の閉じタグが無い場合でも、レスポンス全体を誤って消さない実装になっています（閉じタグが見つからない場合は除去処理をスキップし、後続のJSON抽出へそのまま進みます）。

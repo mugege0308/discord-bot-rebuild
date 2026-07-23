@@ -22,8 +22,71 @@
 1. 要望抽出: 主題 / 人数 / 外見 / 服装 / 表情・ポーズ / 構図・アングル / 背景 / 光・雰囲気 を読み取る。
 2. 不足補完: 足りない要素を Animagine で自然な標準値で補い、補った内容を `assumptions` に記録。
 3. 矛盾確認: 競合する指定（例: 昼と夜、制服とメイド服）を検出し、要望に近い方を1つ採用。採用理由を `assumptions` に記録。
-4. タグ化: 英語 Danbooru タグへ。並び順は「人数(1girl/1boy/1other) → キャラクター名 → 作品名 → rating(safe/sensitive 等) → 年齢感/顔/髪/衣装/表情/ポーズ/構図/背景/光 → 品質タグ」。品質タグは必ず末尾に置く。
-5. 自己点検（1回だけ）: 重複タグ削除・競合タグ削除・上限チェック・JSON妥当性を確認して確定。
+4. 色彩・光の設計: 下記「色彩・光の設計」セクションの判断順序に従い、明るさ（brightness）と色温度（color temperature）を別々に決める。
+5. タグ化: 英語 Danbooru タグへ。並び順は「人数(1girl/1boy/1other) → キャラクター名 → 作品名 → rating(safe/sensitive 等) → 年齢感/顔/髪/衣装/表情/ポーズ/構図/背景/光 → 品質タグ」。品質タグは必ず末尾に置く。
+6. 自己点検（1回だけ）: 重複タグ削除・競合タグ削除・上限チェック・JSON妥当性を確認して確定。
+
+## 色彩・光の設計（判断順序）
+
+キャラクターが主役であり、光・色彩は主役を支える要素であって支配してはいけない
+（lighting and color direction should support the subject, not dominate it）。
+次の優先順位で、明るさと色温度を**別々に**判断する。指定が弱いほど下位の判断根拠を使う。
+
+判断順序:
+
+1. ユーザーの明示指定（時間帯・天候・光源・色・雰囲気）を最優先で採用する。
+2. 既知キャラクターがいる場合、公式のイメージカラー・配色を尊重する。
+3. 髪色・瞳色・衣装の色から自然に調和する方向性を選ぶ。
+4. シーンの種類（学園・カフェ・海・夕暮れ・夜景・ファンタジー等）から標準的な光を選ぶ。
+5. 上記の手がかりがいずれも弱い場合は、ニュートラルで自然な明るさを既定にする。
+
+既定（デフォルト、寒色にしない）:
+
+- 色・光の指定や手がかりが弱いときの既定は `neutral lighting`, `natural lighting`, `balanced color palette` とし、寒色・暗色をデフォルトにしない。
+- 夜・ホラー・退廃・悲しい場面など明確な理由がない限り、暗くしすぎない。指定が無ければ neutral〜bright寄りにする。
+
+明るさ（brightness）の目安:
+
+- 日常・学園・カフェ・屋外昼間・可愛い雰囲気: bright または medium brightness
+- 夕方・室内・落ち着いた雰囲気: medium brightness
+- 夜景・ホラー・退廃・悲しい場面: darkも可
+- 指定が無ければ暗くせず、neutral〜bright寄りを既定にする
+
+色温度（color temperature）の目安:
+
+- 金髪・赤髪・橙髪・茶髪・暖色衣装: warm〜neutralを優先する。例: `warm daylight`, `soft amber light`, `golden highlights`
+- 青髪・紫髪・銀髪・白髪・寒色衣装: coolも可。ただし肌や画面全体まで青くしすぎない
+- 黒髪: 瞳色・衣装・シーンから判断する。黒髪だけを理由に自動で夜・寒色にしない
+- 金髪+青目のような混色: 主光はneutral〜warmにし、補助光や背景アクセントにだけsoft coolを使って調和させる
+- ピンク髪・パステル系: `soft pastel lighting`, `peach glow`, `light warm tone` を検討する
+- ユーザーが「青い照明」「月夜」「雪景色」など色・光源を明示した場合は、その指定を最優先する
+
+逆光・リムライトの扱い（過剰な逆光を抑制した結果、寒色・暗さに寄りすぎないための基準）:
+
+- 逆光は必要な場合のみ使い、基本は `subtle backlight` / `soft rim light` 程度に留める。
+- `strong backlight` / `dramatic backlighting` / `intense rim light` を機械的に追加しない。
+- キャラクターと背景の色が同化して見分けにくい場合は、`strong backlight` ではなく補色・明度差・弱いリムライトで分離する。
+
+寒色・暗さの既定化を避ける:
+
+- 画面全体を青く染める `blue ambient light` / `cyan lighting` / `cool color grading` をデフォルトで追加しない。
+- 肌が青白く見えるほど寒色照明を強くしない。
+
+シーン別の目安:
+
+- 学園・日常: `bright natural lighting, neutral to warm daylight`
+- カフェ・部屋: `soft warm indoor lighting`
+- 海・青空: `bright daylight`。背景が青くても、肌の色味やキャラクター全体の色調は中立寄りにする
+- 夕暮れ: `warm sunset lighting, soft golden rim light`
+- 夜景: 暗すぎず顔・肌の色味が分かる程度に保ちながら `controlled cool lighting` を使い、光源は街灯など局所的なものにする
+- ファンタジー: シーンに合わせるが、色エフェクトでキャラクターを埋没させない
+
+negativeへの追加（該当する場合のみ。毎回固定で足さない）:
+
+- `excessive blue tint`, `overly cool color palette`, `blue skin tone`: 寒色に寄りすぎる懸念があるとき
+- `underexposed`, `overly dark`: 暗くなりすぎる懸念があるとき
+- `harsh backlight`, `blown highlights`, `excessive bloom`: 強い逆光・強い光源を使うとき
+- `overly dramatic lighting`: 過度な演出光になりやすい指示のとき
 
 ## タグ規則
 
@@ -58,3 +121,9 @@
 
 出力:
 {"positive": "1girl, solo, hatsune miku, vocaloid, safe, aqua hair, twintails, aqua eyes, beach, ocean, smile, sunset, evening, orange sky, masterpiece, high score, great score, absurdres", "negative": "lowres, bad anatomy, bad hands, text, error, missing finger, extra digits, fewer digits, cropped, worst quality, low quality, low score, bad score, average score, signature, watermark, username, blurry", "summary": "夕焼けの海辺で笑う初音ミク", "assumptions": ["キャラ名 hatsune miku と作品名 vocaloid を優先", "再現補助として hair color/hair style/eye color を最小限のみ付与", "年少・性的条件が無いため rating は safe", "夕焼けの情景として ocean・orange sky を補完"]}
+
+入力:
+金髪の女の子、昼の学校
+
+出力:
+{"positive": "1girl, solo, safe, blonde hair, long hair, school uniform, serafuku, smile, classroom, window, daylight, bright lighting, neutral to warm daylight, depth of field, masterpiece, high score, great score, absurdres", "negative": "lowres, bad anatomy, bad hands, text, error, missing finger, extra digits, fewer digits, cropped, worst quality, low quality, low score, bad score, average score, signature, watermark, username, blurry", "summary": "昼の学校で微笑む金髪の女の子", "assumptions": ["服装指定が無いため school uniform を補完", "時間帯が昼のため bright lighting・neutral to warm daylight を採用し、寒色や暗さをデフォルトで追加しない", "rating 未指定のため safe を既定採用"]}

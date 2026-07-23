@@ -154,7 +154,8 @@ def _build_composition_variation_instruction(
     return (
         "\n\n---\n"
         "これは既存の生成結果をもとにした「構図を変えて再生成」リクエストです。"
-        "以下の元の生成条件をもとに、キャラクター・衣装・雰囲気・重要な属性はそのまま維持しつつ、"
+        "以下の元の生成条件をもとに、キャラクター・衣装・雰囲気・重要な属性、"
+        "および元の色彩・明るさ・光の方向性（色温度や逆光の強さなど）はそのまま維持しつつ、"
         "構図・カメラ角度・ポーズ・画面内配置だけを変更した新しいpositive/negative/summary/assumptionsを作成してください。\n\n"
         f"元のリクエスト: {parent_request_text}\n"
         f"元のPositive: {parent_positive}\n"
