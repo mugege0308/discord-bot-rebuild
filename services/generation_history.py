@@ -25,8 +25,10 @@ SCHEMA_VERSION = 2
 _HASH_CHUNK_SIZE = 1024 * 1024
 
 # The only rating values image_ratings.rating may hold. Anything else is
-# rejected before the DB is touched.
-ALLOWED_RATINGS = ("like", "meh", "off_target")
+# rejected before the DB is touched. Phase 1D added "favorite" alongside the
+# existing three - the column is untyped TEXT, so no schema change was
+# needed, and existing like/meh/off_target rows are unaffected.
+ALLOWED_RATINGS = ("favorite", "like", "meh", "off_target")
 
 # The only regeneration_type values generation_requests.regeneration_type
 # may hold (besides NULL, for a request that is not a regeneration at all).

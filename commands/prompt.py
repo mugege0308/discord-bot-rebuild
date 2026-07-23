@@ -51,11 +51,11 @@ SHOGOU_MESSAGE_LIMIT = 1900
 
 # Discord allows at most 10 attachments per message.
 MAX_SEND_IMAGE_FILES = 10
-RATING_ORDER = ("like", "meh", "off_target")
+RATING_ORDER = ("favorite", "like", "meh", "off_target")
 RATING_VIEW_TIMEOUT_SECONDS = 3600
-RATING_LABELS = {"like": "好き", "meh": "微妙", "off_target": "想定と違う"}
-RATING_EMOJI = {"like": "👍", "meh": "👎", "off_target": "🎯"}
-# 3 buttons per image, so 1 image per action row (3 buttons/row, within
+RATING_LABELS = {"favorite": "お気に入り", "like": "好き", "meh": "微妙", "off_target": "想定と違う"}
+RATING_EMOJI = {"favorite": "⭐", "like": "👍", "meh": "👎", "off_target": "🎯"}
+# 4 buttons per image, so 1 image per action row (4 buttons/row, within
 # Discord's 5-per-row limit). Discord allows at most 5 action rows per
 # message, and Phase 1C reserves the last one (REGENERATE_ROW) for the
 # regenerate buttons, so only 4 rows - the first 4 rateable images in

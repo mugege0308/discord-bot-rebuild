@@ -33,16 +33,18 @@ def _make_generated_images(count: int = 1) -> list[GeneratedImage]:
 
 
 class ImageRatingViewLayoutTestCase(unittest.TestCase):
-    def test_each_image_gets_like_meh_and_off_target_buttons(self):
+    def test_each_image_gets_favorite_like_meh_and_off_target_buttons(self):
         view = ImageRatingView([(1, 101), (2, 202)])
 
         ratings = [(child.image_id, child.rating) for child in view.children]
         self.assertEqual(
             ratings,
             [
+                (101, "favorite"),
                 (101, "like"),
                 (101, "meh"),
                 (101, "off_target"),
+                (202, "favorite"),
                 (202, "like"),
                 (202, "meh"),
                 (202, "off_target"),
@@ -55,7 +57,12 @@ class ImageRatingViewLayoutTestCase(unittest.TestCase):
         custom_ids = [child.custom_id for child in view.children]
         self.assertEqual(
             custom_ids,
-            ["genai_rate:4242:like", "genai_rate:4242:meh", "genai_rate:4242:off_target"],
+            [
+                "genai_rate:4242:favorite",
+                "genai_rate:4242:like",
+                "genai_rate:4242:meh",
+                "genai_rate:4242:off_target",
+            ],
         )
         for custom_id in custom_ids:
             self.assertLessEqual(len(custom_id), 100, "Discord custom_id limit")
@@ -68,17 +75,20 @@ class ImageRatingViewLayoutTestCase(unittest.TestCase):
         labels = [child.label for child in view.children]
         self.assertEqual(
             labels,
-            ["👍 好き 1", "👎 微妙 1", "🎯 想定と違う 1", "👍 好き 3", "👎 微妙 3", "🎯 想定と違う 3"],
+            [
+                "⭐ お気に入り 1", "👍 好き 1", "👎 微妙 1", "🎯 想定と違う 1",
+                "⭐ お気に入り 3", "👍 好き 3", "👎 微妙 3", "🎯 想定と違う 3",
+            ],
         )
 
     def test_ten_images_stay_within_discord_component_limits(self):
-        # 3 buttons/image means only the first MAX_RATEABLE_IMAGES (4, in
+        # 4 buttons/image means only the first MAX_RATEABLE_IMAGES (4, in
         # attachment order - Phase 1C reserves the 5th row for regenerate
         # buttons) get buttons - 10 images would otherwise need far more
         # button slots than Discord's 5-row x 5-per-row (25) cap allows.
         view = ImageRatingView([(index, index * 10) for index in range(1, 11)])
 
-        self.assertEqual(len(view.children), MAX_RATEABLE_IMAGES * 3)
+        self.assertEqual(len(view.children), MAX_RATEABLE_IMAGES * 4)
         self.assertEqual(
             sorted({child.image_id for child in view.children}),
             [index * 10 for index in range(1, MAX_RATEABLE_IMAGES + 1)],
@@ -96,7 +106,7 @@ class ImageRatingViewLayoutTestCase(unittest.TestCase):
             [(index, index * 10) for index in range(1, MAX_RATEABLE_IMAGES + 1)]
         )
 
-        self.assertEqual(len(view.children), MAX_RATEABLE_IMAGES * 3)
+        self.assertEqual(len(view.children), MAX_RATEABLE_IMAGES * 4)
         self.assertEqual(
             sorted({child.image_id for child in view.children}),
             [index * 10 for index in range(1, MAX_RATEABLE_IMAGES + 1)],
@@ -116,6 +126,19 @@ class ImageRatingButtonCallbackTestCase(unittest.IsolatedAsyncioTestCase):
         interaction.user.id = user_id
         interaction.response.send_message = mock.AsyncMock()
         return interaction
+
+    async def test_favorite_press_saves_and_replies_ephemerally(self):
+        button = ImageRatingButton(image_id=101, rating="favorite", display_index=1, row=0)
+        interaction = self._interaction()
+
+        with mock.patch("commands.prompt.upsert_image_rating", return_value=True) as upsert:
+            await button.callback(interaction)
+
+        upsert.assert_called_once_with(101, 42, "favorite")
+        interaction.response.send_message.assert_awaited_once()
+        args, kwargs = interaction.response.send_message.call_args
+        self.assertIn("お気に入り", args[0])
+        self.assertTrue(kwargs["ephemeral"])
 
     async def test_like_press_saves_and_replies_ephemerally(self):
         button = ImageRatingButton(image_id=101, rating="like", display_index=1, row=0)
@@ -236,7 +259,7 @@ class RatingViewBuildTestCase(unittest.IsolatedAsyncioTestCase):
             view, rated_ids = await prompt_module._build_rating_view(saved, images, send_paths)
 
         self.assertEqual(rated_ids, [22])
-        self.assertEqual([child.image_id for child in view.children], [22, 22, 22])
+        self.assertEqual([child.image_id for child in view.children], [22, 22, 22, 22])
         # The unsent images must never be offered for rating.
         self.assertNotIn(11, rated_ids)
         self.assertNotIn(33, rated_ids)
@@ -269,7 +292,7 @@ class RatingViewBuildTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rated_ids, [22])
         self.assertEqual(
             [child.label for child in view.children],
-            ["👍 好き 2", "👎 微妙 2", "🎯 想定と違う 2"],
+            ["⭐ お気に入り 2", "👍 好き 2", "👎 微妙 2", "🎯 想定と違う 2"],
         )
 
     async def test_mapping_failure_skips_buttons_without_raising(self):
@@ -403,7 +426,7 @@ class GenerateAiEndToEndWiringTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(view, ImageRatingView)
         self.assertTrue(send_mock.call_args.kwargs["wait"])
         rating_children = [child for child in view.children if isinstance(child, ImageRatingButton)]
-        self.assertEqual([child.image_id for child in rating_children], [11, 11, 11])
+        self.assertEqual([child.image_id for child in rating_children], [11, 11, 11, 11])
         # Phase 1C: the same view also carries the two regenerate buttons for
         # this generation_request, on the row after the rating buttons.
         regenerate_children = [child for child in view.children if isinstance(child, RegenerateButton)]
