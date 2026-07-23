@@ -7,10 +7,16 @@ from discord import app_commands
 
 from sd_prompt_template_generator import build_discord_prompt_message
 from services.generation_history import (
+    MIN_GROUP_SIZE_FOR_TAG_COMPARISON,
+    MIN_RATED_FOR_TREND,
+    NORMAL_GENERATION_LABEL,
     GenerationRequestDetail,
     GenerationRequestRecord,
+    GenerationStats,
     SavedGeneration,
+    TagTrendEntry,
     get_generation_request,
+    get_generation_stats,
     resolve_image_ids_for_paths,
     save_generation_history_detailed,
     set_image_discord_message,
@@ -76,6 +82,20 @@ REGENERATE_ALREADY_RUNNING_MESSAGE = "すでに再生成を実行中です。終
 REGENERATE_STARTED_MESSAGE = "再生成を開始しました。"
 REGENERATE_FAILED_MESSAGE = "再生成に失敗しました。時間をおいてもう一度試してね。"
 REGENERATE_PARENT_MISSING_MESSAGE = "元の生成情報が見つかりませんでした。履歴が削除されたか、DBが利用できない可能性があります。"
+
+# Phase 2A: /generate_ai_stats. Display-only labels; the underlying values
+# ("normal"/"same_prompt"/"change_composition") come from generation_history.
+STATS_REGENERATION_LABELS = {
+    NORMAL_GENERATION_LABEL: "通常生成",
+    "same_prompt": "同じ条件で再生成",
+    "change_composition": "構図を変えて再生成",
+}
+STATS_RATING_ICON_ORDER = ("favorite", "like", "meh", "off_target")
+STATS_NO_HISTORY_MESSAGE = "まだ /generate_ai の生成履歴がありません。/generate_ai で画像を生成してみてね。"
+STATS_NO_RATINGS_NOTE = "まだあなた自身の評価がありません。生成した画像に評価ボタン（⭐👍👎🎯）を押すと、ここに集計されるよ。"
+STATS_LOW_SAMPLE_NOTE = "まだ評価数が少ないため、傾向判断には不十分です。"
+STATS_TOP_TAG_LIMIT = 3
+STATS_FAILED_MESSAGE = "評価統計の集計に失敗しました。時間をおいてもう一度試してね。"
 
 # In-process only (not persisted, not restored after a bot restart): guards
 # against double-clicking a regenerate button while its background task is
@@ -226,15 +246,17 @@ async def _safe_followup_send(
     *,
     label: str,
     content: str | None = None,
+    embed: discord.Embed | None = None,
     files: list[discord.File] | None = None,
     view: discord.ui.View | None = None,
     ephemeral: bool = True,
     wait: bool = False,
 ) -> "discord.Message | None":
     logger.info(
-        "Discord followup.send before: label=%s content_length=%s file_count=%s has_view=%s ephemeral=%s",
+        "Discord followup.send before: label=%s content_length=%s has_embed=%s file_count=%s has_view=%s ephemeral=%s",
         label,
         len(content or ""),
+        embed is not None,
         len(files or []),
         view is not None,
         ephemeral,
@@ -246,6 +268,8 @@ async def _safe_followup_send(
         }
         if content is not None:
             kwargs["content"] = content
+        if embed is not None:
+            kwargs["embed"] = embed
         if files is not None:
             kwargs["files"] = files
         if view is not None:
@@ -788,6 +812,118 @@ async def _run_regeneration(
         _active_regenerations.discard(request_id)
 
 
+def _format_percentage(numerator: int, denominator: int) -> str:
+    if denominator <= 0:
+        return "-"
+    return f"{numerator / denominator * 100:.1f}%"
+
+
+def _format_rating_line(ratings) -> str:
+    icons = {"favorite": "⭐", "like": "👍", "meh": "👎", "off_target": "🎯"}
+    counts = {name: getattr(ratings, name) for name in STATS_RATING_ICON_ORDER}
+    return " / ".join(f"{icons[name]} {counts[name]}" for name in STATS_RATING_ICON_ORDER)
+
+
+def _select_top_tag_phrases(
+    tag_trend: tuple[TagTrendEntry, ...],
+    good_sample_count: int,
+    low_sample_count: int,
+    limit: int = STATS_TOP_TAG_LIMIT,
+) -> tuple[list[str], list[str]]:
+    """Ranks watched phrases by how much more often they show up in the
+    caller's good (favorite/like) ratings versus low (meh/off_target)
+    ratings, as a share of each group's own sample size (so a small group
+    is not penalized just for having fewer total ratings).
+
+    Only meaningful once both groups meet MIN_GROUP_SIZE_FOR_TAG_COMPARISON -
+    callers are expected to check that before calling this.
+    """
+    scored: list[tuple[str, float]] = []
+    for entry in tag_trend:
+        good_ratio = entry.good_count / good_sample_count if good_sample_count else 0.0
+        low_ratio = entry.low_count / low_sample_count if low_sample_count else 0.0
+        scored.append((entry.phrase, good_ratio - low_ratio))
+
+    good_leaning = sorted((item for item in scored if item[1] > 0), key=lambda item: item[1], reverse=True)
+    low_leaning = sorted((item for item in scored if item[1] < 0), key=lambda item: item[1])
+    return (
+        [phrase for phrase, _ in good_leaning[:limit]],
+        [phrase for phrase, _ in low_leaning[:limit]],
+    )
+
+
+def _build_generation_stats_embed(stats: GenerationStats) -> discord.Embed:
+    embed = discord.Embed(title="/generate_ai 評価統計", color=discord.Color.blurple())
+
+    if stats.total_requests == 0:
+        embed.description = STATS_NO_HISTORY_MESSAGE
+        return embed
+
+    embed.add_field(
+        name="全体件数",
+        value=(
+            f"生成リクエスト: {stats.total_requests}件 / 生成画像: {stats.total_images}枚\n"
+            f"評価済み: {stats.rated_images}枚 / 未評価: {stats.unrated_images}枚"
+        ),
+        inline=False,
+    )
+
+    if stats.rated_images == 0:
+        embed.add_field(name="評価別件数", value=STATS_NO_RATINGS_NOTE, inline=False)
+        return embed
+
+    embed.add_field(
+        name="評価別件数",
+        value=(
+            f"{_format_rating_line(stats.ratings_all_time)}\n"
+            f"好評価率: {_format_percentage(stats.ratings_all_time.good, stats.ratings_all_time.total)}"
+            f"（低評価: {_format_percentage(stats.ratings_all_time.low, stats.ratings_all_time.total)}）"
+        ),
+        inline=False,
+    )
+
+    recent_lines = [
+        f"直近7日: {stats.ratings_7d.total}件（{_format_rating_line(stats.ratings_7d)}）",
+        f"直近30日: {stats.ratings_30d.total}件（{_format_rating_line(stats.ratings_30d)}）",
+        f"全期間: {stats.ratings_all_time.total}件",
+    ]
+    if stats.rated_images < MIN_RATED_FOR_TREND:
+        recent_lines.append(f"※{STATS_LOW_SAMPLE_NOTE}")
+    embed.add_field(name="直近の傾向", value="\n".join(recent_lines), inline=False)
+
+    regeneration_lines = []
+    for entry in stats.regeneration_breakdown:
+        label = STATS_REGENERATION_LABELS.get(entry.regeneration_type, entry.regeneration_type)
+        line = f"{label}: {entry.request_count}件（評価 {_format_rating_line(entry.ratings)}）"
+        if entry.ratings.total < MIN_GROUP_SIZE_FOR_TAG_COMPARISON:
+            line += "（件数少なめ）"
+        regeneration_lines.append(line)
+    if regeneration_lines:
+        embed.add_field(name="再生成傾向", value="\n".join(regeneration_lines), inline=False)
+
+    if (
+        stats.rated_images >= MIN_RATED_FOR_TREND
+        and stats.good_sample_count >= MIN_GROUP_SIZE_FOR_TAG_COMPARISON
+        and stats.low_sample_count >= MIN_GROUP_SIZE_FOR_TAG_COMPARISON
+    ):
+        good_phrases, low_phrases = _select_top_tag_phrases(
+            stats.tag_trend, stats.good_sample_count, stats.low_sample_count
+        )
+        trend_lines = []
+        if good_phrases:
+            trend_lines.append(f"好評価で多い: {', '.join(good_phrases)}")
+        if low_phrases:
+            trend_lines.append(f"低評価で多い: {', '.join(low_phrases)}")
+        if not trend_lines:
+            trend_lines.append("好評価・低評価の間で目立った傾向差は見つかりませんでした。")
+        trend_value = "\n".join(trend_lines)
+    else:
+        trend_value = STATS_LOW_SAMPLE_NOTE
+    embed.add_field(name="Prompt Designerのテキスト傾向", value=trend_value, inline=False)
+
+    return embed
+
+
 class PromptImageGenerateView(discord.ui.View):
     def __init__(self, owner_id: int, positive_prompt: str, negative_prompt: str) -> None:
         super().__init__(timeout=900)
@@ -1017,4 +1153,28 @@ def setup(client: discord.Client) -> None:
             reference_id=reference_id,
         )
 
-    logger.info("Registered prompt slash commands: prompt, generate, generate_raw, generate_ai")
+    @client.tree.command(
+        name="generate_ai_stats",
+        description="/generate_ai の自分の評価履歴を集計して表示します。",
+    )
+    async def slash_generate_ai_stats(interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
+        if not is_pc_control_allowed(interaction.user.id):
+            logger.warning("Denied /generate_ai_stats by user_id=%s", interaction.user.id)
+            await _send_error(interaction, SD_DENIED_MESSAGE, label="generate_ai_stats.denied")
+            return
+
+        try:
+            stats = await asyncio.to_thread(get_generation_stats, interaction.user.id)
+        except Exception:
+            logger.exception("Unexpected error while building /generate_ai_stats for user_id=%s", interaction.user.id)
+            stats = None
+
+        if stats is None:
+            await _send_error(interaction, STATS_FAILED_MESSAGE, label="generate_ai_stats.failed")
+            return
+
+        embed = _build_generation_stats_embed(stats)
+        await _safe_followup_send(interaction, label="generate_ai_stats.result", embed=embed, ephemeral=True)
+
+    logger.info("Registered prompt slash commands: prompt, generate, generate_raw, generate_ai, generate_ai_stats")

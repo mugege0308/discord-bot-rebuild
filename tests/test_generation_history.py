@@ -2,14 +2,20 @@ import json
 import sqlite3
 import tempfile
 import unittest
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest import mock
 
 from services.generation_history import (
     ALLOWED_RATINGS,
+    MIN_GROUP_SIZE_FOR_TAG_COMPARISON,
+    MIN_RATED_FOR_TREND,
+    NORMAL_GENERATION_LABEL,
     SCHEMA_VERSION,
+    WATCHED_TAG_PHRASES,
     GenerationRequestRecord,
     get_generation_request,
+    get_generation_stats,
     init_db,
     resolve_image_ids_for_paths,
     save_generation_history,
@@ -18,6 +24,7 @@ from services.generation_history import (
     upsert_image_rating,
 )
 from services.sd_control import GeneratedImage
+from services.weather import JST
 
 
 def _make_request(**overrides) -> GenerationRequestRecord:
@@ -784,6 +791,229 @@ class ImageRatingTestCase(GenerationHistoryTestCase):
             _make_request(selection_used=False), [_make_image(str(path))], selected_paths=[]
         )
         self.assertIsInstance(request_id, int)
+
+
+class GenerationStatsTestCase(GenerationHistoryTestCase):
+    """Phase 2A: /generate_ai_stats aggregation."""
+
+    def _save_and_rate(
+        self,
+        *,
+        user_id: int = 42,
+        rater_id: int | None = None,
+        rating: str | None = None,
+        filename: str = "img",
+        **request_overrides,
+    ) -> tuple[int, int]:
+        """Saves one request with one image, optionally rating it, and
+        returns (request_id, image_id)."""
+        path = self._write_file(f"sd_outputs/{filename}.png", f"PNG-{filename}".encode())
+        request = _make_request(user_id=user_id, selection_used=False, **request_overrides)
+        saved = save_generation_history_detailed(request, [_make_image(str(path))], selected_paths=[])
+        self.assertIsNotNone(saved)
+        image_id = saved.image_ids[0]
+        if rating is not None:
+            self.assertTrue(upsert_image_rating(image_id, rater_id if rater_id is not None else user_id, rating))
+        return saved.request_id, image_id
+
+    def _set_rating_updated_at(self, image_id: int, user_id: int, when) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE image_ratings SET updated_at = ? WHERE image_id = ? AND user_id = ?",
+                (when.isoformat(timespec="seconds"), image_id, user_id),
+            )
+
+    def test_no_history_returns_all_zero_counts(self):
+        stats = get_generation_stats(42)
+
+        self.assertEqual(stats.total_requests, 0)
+        self.assertEqual(stats.total_images, 0)
+        self.assertEqual(stats.rated_images, 0)
+        self.assertEqual(stats.unrated_images, 0)
+        self.assertEqual(stats.ratings_all_time.total, 0)
+
+    def test_unrated_images_are_counted_as_unrated_not_ignored(self):
+        self._save_and_rate(user_id=42, filename="a")
+        self._save_and_rate(user_id=42, filename="b")
+
+        stats = get_generation_stats(42)
+
+        self.assertEqual(stats.total_requests, 2)
+        self.assertEqual(stats.total_images, 2)
+        self.assertEqual(stats.rated_images, 0)
+        self.assertEqual(stats.unrated_images, 2)
+
+    def test_all_four_ratings_are_counted_separately(self):
+        self._save_and_rate(user_id=42, rating="favorite", filename="a")
+        self._save_and_rate(user_id=42, rating="like", filename="b")
+        self._save_and_rate(user_id=42, rating="meh", filename="c")
+        self._save_and_rate(user_id=42, rating="off_target", filename="d")
+
+        stats = get_generation_stats(42)
+
+        self.assertEqual(stats.rated_images, 4)
+        self.assertEqual(stats.unrated_images, 0)
+        self.assertEqual(stats.ratings_all_time.favorite, 1)
+        self.assertEqual(stats.ratings_all_time.like, 1)
+        self.assertEqual(stats.ratings_all_time.meh, 1)
+        self.assertEqual(stats.ratings_all_time.off_target, 1)
+        self.assertEqual(stats.ratings_all_time.good, 2)
+        self.assertEqual(stats.ratings_all_time.low, 2)
+
+    def test_rating_update_counts_only_the_latest_value(self):
+        _, image_id = self._save_and_rate(user_id=42, rating="like", filename="a")
+        self.assertTrue(upsert_image_rating(image_id, 42, "favorite"))
+
+        stats = get_generation_stats(42)
+
+        self.assertEqual(stats.rated_images, 1)
+        self.assertEqual(stats.ratings_all_time.favorite, 1)
+        self.assertEqual(stats.ratings_all_time.like, 0)
+
+    def test_off_target_is_not_merged_into_meh_as_generic_low_quality(self):
+        self._save_and_rate(user_id=42, rating="meh", filename="a")
+        self._save_and_rate(user_id=42, rating="off_target", filename="b")
+
+        stats = get_generation_stats(42)
+
+        self.assertEqual(stats.ratings_all_time.meh, 1)
+        self.assertEqual(stats.ratings_all_time.off_target, 1)
+        self.assertEqual(stats.ratings_all_time.low, 2)
+
+    def test_other_users_ratings_on_my_images_are_not_counted(self):
+        _, image_id = self._save_and_rate(user_id=42, filename="a")
+        self.assertTrue(upsert_image_rating(image_id, 999, "favorite"))
+
+        stats = get_generation_stats(42)
+
+        self.assertEqual(stats.rated_images, 0, "another user's rating must not count as my own evaluation history")
+        self.assertEqual(stats.unrated_images, 1)
+
+    def test_other_users_requests_do_not_leak_into_my_stats(self):
+        self._save_and_rate(user_id=999, rating="favorite", filename="other")
+        self._save_and_rate(user_id=42, rating="like", filename="mine")
+
+        stats = get_generation_stats(42)
+
+        self.assertEqual(stats.total_requests, 1)
+        self.assertEqual(stats.rated_images, 1)
+        self.assertEqual(stats.ratings_all_time.like, 1)
+        self.assertEqual(stats.ratings_all_time.favorite, 0)
+
+    def test_regeneration_breakdown_counts_requests_and_ratings_independently(self):
+        self._save_and_rate(user_id=42, rating="like", filename="a")
+        self._save_and_rate(user_id=42, filename="b", regeneration_type=None, parent_request_id=None)
+        req_id, _ = self._save_and_rate(user_id=42, rating="favorite", filename="c")
+        self._save_and_rate(user_id=42, rating="off_target", filename="d", regeneration_type="same_prompt", parent_request_id=req_id)
+        self._save_and_rate(user_id=42, filename="e", regeneration_type="change_composition", parent_request_id=req_id)
+
+        stats = get_generation_stats(42)
+
+        breakdown = {entry.regeneration_type: entry for entry in stats.regeneration_breakdown}
+        self.assertEqual(breakdown[NORMAL_GENERATION_LABEL].request_count, 3)
+        self.assertEqual(breakdown[NORMAL_GENERATION_LABEL].ratings.total, 2)
+        self.assertEqual(breakdown["same_prompt"].request_count, 1)
+        self.assertEqual(breakdown["same_prompt"].ratings.off_target, 1)
+        self.assertEqual(breakdown["change_composition"].request_count, 1)
+        self.assertEqual(breakdown["change_composition"].ratings.total, 0, "unrated request contributes 0 ratings, not omission")
+
+    def test_recent_windows_use_the_ratings_own_recency_not_all_time(self):
+        _, recent_image = self._save_and_rate(user_id=42, rating="like", filename="recent")
+        _, old_image = self._save_and_rate(user_id=42, rating="meh", filename="old")
+        now = datetime.now(JST)
+        self._set_rating_updated_at(recent_image, 42, now - timedelta(days=3))
+        self._set_rating_updated_at(old_image, 42, now - timedelta(days=40))
+
+        stats = get_generation_stats(42)
+
+        self.assertEqual(stats.ratings_7d.total, 1)
+        self.assertEqual(stats.ratings_7d.like, 1)
+        self.assertEqual(stats.ratings_30d.total, 1)
+        self.assertEqual(stats.ratings_30d.like, 1)
+        self.assertEqual(stats.ratings_all_time.total, 2)
+
+    def test_tag_trend_deduplicates_repeated_phrase_within_one_request(self):
+        self._save_and_rate(
+            user_id=42,
+            rating="favorite",
+            filename="a",
+            positive="1girl, natural lighting, natural lighting, masterpiece",
+        )
+
+        stats = get_generation_stats(42)
+
+        entry = next(item for item in stats.tag_trend if item.phrase == "natural lighting")
+        self.assertEqual(entry.good_count, 1)
+
+    def test_tag_trend_is_case_insensitive(self):
+        self._save_and_rate(user_id=42, rating="favorite", filename="a", positive="1girl, Natural Lighting")
+
+        stats = get_generation_stats(42)
+
+        entry = next(item for item in stats.tag_trend if item.phrase == "natural lighting")
+        self.assertEqual(entry.good_count, 1)
+
+    def test_tag_trend_strips_surrounding_whitespace_around_comma_separated_tags(self):
+        self._save_and_rate(
+            user_id=42, rating="favorite", filename="a", positive="1girl,   natural lighting  , masterpiece"
+        )
+
+        stats = get_generation_stats(42)
+
+        entry = next(item for item in stats.tag_trend if item.phrase == "natural lighting")
+        self.assertEqual(entry.good_count, 1)
+
+    def test_tag_trend_respects_word_boundaries_and_avoids_false_positives(self):
+        # "night" must not match inside "midnight", and "cafe" must not
+        # match inside "cafeteria" - both share a run of word characters
+        # with no boundary at the point the shorter phrase would end.
+        self._save_and_rate(
+            user_id=42,
+            rating="favorite",
+            filename="a",
+            positive="1girl, midnight snack, cafeteria scene",
+        )
+
+        stats = get_generation_stats(42)
+
+        matched_phrases = {item.phrase for item in stats.tag_trend}
+        self.assertNotIn("night", matched_phrases)
+        self.assertNotIn("cafe", matched_phrases)
+
+    def test_tag_trend_only_counts_my_own_rated_images_not_unrated_ones(self):
+        self._save_and_rate(user_id=42, filename="a", positive="1girl, natural lighting")
+
+        stats = get_generation_stats(42)
+
+        self.assertEqual(stats.tag_trend, ())
+
+    def test_good_and_low_sample_counts_split_by_rating(self):
+        self._save_and_rate(user_id=42, rating="favorite", filename="a")
+        self._save_and_rate(user_id=42, rating="like", filename="b")
+        self._save_and_rate(user_id=42, rating="meh", filename="c")
+        self._save_and_rate(user_id=42, rating="off_target", filename="d")
+
+        stats = get_generation_stats(42)
+
+        self.assertEqual(stats.good_sample_count, 2)
+        self.assertEqual(stats.low_sample_count, 2)
+
+    def test_thresholds_are_module_level_constants(self):
+        self.assertIsInstance(MIN_RATED_FOR_TREND, int)
+        self.assertIsInstance(MIN_GROUP_SIZE_FOR_TAG_COMPARISON, int)
+        self.assertGreater(MIN_RATED_FOR_TREND, 0)
+        self.assertGreater(MIN_GROUP_SIZE_FOR_TAG_COMPARISON, 0)
+
+    def test_watched_tag_phrases_is_a_non_empty_fixed_list(self):
+        self.assertGreater(len(WATCHED_TAG_PHRASES), 0)
+        self.assertEqual(len(WATCHED_TAG_PHRASES), len(set(WATCHED_TAG_PHRASES)), "no duplicate phrases")
+
+    def test_db_error_returns_none_without_raising(self):
+        with mock.patch(
+            "services.generation_history.sqlite3.connect",
+            side_effect=sqlite3.OperationalError("disk I/O error"),
+        ):
+            self.assertIsNone(get_generation_stats(42))
 
 
 if __name__ == "__main__":

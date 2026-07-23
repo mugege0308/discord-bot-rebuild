@@ -1,9 +1,10 @@
 import hashlib
 import json
 import logging
+import re
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Sequence
 
@@ -33,6 +34,50 @@ ALLOWED_RATINGS = ("favorite", "like", "meh", "off_target")
 # The only regeneration_type values generation_requests.regeneration_type
 # may hold (besides NULL, for a request that is not a regeneration at all).
 REGENERATION_TYPES = ("same_prompt", "change_composition")
+
+# Phase 2A: /generate_ai_stats. NULL (not a regeneration) is reported under
+# this label rather than as a Python None, so it can be used directly as a
+# dict key and a display label.
+NORMAL_GENERATION_LABEL = "normal"
+
+# Phase 2A minimum sample sizes, below which stats are still computed but
+# comparative/trend commentary is withheld rather than overclaiming from a
+# handful of ratings.
+MIN_RATED_FOR_TREND = 10
+MIN_GROUP_SIZE_FOR_TAG_COMPARISON = 3
+
+# Phase 2A tag-trend scanning: a fixed, curated set of tags/phrases this
+# repo's own Prompt Designer instruction (shogou_chan_prompt_designer_instruction.md,
+# Phase 1E) is guided to use for lighting/color/framing/scene. This is a
+# lightweight first pass over stored text - not image analysis - so it is
+# deliberately a closed list rather than free-form keyword extraction.
+# Matched case-insensitively with word boundaries so e.g. "day" does not
+# match inside "today", and "night" does not match inside some longer tag.
+WATCHED_TAG_PHRASES: tuple[str, ...] = (
+    # color temperature
+    "warm lighting", "warm daylight", "soft amber light", "golden highlights",
+    "warm sunset lighting", "soft golden rim light", "neutral lighting",
+    "natural lighting", "neutral to warm daylight", "balanced color palette",
+    "cool lighting", "cool colors", "blue tones", "controlled cool lighting",
+    # brightness
+    "bright lighting", "bright daylight", "bright natural lighting",
+    "low light", "moody lighting",
+    # backlight / rim light
+    "backlight", "rim light", "subtle backlight", "soft rim light",
+    "strong backlight", "dramatic backlighting", "intense rim light",
+    # indoor / outdoor
+    "indoor", "outdoor", "soft warm indoor lighting",
+    # time of day
+    "daylight", "sunset", "night", "evening",
+    # framing
+    "close-up", "close up", "upper body", "full body", "cowboy shot", "portrait",
+    # scene
+    "school uniform", "serafuku", "classroom", "cafe", "coffee shop",
+    "beach", "ocean", "bedroom", "living room",
+)
+_WATCHED_TAG_PATTERNS: tuple[tuple[str, "re.Pattern[str]"], ...] = tuple(
+    (phrase, re.compile(r"\b" + re.escape(phrase) + r"\b", re.IGNORECASE)) for phrase in WATCHED_TAG_PHRASES
+)
 
 
 @dataclass(frozen=True)
@@ -82,6 +127,94 @@ class GenerationRequestDetail:
     selection_message: str
     parent_request_id: int | None
     regeneration_type: str | None
+
+
+@dataclass(frozen=True)
+class RatingCounts:
+    """Phase 2A: how many of a set of rated images fall into each of the
+    four rating values. "Good" (favorite+like) and "low" (meh+off_target)
+    are convenience roll-ups for display - the four original categories are
+    always available too, and off_target is never merged into a generic
+    quality bucket, since it represents a request mismatch rather than
+    low image quality.
+    """
+
+    favorite: int = 0
+    like: int = 0
+    meh: int = 0
+    off_target: int = 0
+
+    @property
+    def total(self) -> int:
+        return self.favorite + self.like + self.meh + self.off_target
+
+    @property
+    def good(self) -> int:
+        return self.favorite + self.like
+
+    @property
+    def low(self) -> int:
+        return self.meh + self.off_target
+
+
+def _rating_counts_from_ratings(ratings: Sequence[str]) -> RatingCounts:
+    counts = {"favorite": 0, "like": 0, "meh": 0, "off_target": 0}
+    for rating in ratings:
+        if rating in counts:
+            counts[rating] += 1
+    return RatingCounts(**counts)
+
+
+@dataclass(frozen=True)
+class RegenerationTypeStats:
+    """Phase 2A: one row of the "re-generation trend" breakdown - how many
+    generation_requests of this type exist, and how the caller's own ratings
+    on their images are distributed. regeneration_type is NORMAL_GENERATION_LABEL
+    for a request that is not a regeneration (NULL in the DB)."""
+
+    regeneration_type: str
+    request_count: int
+    ratings: RatingCounts
+
+
+@dataclass(frozen=True)
+class TagTrendEntry:
+    """Phase 2A: how often one watched tag/phrase appears in the prompt text
+    of images the caller rated favorite/like ("good") versus meh/off_target
+    ("low"). Counted at most once per rated image, even if the underlying
+    request's text repeats the phrase, and even if the phrase shows up in
+    more than one of positive/negative/summary/assumptions/request_text for
+    that same image."""
+
+    phrase: str
+    good_count: int
+    low_count: int
+
+
+@dataclass(frozen=True)
+class GenerationStats:
+    """Phase 2A: /generate_ai_stats aggregate for one user. Every count here
+    is scoped to that user's own generation_requests AND that same user's own
+    image_ratings rows - another user's rating on this user's image is not
+    counted, matching "実行者本人の評価履歴のみ集計"."""
+
+    total_requests: int
+    total_images: int
+    rated_images: int
+    unrated_images: int
+    ratings_all_time: RatingCounts
+    ratings_7d: RatingCounts
+    ratings_30d: RatingCounts
+    regeneration_breakdown: tuple[RegenerationTypeStats, ...]
+    tag_trend: tuple[TagTrendEntry, ...]
+    good_sample_count: int
+    low_sample_count: int
+
+
+def _extract_watched_tags(text: str) -> set[str]:
+    """Returns the set of WATCHED_TAG_PHRASES present in text, each phrase
+    counted at most once regardless of how many times it appears."""
+    return {phrase for phrase, pattern in _WATCHED_TAG_PATTERNS if pattern.search(text)}
 
 
 def _now_text() -> str:
@@ -556,3 +689,174 @@ def get_generation_request(request_id: int) -> GenerationRequestDetail | None:
     except Exception:
         logger.exception("Failed to read generation request: request_id=%s", request_id)
         return None
+
+
+def _parse_timestamp(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def get_generation_stats(user_id: int) -> GenerationStats | None:
+    """Phase 2A: /generate_ai_stats aggregate for one user (see
+    GenerationStats' docstring for the exact scoping rule: this user's own
+    generation_requests, joined to this same user's own image_ratings rows).
+
+    Read-only and additive-only against the existing schema - no new tables
+    or columns. Never raises: any DB error (corruption, locked file, ...) is
+    logged and reported as None so the command can show a short message
+    instead of crashing the bot.
+    """
+    try:
+        with _connect() as connection:
+            total_requests = int(
+                connection.execute(
+                    "SELECT COUNT(*) AS c FROM generation_requests WHERE user_id = ?", (user_id,)
+                ).fetchone()["c"]
+            )
+            total_images = int(
+                connection.execute(
+                    """
+                    SELECT COUNT(*) AS c
+                    FROM generation_images gi
+                    JOIN generation_requests gr ON gr.id = gi.request_id
+                    WHERE gr.user_id = ?
+                    """,
+                    (user_id,),
+                ).fetchone()["c"]
+            )
+            request_type_rows = connection.execute(
+                """
+                SELECT regeneration_type, COUNT(*) AS c
+                FROM generation_requests
+                WHERE user_id = ?
+                GROUP BY regeneration_type
+                """,
+                (user_id,),
+            ).fetchall()
+            # One row per image this user has personally rated, restricted to
+            # their own generation_requests - the single source every other
+            # aggregate below (ratings by rating value, by recency, by
+            # regeneration_type, and the tag trend) is derived from. The
+            # UNIQUE(image_id, user_id) constraint on image_ratings means
+            # this can never return more than one row per image.
+            rated_rows = connection.execute(
+                """
+                SELECT
+                    ir.rating AS rating,
+                    ir.updated_at AS updated_at,
+                    gr.regeneration_type AS regeneration_type,
+                    gr.positive AS positive,
+                    gr.negative AS negative,
+                    gr.summary AS summary,
+                    gr.assumptions_json AS assumptions_json,
+                    gr.request_text AS request_text
+                FROM image_ratings ir
+                JOIN generation_images gi ON gi.id = ir.image_id
+                JOIN generation_requests gr ON gr.id = gi.request_id
+                WHERE gr.user_id = ? AND ir.user_id = ?
+                """,
+                (user_id, user_id),
+            ).fetchall()
+    except Exception:
+        logger.exception("Failed to read generation stats: user_id=%s", user_id)
+        return None
+
+    request_counts_by_type: dict[str, int] = {}
+    for row in request_type_rows:
+        label = row["regeneration_type"] or NORMAL_GENERATION_LABEL
+        request_counts_by_type[label] = request_counts_by_type.get(label, 0) + int(row["c"])
+
+    rated_images = len(rated_rows)
+    unrated_images = max(total_images - rated_images, 0)
+    ratings_all_time = _rating_counts_from_ratings([row["rating"] for row in rated_rows])
+
+    now = datetime.now(JST)
+    cutoff_7d = now - timedelta(days=7)
+    cutoff_30d = now - timedelta(days=30)
+    ratings_7d_values: list[str] = []
+    ratings_30d_values: list[str] = []
+    for row in rated_rows:
+        rated_at = _parse_timestamp(row["updated_at"])
+        if rated_at is None:
+            continue
+        if rated_at >= cutoff_30d:
+            ratings_30d_values.append(row["rating"])
+        if rated_at >= cutoff_7d:
+            ratings_7d_values.append(row["rating"])
+    ratings_7d = _rating_counts_from_ratings(ratings_7d_values)
+    ratings_30d = _rating_counts_from_ratings(ratings_30d_values)
+
+    ratings_by_type: dict[str, list[str]] = {}
+    for row in rated_rows:
+        label = row["regeneration_type"] or NORMAL_GENERATION_LABEL
+        ratings_by_type.setdefault(label, []).append(row["rating"])
+
+    all_type_labels = set(request_counts_by_type) | set(ratings_by_type)
+    regeneration_breakdown = tuple(
+        RegenerationTypeStats(
+            regeneration_type=label,
+            request_count=request_counts_by_type.get(label, 0),
+            ratings=_rating_counts_from_ratings(ratings_by_type.get(label, [])),
+        )
+        for label in sorted(all_type_labels, key=lambda value: (value != NORMAL_GENERATION_LABEL, value))
+    )
+
+    good_tag_counts: dict[str, int] = {}
+    low_tag_counts: dict[str, int] = {}
+    good_sample_count = 0
+    low_sample_count = 0
+    for row in rated_rows:
+        rating = row["rating"]
+        if rating in ("favorite", "like"):
+            bucket = good_tag_counts
+            good_sample_count += 1
+        elif rating in ("meh", "off_target"):
+            bucket = low_tag_counts
+            low_sample_count += 1
+        else:
+            continue
+        try:
+            assumptions = json.loads(row["assumptions_json"] or "[]")
+        except (TypeError, json.JSONDecodeError):
+            assumptions = []
+        combined_text = " ".join(
+            [
+                row["positive"] or "",
+                row["negative"] or "",
+                row["summary"] or "",
+                " ".join(str(item) for item in assumptions),
+                row["request_text"] or "",
+            ]
+        )
+        # Deduped per image (a set, not a list/Counter over raw matches), so
+        # a phrase repeated within one request's text is not over-counted.
+        for phrase in _extract_watched_tags(combined_text):
+            bucket[phrase] = bucket.get(phrase, 0) + 1
+
+    tag_trend = tuple(
+        TagTrendEntry(
+            phrase=phrase,
+            good_count=good_tag_counts.get(phrase, 0),
+            low_count=low_tag_counts.get(phrase, 0),
+        )
+        for phrase in WATCHED_TAG_PHRASES
+        if good_tag_counts.get(phrase, 0) or low_tag_counts.get(phrase, 0)
+    )
+
+    return GenerationStats(
+        total_requests=total_requests,
+        total_images=total_images,
+        rated_images=rated_images,
+        unrated_images=unrated_images,
+        ratings_all_time=ratings_all_time,
+        ratings_7d=ratings_7d,
+        ratings_30d=ratings_30d,
+        regeneration_breakdown=regeneration_breakdown,
+        tag_trend=tag_trend,
+        good_sample_count=good_sample_count,
+        low_sample_count=low_sample_count,
+    )
