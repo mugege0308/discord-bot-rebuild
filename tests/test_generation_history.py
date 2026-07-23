@@ -9,6 +9,7 @@ from services.generation_history import (
     ALLOWED_RATINGS,
     SCHEMA_VERSION,
     GenerationRequestRecord,
+    get_generation_request,
     init_db,
     resolve_image_ids_for_paths,
     save_generation_history,
@@ -274,6 +275,263 @@ class GenerationHistoryTestCase(unittest.TestCase):
             result = save_generation_history(request, images, selected_paths=[])
 
         self.assertIsNone(result)
+
+
+class SchemaMigrationTestCase(GenerationHistoryTestCase):
+    """Phase 1C: generation_requests gains parent_request_id/regeneration_type
+    via an additive v1 -> v2 migration that must not disturb existing rows
+    or leave the file half-upgraded if it fails partway through."""
+
+    def _create_v1_db(self) -> None:
+        """Builds a file with the pre-Phase-1C generation_requests shape
+        (no parent_request_id/regeneration_type columns) stamped at schema
+        version 1, with one pre-existing row - independent of this module's
+        own init_db(), which already creates the v2 shape."""
+        DATA_DIR_MARKER = self.db_file.parent
+        DATA_DIR_MARKER.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(self.db_file) as connection:
+            connection.execute(
+                """
+                CREATE TABLE generation_requests (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at TEXT NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    request_text TEXT NOT NULL,
+                    reference_id INTEGER,
+                    positive TEXT NOT NULL,
+                    negative TEXT NOT NULL,
+                    summary TEXT NOT NULL,
+                    assumptions_json TEXT NOT NULL,
+                    workflow_file TEXT,
+                    workflow_hash TEXT,
+                    selection_used INTEGER NOT NULL DEFAULT 0,
+                    selection_message TEXT
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE generation_images (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    request_id INTEGER NOT NULL REFERENCES generation_requests(id) ON DELETE CASCADE,
+                    image_path TEXT NOT NULL,
+                    seed INTEGER,
+                    batch_index INTEGER NOT NULL,
+                    checkpoint_name TEXT,
+                    sampler_name TEXT,
+                    scheduler TEXT,
+                    steps INTEGER,
+                    cfg REAL,
+                    width INTEGER,
+                    height INTEGER,
+                    was_selected_by_ai INTEGER NOT NULL DEFAULT 0,
+                    discord_message_id INTEGER,
+                    discord_channel_id INTEGER
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE image_ratings (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    image_id INTEGER NOT NULL REFERENCES generation_images(id) ON DELETE CASCADE,
+                    user_id INTEGER NOT NULL,
+                    rating TEXT NOT NULL,
+                    rated_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(image_id, user_id)
+                )
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO generation_requests (
+                    created_at, user_id, request_text, reference_id,
+                    positive, negative, summary, assumptions_json,
+                    workflow_file, workflow_hash, selection_used, selection_message
+                ) VALUES ('2026-01-01T00:00:00+09:00', 42, '既存の依頼', NULL,
+                    '1girl', 'lowres', '既存の要約', '[]', NULL, NULL, 0, '')
+                """
+            )
+            connection.execute("PRAGMA user_version = 1")
+            connection.commit()
+
+    def test_migration_adds_columns_and_bumps_version(self):
+        self._create_v1_db()
+
+        init_db()
+
+        with self._connect() as connection:
+            version = connection.execute("PRAGMA user_version").fetchone()[0]
+            columns = {row["name"] for row in connection.execute("PRAGMA table_info(generation_requests)")}
+        self.assertEqual(version, SCHEMA_VERSION)
+        self.assertIn("parent_request_id", columns)
+        self.assertIn("regeneration_type", columns)
+
+    def test_migration_preserves_existing_row_and_backfills_null(self):
+        self._create_v1_db()
+
+        init_db()
+
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM generation_requests WHERE request_text = '既存の依頼'"
+            ).fetchone()
+        self.assertIsNotNone(row, "pre-existing row must survive the migration")
+        self.assertEqual(row["positive"], "1girl")
+        self.assertEqual(row["negative"], "lowres")
+        self.assertIsNone(row["parent_request_id"])
+        self.assertIsNone(row["regeneration_type"])
+
+    def test_migration_is_idempotent_when_rerun_against_an_already_migrated_file(self):
+        self._create_v1_db()
+        init_db()
+
+        init_db()  # must not raise "duplicate column" or similar
+
+        with self._connect() as connection:
+            version = connection.execute("PRAGMA user_version").fetchone()[0]
+        self.assertEqual(version, SCHEMA_VERSION)
+
+    def test_migration_failure_leaves_the_v1_file_untouched(self):
+        self._create_v1_db()
+
+        with mock.patch(
+            "services.generation_history._add_column_if_missing",
+            side_effect=[None, sqlite3.OperationalError("disk full")],
+        ):
+            with self.assertRaises(sqlite3.OperationalError):
+                init_db()
+
+        # The whole ALTER TABLE / PRAGMA user_version transaction must have
+        # rolled back together - a half-migrated file (one new column but
+        # not the other, or a bumped version without both columns) would be
+        # worse than an un-migrated one.
+        with sqlite3.connect(self.db_file) as connection:
+            connection.row_factory = sqlite3.Row
+            version = connection.execute("PRAGMA user_version").fetchone()[0]
+            columns = {row["name"] for row in connection.execute("PRAGMA table_info(generation_requests)")}
+        self.assertEqual(version, 1)
+        self.assertNotIn("parent_request_id", columns)
+        self.assertNotIn("regeneration_type", columns)
+
+
+class RegenerationFieldsTestCase(GenerationHistoryTestCase):
+    """Phase 1C: parent_request_id/regeneration_type on save, and the
+    read-only get_generation_request lookup used by the regenerate flow."""
+
+    def _save_request(self, **overrides) -> int:
+        path = self._write_file(f"sd_outputs/{overrides.get('request_text', 'img')}.png", b"PNG-BYTES")
+        saved = save_generation_history_detailed(
+            _make_request(selection_used=False, **overrides),
+            [_make_image(str(path))],
+            selected_paths=[],
+        )
+        self.assertIsNotNone(saved)
+        return saved.request_id
+
+    def test_parent_request_id_and_regeneration_type_are_stored(self):
+        parent_id = self._save_request(request_text="元の依頼")
+
+        child_id = self._save_request(
+            request_text="再生成", parent_request_id=parent_id, regeneration_type="same_prompt"
+        )
+
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT parent_request_id, regeneration_type FROM generation_requests WHERE id = ?",
+                (child_id,),
+            ).fetchone()
+        self.assertEqual(row["parent_request_id"], parent_id)
+        self.assertEqual(row["regeneration_type"], "same_prompt")
+
+    def test_change_composition_regeneration_type_is_stored(self):
+        parent_id = self._save_request(request_text="元の依頼2")
+
+        child_id = self._save_request(
+            request_text="構図変更再生成", parent_request_id=parent_id, regeneration_type="change_composition"
+        )
+
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT regeneration_type FROM generation_requests WHERE id = ?", (child_id,)
+            ).fetchone()
+        self.assertEqual(row["regeneration_type"], "change_composition")
+
+    def test_nonexistent_parent_request_id_is_stored_as_null(self):
+        request_id = self._save_request(request_text="孤立した再生成", parent_request_id=999999, regeneration_type="same_prompt")
+
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT parent_request_id FROM generation_requests WHERE id = ?", (request_id,)
+            ).fetchone()
+        self.assertIsNone(row["parent_request_id"])
+
+    def test_unknown_regeneration_type_is_rejected_and_stored_as_null(self):
+        request_id = self._save_request(request_text="不正なタイプ", regeneration_type="bogus_type")
+
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT regeneration_type FROM generation_requests WHERE id = ?", (request_id,)
+            ).fetchone()
+        self.assertIsNone(row["regeneration_type"])
+
+    def test_normal_non_regenerated_request_has_null_parent_fields(self):
+        request_id = self._save_request(request_text="通常の依頼")
+
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT parent_request_id, regeneration_type FROM generation_requests WHERE id = ?",
+                (request_id,),
+            ).fetchone()
+        self.assertIsNone(row["parent_request_id"])
+        self.assertIsNone(row["regeneration_type"])
+
+    def test_get_generation_request_returns_full_detail(self):
+        request_id = self._save_request(
+            request_text="詳細取得テスト",
+            user_id=777,
+            reference_id=3,
+            positive="1girl, safe",
+            negative="lowres",
+            summary="要約テキスト",
+            assumptions=("補完A",),
+        )
+
+        detail = get_generation_request(request_id)
+
+        self.assertIsNotNone(detail)
+        self.assertEqual(detail.id, request_id)
+        self.assertEqual(detail.user_id, 777)
+        self.assertEqual(detail.request_text, "詳細取得テスト")
+        self.assertEqual(detail.reference_id, 3)
+        self.assertEqual(detail.positive, "1girl, safe")
+        self.assertEqual(detail.negative, "lowres")
+        self.assertEqual(detail.summary, "要約テキスト")
+        self.assertEqual(detail.assumptions, ("補完A",))
+        self.assertIsNone(detail.parent_request_id)
+        self.assertIsNone(detail.regeneration_type)
+
+    def test_get_generation_request_includes_parent_info(self):
+        parent_id = self._save_request(request_text="元祖")
+        child_id = self._save_request(
+            request_text="子", parent_request_id=parent_id, regeneration_type="change_composition"
+        )
+
+        detail = get_generation_request(child_id)
+
+        self.assertEqual(detail.parent_request_id, parent_id)
+        self.assertEqual(detail.regeneration_type, "change_composition")
+
+    def test_get_generation_request_returns_none_for_missing_id(self):
+        self.assertIsNone(get_generation_request(999999))
+
+    def test_get_generation_request_returns_none_on_db_error_without_raising(self):
+        with mock.patch(
+            "services.generation_history.sqlite3.connect",
+            side_effect=sqlite3.OperationalError("disk I/O error"),
+        ):
+            self.assertIsNone(get_generation_request(1))
 
 
 class ImageRatingTestCase(GenerationHistoryTestCase):

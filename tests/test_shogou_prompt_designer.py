@@ -4,6 +4,7 @@ from unittest import mock
 from services.shogou_prompt_designer import (
     ShogouPromptResult,
     _strip_think_blocks,
+    generate_shogou_composition_variation,
     generate_shogou_prompt_result,
     parse_shogou_prompt_response,
 )
@@ -168,6 +169,118 @@ class GenerateShogouPromptResultMemoryWiringTestCase(unittest.TestCase):
         # automatic relevance selection in build_image_memory_prompt_context
         # (unmodified by this integration) decides which tags to use.
         image_memory_mock.assert_called_once_with(1, "犬耳の子", None)
+
+
+class GenerateShogouCompositionVariationTestCase(unittest.TestCase):
+    """Phase 1C "change_composition" regeneration."""
+
+    def test_parent_fields_and_instruction_are_sent_to_lm_studio(self):
+        with mock.patch(
+            "services.shogou_prompt_designer.load_shogou_instruction",
+            return_value="INSTRUCTION_BODY",
+        ), mock.patch(
+            "services.shogou_prompt_designer.append_memory_to_system_prompt",
+            return_value="INSTRUCTION_BODY",
+        ), mock.patch(
+            "services.shogou_prompt_designer.build_image_memory_prompt_context",
+            return_value="",
+        ), mock.patch(
+            "services.shogou_prompt_designer._post_chat_completion",
+            return_value=VALID_JSON,
+        ) as post_mock:
+            result = generate_shogou_composition_variation(
+                "雨の日の喫茶店で読書する女の子",
+                "1girl, cafe, reading, rain",
+                "lowres, bad anatomy",
+                "喫茶店で読書する猫耳の女の子",
+                ("背景を補完",),
+                user_id=42,
+                reference_id=None,
+            )
+
+        self.assertFalse(result.blocked)
+        sent_system_prompt = post_mock.call_args.args[0]
+        sent_user_input = post_mock.call_args.args[1]
+        # The parent's request/positive/negative/summary/assumptions must
+        # all reach LM Studio, so it has the same generation to vary from.
+        self.assertIn("雨の日の喫茶店で読書する女の子", sent_system_prompt)
+        self.assertIn("1girl, cafe, reading, rain", sent_system_prompt)
+        self.assertIn("lowres, bad anatomy", sent_system_prompt)
+        self.assertIn("喫茶店で読書する猫耳の女の子", sent_system_prompt)
+        self.assertIn("背景を補完", sent_system_prompt)
+        # Explicit instruction: keep character/clothing/mood, vary only
+        # composition/camera/pose/layout.
+        self.assertIn("キャラクター", sent_system_prompt)
+        self.assertIn("衣装", sent_system_prompt)
+        self.assertIn("雰囲気", sent_system_prompt)
+        self.assertIn("構図", sent_system_prompt)
+        self.assertIn("カメラ角度", sent_system_prompt)
+        self.assertIn("ポーズ", sent_system_prompt)
+        self.assertEqual(sent_user_input, "雨の日の喫茶店で読書する女の子")
+
+    def test_instruction_is_appended_after_reference_context(self):
+        with mock.patch(
+            "services.shogou_prompt_designer.load_shogou_instruction",
+            return_value="INSTRUCTION_BODY",
+        ), mock.patch(
+            "services.shogou_prompt_designer.append_memory_to_system_prompt",
+            return_value="INSTRUCTION_BODY",
+        ), mock.patch(
+            "services.shogou_prompt_designer.build_image_memory_prompt_context",
+            return_value="画像参考Memory #7 (明示指定のため全タグ): silver hair",
+        ) as image_memory_mock, mock.patch(
+            "services.shogou_prompt_designer._post_chat_completion",
+            return_value=VALID_JSON,
+        ) as post_mock:
+            generate_shogou_composition_variation(
+                "この子で", "1girl", "lowres", "要約", (), user_id=1, reference_id=7
+            )
+
+        image_memory_mock.assert_called_once_with(1, "この子で", 7)
+        sent_system_prompt = post_mock.call_args.args[0]
+        self.assertLess(
+            sent_system_prompt.index("画像参考Memory #7"),
+            sent_system_prompt.index("構図"),
+        )
+
+    def test_does_not_call_the_plain_prompt_result_path(self):
+        with mock.patch(
+            "services.shogou_prompt_designer.load_shogou_instruction",
+            return_value="INSTRUCTION_BODY",
+        ), mock.patch(
+            "services.shogou_prompt_designer.append_memory_to_system_prompt",
+            return_value="INSTRUCTION_BODY",
+        ), mock.patch(
+            "services.shogou_prompt_designer.build_image_memory_prompt_context",
+            return_value="",
+        ), mock.patch(
+            "services.shogou_prompt_designer._post_chat_completion",
+            return_value=VALID_JSON,
+        ) as post_mock, mock.patch(
+            "services.shogou_prompt_designer.generate_shogou_prompt_result"
+        ) as plain_mock:
+            generate_shogou_composition_variation("元の依頼", "1girl", "lowres", "要約", (), user_id=1)
+
+        plain_mock.assert_not_called()
+        post_mock.assert_called_once()
+
+    def test_blocked_json_from_lm_studio_is_surfaced_as_blocked(self):
+        with mock.patch(
+            "services.shogou_prompt_designer.load_shogou_instruction",
+            return_value="INSTRUCTION_BODY",
+        ), mock.patch(
+            "services.shogou_prompt_designer.append_memory_to_system_prompt",
+            return_value="INSTRUCTION_BODY",
+        ), mock.patch(
+            "services.shogou_prompt_designer.build_image_memory_prompt_context",
+            return_value="",
+        ), mock.patch(
+            "services.shogou_prompt_designer._post_chat_completion",
+            return_value="not json at all",
+        ):
+            result = generate_shogou_composition_variation("元の依頼", "1girl", "lowres", "要約", (), user_id=1)
+
+        self.assertTrue(result.blocked)
 
 
 if __name__ == "__main__":

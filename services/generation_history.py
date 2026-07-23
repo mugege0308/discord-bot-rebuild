@@ -20,13 +20,17 @@ DB_FILE = DATA_DIR / "generation_history.db"
 # future change can tell which shape an existing file has and migrate it.
 # Bump this whenever the CREATE TABLE statements below change, and add the
 # matching migration step to _apply_schema_version().
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _HASH_CHUNK_SIZE = 1024 * 1024
 
 # The only rating values image_ratings.rating may hold. Anything else is
 # rejected before the DB is touched.
 ALLOWED_RATINGS = ("like", "meh", "off_target")
+
+# The only regeneration_type values generation_requests.regeneration_type
+# may hold (besides NULL, for a request that is not a regeneration at all).
+REGENERATION_TYPES = ("same_prompt", "change_composition")
 
 
 @dataclass(frozen=True)
@@ -42,6 +46,10 @@ class GenerationRequestRecord:
     workflow_hash: str | None
     selection_used: bool
     selection_message: str
+    # Phase 1C: set together when this request is a regeneration of an
+    # earlier one. Both stay None for a normal (non-regenerated) request.
+    parent_request_id: int | None = None
+    regeneration_type: str | None = None
 
 
 @dataclass(frozen=True)
@@ -53,6 +61,27 @@ class SavedGeneration:
     image_ids: list[int]
 
 
+@dataclass(frozen=True)
+class GenerationRequestDetail:
+    """Read-only view of one generation_requests row, e.g. for regeneration."""
+
+    id: int
+    created_at: str
+    user_id: int
+    request_text: str
+    reference_id: int | None
+    positive: str
+    negative: str
+    summary: str
+    assumptions: tuple[str, ...]
+    workflow_file: str | None
+    workflow_hash: str | None
+    selection_used: bool
+    selection_message: str
+    parent_request_id: int | None
+    regeneration_type: str | None
+
+
 def _now_text() -> str:
     return datetime.now(JST).isoformat(timespec="seconds")
 
@@ -60,6 +89,10 @@ def _now_text() -> str:
 def init_db() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(DB_FILE) as connection:
+        # _migrate_v1_to_v2 (via _add_column_if_missing) reads PRAGMA
+        # table_info rows by column name, so this connection needs the same
+        # row_factory as _connect()'s.
+        connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute(
             """
@@ -76,7 +109,9 @@ def init_db() -> None:
                 workflow_file TEXT,
                 workflow_hash TEXT,
                 selection_used INTEGER NOT NULL DEFAULT 0,
-                selection_message TEXT
+                selection_message TEXT,
+                parent_request_id INTEGER,
+                regeneration_type TEXT
             )
             """
         )
@@ -118,12 +153,39 @@ def init_db() -> None:
         connection.commit()
 
 
+def _add_column_if_missing(connection: sqlite3.Connection, table: str, column: str, column_type: str) -> None:
+    existing = {row["name"] for row in connection.execute(f"PRAGMA table_info({table})")}
+    if column not in existing:
+        # No DEFAULT clause, so SQLite backfills every existing row with
+        # NULL - exactly what a pre-Phase-1C row should have for both of
+        # these columns.
+        connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_type}")
+
+
+def _migrate_v1_to_v2(connection: sqlite3.Connection) -> None:
+    """Adds parent_request_id/regeneration_type to generation_requests.
+
+    Additive only (no data is rewritten or dropped), and guarded by
+    PRAGMA table_info so re-running it against an already-migrated file
+    (e.g. one a fresh CREATE TABLE already brought to the v2 shape) is a
+    no-op rather than a "duplicate column" error.
+    """
+    _add_column_if_missing(connection, "generation_requests", "parent_request_id", "INTEGER")
+    _add_column_if_missing(connection, "generation_requests", "regeneration_type", "TEXT")
+
+
 def _apply_schema_version(connection: sqlite3.Connection) -> None:
     """Stamps/checks PRAGMA user_version so future schema changes have a
     reliable version to migrate from.
 
     PRAGMA user_version does not accept parameter binding, so SCHEMA_VERSION
     is interpolated - it is a module-level int constant, never user input.
+    Any failure raised while migrating propagates to the caller's try/except
+    (init_db() is only ever reached through _connect(), which every public
+    function in this module wraps), so a broken migration is reported as a
+    failure rather than silently corrupting or half-upgrading the file: the
+    whole connection's transaction (including the CREATE TABLE IF NOT EXISTS
+    statements above) rolls back together.
     """
     current = int(connection.execute("PRAGMA user_version").fetchone()[0])
     if current == SCHEMA_VERSION:
@@ -142,7 +204,11 @@ def _apply_schema_version(connection: sqlite3.Connection) -> None:
             SCHEMA_VERSION,
         )
         return
-    # Reachable only once SCHEMA_VERSION > 1. Deliberately does not bump the
+    if current == 1:
+        _migrate_v1_to_v2(connection)
+        connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        return
+    # Reachable only once SCHEMA_VERSION > 2. Deliberately does not bump the
     # version: silently relabelling an un-migrated file would hide the gap.
     logger.warning(
         "generation_history.db schema version %s is older than %s and no migration step is defined yet.",
@@ -246,13 +312,32 @@ def save_generation_history_detailed(
             _build_selection_index(selected_paths) if request.selection_used else (set(), set())
         )
         with _connect() as connection:
+            resolved_parent_id = None
+            if request.parent_request_id is not None:
+                parent_exists = connection.execute(
+                    "SELECT 1 FROM generation_requests WHERE id = ?", (request.parent_request_id,)
+                ).fetchone()
+                if parent_exists is not None:
+                    resolved_parent_id = int(request.parent_request_id)
+                else:
+                    logger.warning(
+                        "parent_request_id does not exist; storing NULL instead: parent_request_id=%s",
+                        request.parent_request_id,
+                    )
+
+            resolved_regeneration_type = request.regeneration_type
+            if resolved_regeneration_type is not None and resolved_regeneration_type not in REGENERATION_TYPES:
+                logger.warning("Rejected unknown regeneration_type value: %r", resolved_regeneration_type)
+                resolved_regeneration_type = None
+
             cursor = connection.execute(
                 """
                 INSERT INTO generation_requests (
                     created_at, user_id, request_text, reference_id,
                     positive, negative, summary, assumptions_json,
-                    workflow_file, workflow_hash, selection_used, selection_message
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    workflow_file, workflow_hash, selection_used, selection_message,
+                    parent_request_id, regeneration_type
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     _now_text(),
@@ -267,6 +352,8 @@ def save_generation_history_detailed(
                     request.workflow_hash,
                     1 if request.selection_used else 0,
                     request.selection_message,
+                    resolved_parent_id,
+                    resolved_regeneration_type,
                 ),
             )
             request_id = int(cursor.lastrowid)
@@ -430,3 +517,40 @@ def set_image_discord_message(
             len(ids),
         )
         return False
+
+
+def get_generation_request(request_id: int) -> GenerationRequestDetail | None:
+    """Read-only lookup of one generation_requests row (Phase 1C: used to
+    look up the original request a regeneration button should build from).
+
+    Never raises: a missing row returns None like any other lookup miss, and
+    any DB error (corruption, locked file, ...) is logged and also reported
+    as None rather than letting a raw sqlite3 exception reach the caller.
+    """
+    try:
+        with _connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM generation_requests WHERE id = ?", (request_id,)
+            ).fetchone()
+        if row is None:
+            return None
+        return GenerationRequestDetail(
+            id=int(row["id"]),
+            created_at=row["created_at"],
+            user_id=int(row["user_id"]),
+            request_text=row["request_text"],
+            reference_id=row["reference_id"],
+            positive=row["positive"],
+            negative=row["negative"],
+            summary=row["summary"],
+            assumptions=tuple(json.loads(row["assumptions_json"])),
+            workflow_file=row["workflow_file"],
+            workflow_hash=row["workflow_hash"],
+            selection_used=bool(row["selection_used"]),
+            selection_message=row["selection_message"] or "",
+            parent_request_id=row["parent_request_id"],
+            regeneration_type=row["regeneration_type"],
+        )
+    except Exception:
+        logger.exception("Failed to read generation request: request_id=%s", request_id)
+        return None

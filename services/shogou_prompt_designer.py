@@ -3,7 +3,7 @@ import logging
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 from services.image_memory import build_image_memory_prompt_context
 from services.memory import append_memory_to_system_prompt
@@ -137,6 +137,67 @@ def generate_shogou_prompt_result(
     result = parse_shogou_prompt_response(raw_content)
     logger.info(
         "Shogou postprocess complete: positive_length=%s negative_length=%s blocked=%s",
+        len(result.positive),
+        len(result.negative),
+        result.blocked,
+    )
+    return result
+
+
+def _build_composition_variation_instruction(
+    parent_request_text: str,
+    parent_positive: str,
+    parent_negative: str,
+    parent_summary: str,
+    parent_assumptions: Sequence[str],
+) -> str:
+    return (
+        "\n\n---\n"
+        "これは既存の生成結果をもとにした「構図を変えて再生成」リクエストです。"
+        "以下の元の生成条件をもとに、キャラクター・衣装・雰囲気・重要な属性はそのまま維持しつつ、"
+        "構図・カメラ角度・ポーズ・画面内配置だけを変更した新しいpositive/negative/summary/assumptionsを作成してください。\n\n"
+        f"元のリクエスト: {parent_request_text}\n"
+        f"元のPositive: {parent_positive}\n"
+        f"元のNegative: {parent_negative}\n"
+        f"元のSummary: {parent_summary}\n"
+        f"元のAssumptions: {json.dumps(list(parent_assumptions), ensure_ascii=False)}\n"
+    )
+
+
+def generate_shogou_composition_variation(
+    parent_request_text: str,
+    parent_positive: str,
+    parent_negative: str,
+    parent_summary: str,
+    parent_assumptions: Sequence[str],
+    user_id: int | None = None,
+    reference_id: int | None = None,
+) -> ShogouPromptResult:
+    """Phase 1C "change_composition" regeneration: reuses the same shogou
+    instruction/system prompt as a normal /generate_ai call, but appends the
+    parent request's positive/negative/summary/assumptions plus an explicit
+    instruction to keep character/clothing/mood and only vary composition.
+    """
+    text = parent_request_text.strip() or "(元のリクエスト文なし)"
+    logger.info("Shogou composition variation generation start: user_id=%s", user_id)
+    system_prompt = append_memory_to_system_prompt(load_shogou_instruction(), user_id, text, mode="prompt")
+    if user_id is not None:
+        try:
+            reference_context = build_image_memory_prompt_context(user_id, text, reference_id)
+        except ValueError as exc:
+            raise PromptGeneratorError(str(exc)) from exc
+        if reference_context:
+            system_prompt += "\n\n" + reference_context
+    system_prompt += _build_composition_variation_instruction(
+        parent_request_text, parent_positive, parent_negative, parent_summary, parent_assumptions
+    )
+    logger.info("Shogou composition variation system prompt complete: user_id=%s length=%s", user_id, len(system_prompt))
+
+    raw_content = _post_chat_completion(system_prompt, text, temperature=0.35)
+    logger.info("Shogou composition variation postprocess start: raw_content_length=%s", len(raw_content))
+    result = parse_shogou_prompt_response(raw_content)
+    logger.info(
+        "Shogou composition variation postprocess complete: positive_length=%s negative_length=%s blocked=%s",
         len(result.positive),
         len(result.negative),
         result.blocked,

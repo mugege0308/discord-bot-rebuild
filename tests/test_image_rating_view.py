@@ -3,7 +3,13 @@ from pathlib import Path
 from unittest import mock
 
 import commands.prompt as prompt_module
-from commands.prompt import ImageRatingButton, ImageRatingView
+from commands.prompt import (
+    MAX_RATEABLE_IMAGES,
+    REGENERATE_ROW,
+    ImageRatingButton,
+    ImageRatingView,
+    RegenerateButton,
+)
 from services.generation_history import SavedGeneration
 from services.image_selection import ImageSelectionResult
 from services.sd_control import GeneratedImage
@@ -66,16 +72,17 @@ class ImageRatingViewLayoutTestCase(unittest.TestCase):
         )
 
     def test_ten_images_stay_within_discord_component_limits(self):
-        # 3 buttons/image means only the first MAX_RATEABLE_IMAGES (5, in
-        # attachment order) get buttons - 10 images would need 30 button
-        # slots, which exceeds Discord's 5-row x 5-per-row (25) cap.
+        # 3 buttons/image means only the first MAX_RATEABLE_IMAGES (4, in
+        # attachment order - Phase 1C reserves the 5th row for regenerate
+        # buttons) get buttons - 10 images would otherwise need far more
+        # button slots than Discord's 5-row x 5-per-row (25) cap allows.
         view = ImageRatingView([(index, index * 10) for index in range(1, 11)])
 
-        self.assertEqual(len(view.children), 15)
+        self.assertEqual(len(view.children), MAX_RATEABLE_IMAGES * 3)
         self.assertEqual(
             sorted({child.image_id for child in view.children}),
-            [10, 20, 30, 40, 50],
-            "only the first 5 images (by attachment order) become rateable",
+            [index * 10 for index in range(1, MAX_RATEABLE_IMAGES + 1)],
+            "only the first MAX_RATEABLE_IMAGES images (by attachment order) become rateable",
         )
         rows = {}
         for child in view.children:
@@ -84,11 +91,16 @@ class ImageRatingViewLayoutTestCase(unittest.TestCase):
         for row, children in rows.items():
             self.assertLessEqual(len(children), 5, f"row {row} exceeds 5 components")
 
-    def test_five_images_all_get_buttons_within_limits(self):
-        view = ImageRatingView([(index, index * 10) for index in range(1, 6)])
+    def test_max_rateable_images_all_get_buttons_within_limits(self):
+        view = ImageRatingView(
+            [(index, index * 10) for index in range(1, MAX_RATEABLE_IMAGES + 1)]
+        )
 
-        self.assertEqual(len(view.children), 15)
-        self.assertEqual(sorted({child.image_id for child in view.children}), [10, 20, 30, 40, 50])
+        self.assertEqual(len(view.children), MAX_RATEABLE_IMAGES * 3)
+        self.assertEqual(
+            sorted({child.image_id for child in view.children}),
+            [index * 10 for index in range(1, MAX_RATEABLE_IMAGES + 1)],
+        )
 
     def test_timeout_is_one_hour(self):
         self.assertEqual(ImageRatingView([(1, 1)]).timeout, 3600)
@@ -273,6 +285,58 @@ class RatingViewBuildTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rated_ids, [])
 
 
+class ResultViewBuildTestCase(unittest.IsolatedAsyncioTestCase):
+    """Phase 1C: _build_result_view combines rating buttons with the
+    per-request regenerate buttons into one View."""
+
+    async def test_regenerate_buttons_are_added_even_at_max_rateable_images(self):
+        images = _make_generated_images(MAX_RATEABLE_IMAGES)
+        saved = SavedGeneration(request_id=7, image_ids=list(range(11, 11 + MAX_RATEABLE_IMAGES)))
+        send_paths = [image.path for image in images]
+
+        with mock.patch(
+            "commands.prompt.resolve_image_ids_for_paths",
+            return_value=list(range(11, 11 + MAX_RATEABLE_IMAGES)),
+        ):
+            view, rated_ids = await prompt_module._build_result_view(saved, images, send_paths, owner_id=42)
+
+        self.assertEqual(len(rated_ids), MAX_RATEABLE_IMAGES)
+        rows = {}
+        for child in view.children:
+            rows.setdefault(child.row, []).append(child)
+        self.assertLessEqual(len(rows), 5, "Discord allows at most 5 action rows")
+        for row, children in rows.items():
+            self.assertLessEqual(len(children), 5, f"row {row} exceeds 5 components")
+        regenerate_children = [child for child in view.children if isinstance(child, RegenerateButton)]
+        self.assertEqual(len(regenerate_children), 2, "one regenerate button per REGENERATION_TYPES entry")
+        self.assertTrue(all(child.row == REGENERATE_ROW for child in regenerate_children))
+
+    async def test_regenerate_buttons_are_added_even_when_no_image_is_rateable(self):
+        # _build_rating_view returns None here (nothing could be mapped), but
+        # the request itself still saved successfully, so the regenerate
+        # buttons must still be offered.
+        saved = SavedGeneration(request_id=9, image_ids=[11])
+        images = _make_generated_images(1)
+
+        with mock.patch("commands.prompt.resolve_image_ids_for_paths", return_value=[None]):
+            view, rated_ids = await prompt_module._build_result_view(
+                saved, images, [images[0].path], owner_id=42
+            )
+
+        self.assertEqual(rated_ids, [])
+        self.assertIsNotNone(view)
+        regenerate_children = [child for child in view.children if isinstance(child, RegenerateButton)]
+        self.assertEqual(len(regenerate_children), 2)
+
+    async def test_no_view_at_all_when_history_save_failed(self):
+        view, rated_ids = await prompt_module._build_result_view(
+            None, _make_generated_images(1), [Path("a.png")], owner_id=42
+        )
+
+        self.assertIsNone(view)
+        self.assertEqual(rated_ids, [])
+
+
 class DiscordMessageBookkeepingTestCase(unittest.IsolatedAsyncioTestCase):
     async def test_message_and_channel_ids_are_stored(self):
         sent_message = mock.MagicMock()
@@ -338,7 +402,16 @@ class GenerateAiEndToEndWiringTestCase(unittest.IsolatedAsyncioTestCase):
         view = send_mock.call_args.kwargs["view"]
         self.assertIsInstance(view, ImageRatingView)
         self.assertTrue(send_mock.call_args.kwargs["wait"])
-        self.assertEqual([child.image_id for child in view.children], [11, 11, 11])
+        rating_children = [child for child in view.children if isinstance(child, ImageRatingButton)]
+        self.assertEqual([child.image_id for child in rating_children], [11, 11, 11])
+        # Phase 1C: the same view also carries the two regenerate buttons for
+        # this generation_request, on the row after the rating buttons.
+        regenerate_children = [child for child in view.children if isinstance(child, RegenerateButton)]
+        self.assertEqual(len(regenerate_children), 2)
+        self.assertEqual({child.regeneration_type for child in regenerate_children}, {"same_prompt", "change_composition"})
+        self.assertTrue(all(child.request_id == 1 for child in regenerate_children))
+        self.assertTrue(all(child.owner_id == 555 for child in regenerate_children))
+        self.assertTrue(all(child.row == REGENERATE_ROW for child in regenerate_children))
         self.assertIs(view.message, sent_message)
         store_mock.assert_called_once_with([11], 999, 888)
 

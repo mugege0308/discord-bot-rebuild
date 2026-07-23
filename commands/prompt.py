@@ -7,8 +7,10 @@ from discord import app_commands
 
 from sd_prompt_template_generator import build_discord_prompt_message
 from services.generation_history import (
+    GenerationRequestDetail,
     GenerationRequestRecord,
     SavedGeneration,
+    get_generation_request,
     resolve_image_ids_for_paths,
     save_generation_history_detailed,
     set_image_discord_message,
@@ -28,7 +30,11 @@ from services.sd_control import (
     generate_images_with_metadata,
     get_negative_prompt,
 )
-from services.shogou_prompt_designer import ShogouPromptResult, generate_shogou_prompt_result
+from services.shogou_prompt_designer import (
+    ShogouPromptResult,
+    generate_shogou_composition_variation,
+    generate_shogou_prompt_result,
+)
 
 
 logger = logging.getLogger("secretary-bot.prompt")
@@ -50,11 +56,32 @@ RATING_VIEW_TIMEOUT_SECONDS = 3600
 RATING_LABELS = {"like": "好き", "meh": "微妙", "off_target": "想定と違う"}
 RATING_EMOJI = {"like": "👍", "meh": "👎", "off_target": "🎯"}
 # 3 buttons per image, so 1 image per action row (3 buttons/row, within
-# Discord's 5-per-row limit). With Discord's 5-row cap, only the first 5
-# rateable images (in attachment order) get buttons; the rest are still
-# sent, just without rating buttons.
+# Discord's 5-per-row limit). Discord allows at most 5 action rows per
+# message, and Phase 1C reserves the last one (REGENERATE_ROW) for the
+# regenerate buttons, so only 4 rows - the first 4 rateable images in
+# attachment order - are left for rating buttons; the rest are still sent,
+# just without rating buttons.
 RATING_IMAGES_PER_ROW = 1
-MAX_RATEABLE_IMAGES = 5 * RATING_IMAGES_PER_ROW
+MAX_RATEABLE_IMAGES = 4 * RATING_IMAGES_PER_ROW
+
+# Phase 1C: regenerate the parent generation_request instead of rating one
+# of its images. Always on the row after the last possible rating row, so
+# together they never exceed Discord's 5-row cap.
+REGENERATION_TYPES = ("same_prompt", "change_composition")
+REGENERATE_ROW = MAX_RATEABLE_IMAGES // RATING_IMAGES_PER_ROW
+REGENERATE_LABELS = {"same_prompt": "同じ条件で再生成", "change_composition": "構図を変えて再生成"}
+REGENERATE_EMOJI = {"same_prompt": "🔁", "change_composition": "🎥"}
+REGENERATE_ONLY_OWNER_MESSAGE = "この再生成ボタンは、元の生成を実行した本人だけが押せます。"
+REGENERATE_ALREADY_RUNNING_MESSAGE = "すでに再生成を実行中です。終わってからもう一度試してね。"
+REGENERATE_STARTED_MESSAGE = "再生成を開始しました。"
+REGENERATE_FAILED_MESSAGE = "再生成に失敗しました。時間をおいてもう一度試してね。"
+REGENERATE_PARENT_MISSING_MESSAGE = "元の生成情報が見つかりませんでした。履歴が削除されたか、DBが利用できない可能性があります。"
+
+# In-process only (not persisted, not restored after a bot restart): guards
+# against double-clicking a regenerate button while its background task is
+# still running. Keyed by the parent generation_requests.id being
+# regenerated from.
+_active_regenerations: set[int] = set()
 
 
 class ImageRatingButton(discord.ui.Button):
@@ -126,6 +153,72 @@ class ImageRatingView(discord.ui.View):
             # The message may be gone or no longer editable; the already
             # delivered images and stored ratings still stand.
             logger.info("Could not disable rating buttons after timeout.", exc_info=True)
+
+
+class RegenerateButton(discord.ui.Button):
+    """Regenerates the whole generation_request (not one image) that this
+    message's images came from. Phase 1C: same_prompt reuses the saved
+    positive/negative as-is; change_composition sends the parent's
+    request/positive/negative/summary/assumptions back through the Prompt
+    Designer with an instruction to vary only the composition.
+    """
+
+    def __init__(self, *, request_id: int, regeneration_type: str, owner_id: int, row: int) -> None:
+        super().__init__(
+            style=discord.ButtonStyle.secondary,
+            label=f"{REGENERATE_EMOJI[regeneration_type]} {REGENERATE_LABELS[regeneration_type]}",
+            custom_id=f"genai_regen:{request_id}:{regeneration_type}",
+            row=row,
+        )
+        self.request_id = request_id
+        self.regeneration_type = regeneration_type
+        self.owner_id = owner_id
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.owner_id:
+            try:
+                await interaction.response.send_message(REGENERATE_ONLY_OWNER_MESSAGE, ephemeral=True)
+            except Exception:
+                logger.exception("Failed to reply to regenerate button permission check: request_id=%s", self.request_id)
+            return
+
+        # Anti-spam: only one regeneration per parent request_id at a time.
+        # This is an in-process guard only (no persistence, no cross-restart
+        # tracking), which is enough to stop rapid double-clicks from
+        # queuing duplicate ComfyUI/LM Studio work.
+        if self.request_id in _active_regenerations:
+            try:
+                await interaction.response.send_message(REGENERATE_ALREADY_RUNNING_MESSAGE, ephemeral=True)
+            except Exception:
+                logger.exception("Failed to reply to regenerate button busy check: request_id=%s", self.request_id)
+            return
+
+        _active_regenerations.add(self.request_id)
+        try:
+            await interaction.response.send_message(REGENERATE_STARTED_MESSAGE, ephemeral=True)
+        except Exception:
+            logger.exception("Failed to acknowledge regenerate button: request_id=%s", self.request_id)
+            _active_regenerations.discard(self.request_id)
+            return
+
+        # Fire-and-forget: the ephemeral ack above is the Discord-visible
+        # response; the actual regeneration follows the same
+        # defer-then-followup pattern as the slash commands and reports its
+        # own errors via _send_error. _active_regenerations is cleared by
+        # _run_regeneration's finally block once this finishes either way.
+        asyncio.create_task(_run_regeneration(interaction, self.request_id, self.regeneration_type))
+
+
+def _build_regenerate_buttons(request_id: int, owner_id: int) -> list[RegenerateButton]:
+    return [
+        RegenerateButton(
+            request_id=request_id,
+            regeneration_type=regeneration_type,
+            owner_id=owner_id,
+            row=REGENERATE_ROW,
+        )
+        for regeneration_type in REGENERATION_TYPES
+    ]
 
 
 async def _safe_followup_send(
@@ -352,6 +445,8 @@ async def _save_generation_history_safely(
     result: ShogouPromptResult,
     generated_images: list[GeneratedImage],
     selection,
+    parent_request_id: int | None = None,
+    regeneration_type: str | None = None,
 ) -> SavedGeneration | None:
     # Best-effort only: a history-save failure must never block the Discord
     # result from being sent, and must never crash the bot. Any exception
@@ -373,6 +468,8 @@ async def _save_generation_history_safely(
             workflow_hash=workflow_hash,
             selection_used=selection.used_selection,
             selection_message=selection.message or selection.error or "",
+            parent_request_id=parent_request_id,
+            regeneration_type=regeneration_type,
         )
         saved = await asyncio.to_thread(
             save_generation_history_detailed,
@@ -428,6 +525,30 @@ async def _build_rating_view(
     return ImageRatingView(rateable), [image_id for _, image_id in rateable]
 
 
+async def _build_result_view(
+    saved: SavedGeneration | None,
+    generated_images: list[GeneratedImage],
+    send_paths: list[Path],
+    owner_id: int,
+) -> tuple["ImageRatingView | None", list[int]]:
+    """Combines the rating buttons (per sent image) with the regenerate
+    buttons (per request) into the single View a Discord message can carry.
+
+    Regenerate buttons only need a request_id, so they are offered whenever
+    the history save succeeded - even if no individual image could be
+    matched for rating (_build_rating_view returning None for that reason
+    alone must not also hide the regenerate buttons).
+    """
+    if saved is None:
+        return None, []
+    view, rated_image_ids = await _build_rating_view(saved, generated_images, send_paths)
+    if view is None:
+        view = ImageRatingView([])
+    for button in _build_regenerate_buttons(saved.request_id, owner_id):
+        view.add_item(button)
+    return view, rated_image_ids
+
+
 async def _store_discord_message_safely(
     image_ids: list[int],
     sent_message: "discord.Message | None",
@@ -457,6 +578,8 @@ async def _generate_images_from_shogou_result(
     request_text: str = "",
     reference_id: int | None = None,
     result_ephemeral: bool = False,
+    parent_request_id: int | None = None,
+    regeneration_type: str | None = None,
 ) -> None:
     # Mirrors _generate_images_from_prompts' preserve_prompt_text=True path exactly,
     # but keeps its own message builder so /generate_raw's behavior stays untouched.
@@ -494,9 +617,11 @@ async def _generate_images_from_shogou_result(
         result=result,
         generated_images=generated_images,
         selection=selection,
+        parent_request_id=parent_request_id,
+        regeneration_type=regeneration_type,
     )
 
-    view, rated_image_ids = await _build_rating_view(saved, generated_images, send_paths)
+    view, rated_image_ids = await _build_result_view(saved, generated_images, send_paths, interaction.user.id)
     sent_message = await _send_image_files(
         interaction,
         message,
@@ -545,6 +670,122 @@ async def _build_shogou_prompt_result(
             label=f"{label_prefix}.unexpected_error",
         )
         return None
+
+
+async def _build_shogou_regeneration_result(
+    interaction: discord.Interaction,
+    parent: GenerationRequestDetail,
+    *,
+    label_prefix: str,
+) -> ShogouPromptResult | None:
+    """Phase 1C "change_composition": mirrors _build_shogou_prompt_result's
+    error handling exactly, but calls generate_shogou_composition_variation
+    instead of the plain shogou call.
+    """
+    try:
+        result = await asyncio.to_thread(
+            generate_shogou_composition_variation,
+            parent.request_text,
+            parent.positive,
+            parent.negative,
+            parent.summary,
+            parent.assumptions,
+            interaction.user.id,
+            parent.reference_id,
+        )
+        logger.info(
+            "%s result received: positive_length=%s negative_length=%s blocked=%s",
+            label_prefix,
+            len(result.positive),
+            len(result.negative),
+            result.blocked,
+        )
+        return result
+    except PromptGeneratorTimeout:
+        logger.exception("%s timed out.", label_prefix)
+        await _send_error(interaction, "LM Studioから応答がありませんでした。", label=f"{label_prefix}.timeout")
+        return None
+    except PromptGeneratorError as exc:
+        logger.exception("%s failed.", label_prefix)
+        await _send_error(interaction, str(exc), label=f"{label_prefix}.generator_error")
+        return None
+    except Exception:
+        logger.exception("Unexpected %s error.", label_prefix)
+        await _send_error(
+            interaction,
+            "プロンプト生成に失敗しました。LM Studioの起動状態を確認してください。",
+            label=f"{label_prefix}.unexpected_error",
+        )
+        return None
+
+
+async def _run_regeneration(
+    interaction: discord.Interaction,
+    request_id: int,
+    regeneration_type: str,
+) -> None:
+    """Runs one Phase 1C regeneration in the background, after
+    RegenerateButton has already sent the ephemeral "started" reply.
+
+    Any failure here (missing parent, LM Studio error, generation error,
+    or anything unexpected) is reported to the user as a short generic
+    message via _send_error - never a raw exception - while the full detail
+    goes to logger.exception. _active_regenerations is always cleared here,
+    regardless of outcome, so a failed regeneration does not permanently
+    lock out further attempts.
+    """
+    try:
+        parent = await asyncio.to_thread(get_generation_request, request_id)
+        if parent is None:
+            await _send_error(
+                interaction,
+                REGENERATE_PARENT_MISSING_MESSAGE,
+                label="generate_ai.regen.parent_missing",
+            )
+            return
+
+        if regeneration_type == "same_prompt":
+            # No Prompt Designer call: reuse the saved positive/negative
+            # exactly. generate_images_with_metadata still randomizes the
+            # seed on every call, and checkpoint/sampler/steps/cfg/width/
+            # height come from the same workflow file either way, so "same
+            # condition, new seed" falls out of the existing generation
+            # path without any extra bookkeeping here.
+            result = ShogouPromptResult(
+                positive=parent.positive,
+                negative=parent.negative,
+                summary=parent.summary,
+                assumptions=parent.assumptions,
+            )
+        elif regeneration_type == "change_composition":
+            result = await _build_shogou_regeneration_result(interaction, parent, label_prefix="generate_ai.regen")
+            if result is None:
+                return
+            if result.blocked:
+                await _send_error(interaction, result.blocked_reason, label="generate_ai.regen.blocked")
+                return
+        else:
+            logger.error("Unknown regeneration_type encountered: %r request_id=%s", regeneration_type, request_id)
+            return
+
+        await _generate_images_from_shogou_result(
+            interaction,
+            result,
+            label_prefix="generate_ai.regen",
+            request_text=parent.request_text,
+            reference_id=parent.reference_id,
+            parent_request_id=request_id,
+            regeneration_type=regeneration_type,
+        )
+    except Exception:
+        logger.exception(
+            "Unexpected error during regeneration: request_id=%s regeneration_type=%s",
+            request_id,
+            regeneration_type,
+        )
+        await _send_error(interaction, REGENERATE_FAILED_MESSAGE, label="generate_ai.regen.unexpected_error")
+    finally:
+        _active_regenerations.discard(request_id)
 
 
 class PromptImageGenerateView(discord.ui.View):
