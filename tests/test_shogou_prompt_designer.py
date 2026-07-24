@@ -425,5 +425,133 @@ class InstructionContentTestCase(unittest.TestCase):
         self.assertIn("bright", positive)
 
 
+class AssumptionsScopeInstructionTestCase(unittest.TestCase):
+    """Prompt Designer refinement: `assumptions` must record only
+    missing-*information* completion (clothing / place / minimal time of day /
+    count / age band / general scene), never color/lighting/staging (cool
+    tones, blue tones, rim light, ...). Staging is decided by the Prompt
+    Designer body (priority step 4) and lands in positive/negative tags, not
+    in `assumptions`. These read the real instruction file so a future edit
+    that drops a rule - or a few-shot example that regresses to writing
+    staging into `assumptions` - fails loudly. The JSON output contract is
+    unchanged (asserted by InstructionContentTestCase).
+    """
+
+    # Color/lighting/staging terms that must never appear inside an
+    # `assumptions` entry. Deliberately excludes plain scene/time words that
+    # ARE allowed as minimal completion (indoor, daylight, night, sunset).
+    FORBIDDEN_STAGING_IN_ASSUMPTIONS = (
+        "cool tones",
+        "warm tones",
+        "blue tones",
+        "orange lighting",
+        "cinematic lighting",
+        "rim light",
+        "backlight",
+        "bloom",
+        "dramatic lighting",
+        "color grading",
+        "moonlight",
+    )
+
+    @classmethod
+    def setUpClass(cls):
+        cls.instruction = load_shogou_instruction()
+        cls.examples = [
+            json.loads(raw)
+            for raw in re.findall(r"^出力:\n(\{.*\})$", cls.instruction, flags=re.MULTILINE)
+        ]
+
+    def _example_with(self, needle: str) -> dict:
+        matches = [example for example in self.examples if needle in example["positive"]]
+        self.assertTrue(matches, f"expected a few-shot example whose positive contains {needle!r}")
+        return matches[0]
+
+    def test_explicit_priority_order_is_documented(self):
+        # 1 user -> 2 character -> 3 missing-info completion -> 4 staging.
+        priority_index = self.instruction.index("判断の優先順位（明文化・厳守）")
+        for phrase in (
+            "ユーザー指定",
+            "キャラクター情報",
+            "不足情報の補完",
+            "色彩・ライティング・演出の決定",
+        ):
+            self.assertIn(phrase, self.instruction[priority_index:])
+        self.assertIn("「演出」は「不足情報」ではない", self.instruction)
+
+    def test_allowed_assumption_completions_are_listed(self):
+        for phrase in ("服装", "場所", "時間帯（必要最低限）", "人数", "年齢層", "一般的なシーン情報"):
+            self.assertIn(phrase, self.instruction)
+
+    def test_forbidden_staging_terms_are_called_out_as_not_for_assumptions(self):
+        for phrase in self.FORBIDDEN_STAGING_IN_ASSUMPTIONS:
+            self.assertIn(phrase, self.instruction)
+        self.assertIn("`assumptions` には**書かない**", self.instruction)
+
+    def test_background_unspecified_allows_indoor_but_forbids_color_jump(self):
+        self.assertIn("背景未指定 → `indoor`", self.instruction)
+        self.assertIn("背景未指定 → `blue tones`", self.instruction)
+        self.assertIn("飛躍は禁止", self.instruction)
+
+    def test_time_of_day_minimal_completion_allowed_but_not_its_lighting(self):
+        # Test case 3 (no daytime specified -> `daylight` minimal completion
+        # allowed) and test case 4 (`moonlight` staging must not go into
+        # `assumptions`) live in the same rule sentence.
+        self.assertIn("daylight", self.instruction)
+        self.assertIn("night", self.instruction)
+        self.assertIn("moonlight", self.instruction)
+        self.assertIn("最低限の補完は `assumptions` に書いてよい", self.instruction)
+
+    def test_internal_steps_keep_staging_out_of_assumptions(self):
+        self.assertIn(
+            "色彩・ライティング・演出は「不足情報」ではないので、ここでは補完せず `assumptions` にも書かない",
+            self.instruction,
+        )
+        self.assertIn(
+            "ここで決めた色彩・ライティング・演出は positive/negative のタグにのみ反映し、`assumptions` には書かない",
+            self.instruction,
+        )
+
+    def test_no_few_shot_example_puts_staging_into_assumptions(self):
+        # The strong regression guard: whatever the prose says, none of the
+        # shipped few-shot examples may demonstrate staging inside assumptions.
+        self.assertGreaterEqual(len(self.examples), 5, "expected the documented few-shot examples")
+        for example in self.examples:
+            assumptions_text = " ".join(example["assumptions"]).lower()
+            for forbidden in self.FORBIDDEN_STAGING_IN_ASSUMPTIONS:
+                self.assertNotIn(
+                    forbidden,
+                    assumptions_text,
+                    f"staging term {forbidden!r} must not appear in assumptions: {example['assumptions']}",
+                )
+
+    def test_gym_ponytail_example_keeps_assumptions_free_of_cool_or_blue_tones(self):
+        # Reported case: 黒髪ポニーテール・体操服. No color was requested, so
+        # assumptions must not add cool/blue tones, and the picture stays
+        # neutral rather than defaulting to a cool tint.
+        example = self._example_with("gym uniform")
+        assumptions_text = " ".join(example["assumptions"]).lower()
+        for banned in ("cool tones", "blue tones", "cool", "blue"):
+            self.assertNotIn(banned, assumptions_text)
+        # Background was unspecified -> indoor completion IS allowed here.
+        self.assertIn("indoor", assumptions_text)
+        # Neutral default in the tags, not a cool/blue default.
+        positive = example["positive"].lower()
+        self.assertIn("neutral lighting", positive)
+        for banned in ("cool lighting", "blue tones", "cool tones"):
+            self.assertNotIn(banned, positive)
+
+    def test_night_example_keeps_night_but_moves_moonlight_out_of_assumptions(self):
+        # Night was explicitly requested: `night` may be recorded as a
+        # time-of-day completion, but `moonlight` (staging) belongs in the
+        # tags only, not in assumptions.
+        example = self._example_with("night")
+        assumptions_text = " ".join(example["assumptions"]).lower()
+        self.assertIn("night", assumptions_text)
+        self.assertNotIn("moonlight", assumptions_text)
+        # Staging still lands in the positive tags (body decision).
+        self.assertIn("moonlight", example["positive"].lower())
+
+
 if __name__ == "__main__":
     unittest.main()
