@@ -39,6 +39,7 @@ from services.sd_control import (
 from services.shogou_prompt_designer import (
     ShogouPromptResult,
     generate_shogou_composition_variation,
+    generate_shogou_custom_instruction_variation,
     generate_shogou_prompt_result,
 )
 
@@ -75,20 +76,36 @@ MAX_RATEABLE_IMAGES = 4 * RATING_IMAGES_PER_ROW
 # together they never exceed Discord's 5-row cap.
 REGENERATION_TYPES = ("same_prompt", "change_composition")
 REGENERATE_ROW = MAX_RATEABLE_IMAGES // RATING_IMAGES_PER_ROW
-REGENERATE_LABELS = {"same_prompt": "同じ条件で再生成", "change_composition": "構図を変えて再生成"}
-REGENERATE_EMOJI = {"same_prompt": "🔁", "change_composition": "🎥"}
+REGENERATE_LABELS = {
+    "same_prompt": "同じ条件で再生成",
+    "change_composition": "構図を変えて再生成",
+    "custom_instruction": "指示を追加して再生成",
+}
+REGENERATE_EMOJI = {"same_prompt": "🔁", "change_composition": "🎥", "custom_instruction": "✏️"}
 REGENERATE_ONLY_OWNER_MESSAGE = "この再生成ボタンは、元の生成を実行した本人だけが押せます。"
 REGENERATE_ALREADY_RUNNING_MESSAGE = "すでに再生成を実行中です。終わってからもう一度試してね。"
 REGENERATE_STARTED_MESSAGE = "再生成を開始しました。"
 REGENERATE_FAILED_MESSAGE = "再生成に失敗しました。時間をおいてもう一度試してね。"
 REGENERATE_PARENT_MISSING_MESSAGE = "元の生成情報が見つかりませんでした。履歴が削除されたか、DBが利用できない可能性があります。"
 
+# 指示を追加して再生成: opens a Modal instead of firing immediately, so this
+# type is deliberately kept out of REGENERATION_TYPES (which drives the
+# immediate-action RegenerateButton loop) and handled by its own button/modal
+# classes below.
+CUSTOM_INSTRUCTION_TYPE = "custom_instruction"
+CUSTOM_INSTRUCTION_MAX_LENGTH = 1000
+CUSTOM_INSTRUCTION_MODAL_TITLE = "追加指示を入力"
+CUSTOM_INSTRUCTION_INPUT_LABEL = "追加指示"
+CUSTOM_INSTRUCTION_EMPTY_MESSAGE = "追加指示を入力してください。"
+
 # Phase 2A: /generate_ai_stats. Display-only labels; the underlying values
-# ("normal"/"same_prompt"/"change_composition") come from generation_history.
+# ("normal"/"same_prompt"/"change_composition"/"custom_instruction") come
+# from generation_history.
 STATS_REGENERATION_LABELS = {
     NORMAL_GENERATION_LABEL: "通常生成",
     "same_prompt": "同じ条件で再生成",
     "change_composition": "構図を変えて再生成",
+    "custom_instruction": "指示を追加して再生成",
 }
 STATS_RATING_ICON_ORDER = ("favorite", "like", "meh", "off_target")
 STATS_NO_HISTORY_MESSAGE = "まだ /generate_ai の生成履歴がありません。/generate_ai で画像を生成してみてね。"
@@ -229,8 +246,107 @@ class RegenerateButton(discord.ui.Button):
         asyncio.create_task(_run_regeneration(interaction, self.request_id, self.regeneration_type))
 
 
-def _build_regenerate_buttons(request_id: int, owner_id: int) -> list[RegenerateButton]:
-    return [
+class CustomInstructionModal(discord.ui.Modal):
+    """「✏️ 指示を追加して再生成」: collects the free-text instruction before
+    starting the same background regeneration pipeline the other regenerate
+    buttons use. Opened by CustomInstructionRegenerateButton, which already
+    performed the owner/already-running checks before showing this modal.
+    """
+
+    def __init__(self, request_id: int, owner_id: int) -> None:
+        super().__init__(title=CUSTOM_INSTRUCTION_MODAL_TITLE)
+        self.request_id = request_id
+        self.owner_id = owner_id
+        self.instruction = discord.ui.TextInput(
+            label=CUSTOM_INSTRUCTION_INPUT_LABEL,
+            style=discord.TextStyle.paragraph,
+            max_length=CUSTOM_INSTRUCTION_MAX_LENGTH,
+            required=True,
+        )
+        self.add_item(self.instruction)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.owner_id:
+            try:
+                await interaction.response.send_message(REGENERATE_ONLY_OWNER_MESSAGE, ephemeral=True)
+            except Exception:
+                logger.exception("Failed to reply to custom instruction modal permission check: request_id=%s", self.request_id)
+            return
+
+        instruction_text = str(self.instruction.value).strip()
+        if not instruction_text:
+            try:
+                await interaction.response.send_message(CUSTOM_INSTRUCTION_EMPTY_MESSAGE, ephemeral=True)
+            except Exception:
+                logger.exception("Failed to reply to empty custom instruction: request_id=%s", self.request_id)
+            return
+
+        # Same anti-spam guard as RegenerateButton.callback, checked again
+        # here since opening the modal itself does not reserve request_id -
+        # only actually starting the regeneration does.
+        if self.request_id in _active_regenerations:
+            try:
+                await interaction.response.send_message(REGENERATE_ALREADY_RUNNING_MESSAGE, ephemeral=True)
+            except Exception:
+                logger.exception("Failed to reply to custom instruction busy check: request_id=%s", self.request_id)
+            return
+
+        _active_regenerations.add(self.request_id)
+        try:
+            await interaction.response.send_message(REGENERATE_STARTED_MESSAGE, ephemeral=True)
+        except Exception:
+            logger.exception("Failed to acknowledge custom instruction modal: request_id=%s", self.request_id)
+            _active_regenerations.discard(self.request_id)
+            return
+
+        asyncio.create_task(
+            _run_regeneration(
+                interaction,
+                self.request_id,
+                CUSTOM_INSTRUCTION_TYPE,
+                custom_instruction=instruction_text,
+            )
+        )
+
+
+class CustomInstructionRegenerateButton(discord.ui.Button):
+    """Opens CustomInstructionModal instead of starting the regeneration
+    immediately - the only regenerate button that needs input from the user
+    first."""
+
+    def __init__(self, *, request_id: int, owner_id: int, row: int) -> None:
+        super().__init__(
+            style=discord.ButtonStyle.secondary,
+            label=f"{REGENERATE_EMOJI[CUSTOM_INSTRUCTION_TYPE]} {REGENERATE_LABELS[CUSTOM_INSTRUCTION_TYPE]}",
+            custom_id=f"genai_regen:{request_id}:{CUSTOM_INSTRUCTION_TYPE}",
+            row=row,
+        )
+        self.request_id = request_id
+        self.owner_id = owner_id
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.owner_id:
+            try:
+                await interaction.response.send_message(REGENERATE_ONLY_OWNER_MESSAGE, ephemeral=True)
+            except Exception:
+                logger.exception("Failed to reply to regenerate button permission check: request_id=%s", self.request_id)
+            return
+
+        if self.request_id in _active_regenerations:
+            try:
+                await interaction.response.send_message(REGENERATE_ALREADY_RUNNING_MESSAGE, ephemeral=True)
+            except Exception:
+                logger.exception("Failed to reply to regenerate button busy check: request_id=%s", self.request_id)
+            return
+
+        try:
+            await interaction.response.send_modal(CustomInstructionModal(self.request_id, self.owner_id))
+        except Exception:
+            logger.exception("Failed to open custom instruction modal: request_id=%s", self.request_id)
+
+
+def _build_regenerate_buttons(request_id: int, owner_id: int) -> list[discord.ui.Button]:
+    buttons: list[discord.ui.Button] = [
         RegenerateButton(
             request_id=request_id,
             regeneration_type=regeneration_type,
@@ -239,6 +355,10 @@ def _build_regenerate_buttons(request_id: int, owner_id: int) -> list[Regenerate
         )
         for regeneration_type in REGENERATION_TYPES
     ]
+    buttons.append(
+        CustomInstructionRegenerateButton(request_id=request_id, owner_id=owner_id, row=REGENERATE_ROW)
+    )
+    return buttons
 
 
 async def _safe_followup_send(
@@ -471,6 +591,7 @@ async def _save_generation_history_safely(
     selection,
     parent_request_id: int | None = None,
     regeneration_type: str | None = None,
+    custom_instruction: str | None = None,
 ) -> SavedGeneration | None:
     # Best-effort only: a history-save failure must never block the Discord
     # result from being sent, and must never crash the bot. Any exception
@@ -494,6 +615,7 @@ async def _save_generation_history_safely(
             selection_message=selection.message or selection.error or "",
             parent_request_id=parent_request_id,
             regeneration_type=regeneration_type,
+            custom_instruction=custom_instruction,
         )
         saved = await asyncio.to_thread(
             save_generation_history_detailed,
@@ -604,6 +726,7 @@ async def _generate_images_from_shogou_result(
     result_ephemeral: bool = False,
     parent_request_id: int | None = None,
     regeneration_type: str | None = None,
+    custom_instruction: str | None = None,
 ) -> None:
     # Mirrors _generate_images_from_prompts' preserve_prompt_text=True path exactly,
     # but keeps its own message builder so /generate_raw's behavior stays untouched.
@@ -643,6 +766,7 @@ async def _generate_images_from_shogou_result(
         selection=selection,
         parent_request_id=parent_request_id,
         regeneration_type=regeneration_type,
+        custom_instruction=custom_instruction,
     )
 
     view, rated_image_ids = await _build_result_view(saved, generated_images, send_paths, interaction.user.id)
@@ -743,13 +867,65 @@ async def _build_shogou_regeneration_result(
         return None
 
 
+async def _build_shogou_custom_instruction_result(
+    interaction: discord.Interaction,
+    parent: GenerationRequestDetail,
+    custom_instruction: str,
+    *,
+    label_prefix: str,
+) -> ShogouPromptResult | None:
+    """「指示を追加して再生成」: mirrors _build_shogou_regeneration_result's
+    error handling exactly, but calls generate_shogou_custom_instruction_variation
+    with the user's free-text instruction alongside the parent fields.
+    """
+    try:
+        result = await asyncio.to_thread(
+            generate_shogou_custom_instruction_variation,
+            parent.request_text,
+            parent.positive,
+            parent.negative,
+            parent.summary,
+            parent.assumptions,
+            custom_instruction,
+            interaction.user.id,
+            parent.reference_id,
+        )
+        logger.info(
+            "%s result received: positive_length=%s negative_length=%s blocked=%s",
+            label_prefix,
+            len(result.positive),
+            len(result.negative),
+            result.blocked,
+        )
+        return result
+    except PromptGeneratorTimeout:
+        logger.exception("%s timed out.", label_prefix)
+        await _send_error(interaction, "LM Studioから応答がありませんでした。", label=f"{label_prefix}.timeout")
+        return None
+    except PromptGeneratorError as exc:
+        logger.exception("%s failed.", label_prefix)
+        await _send_error(interaction, str(exc), label=f"{label_prefix}.generator_error")
+        return None
+    except Exception:
+        logger.exception("Unexpected %s error.", label_prefix)
+        await _send_error(
+            interaction,
+            "プロンプト生成に失敗しました。LM Studioの起動状態を確認してください。",
+            label=f"{label_prefix}.unexpected_error",
+        )
+        return None
+
+
 async def _run_regeneration(
     interaction: discord.Interaction,
     request_id: int,
     regeneration_type: str,
+    *,
+    custom_instruction: str | None = None,
 ) -> None:
-    """Runs one Phase 1C regeneration in the background, after
-    RegenerateButton has already sent the ephemeral "started" reply.
+    """Runs one regeneration in the background, after RegenerateButton (or
+    CustomInstructionModal, for custom_instruction) has already sent the
+    ephemeral "started" reply.
 
     Any failure here (missing parent, LM Studio error, generation error,
     or anything unexpected) is reported to the user as a short generic
@@ -788,6 +964,15 @@ async def _run_regeneration(
             if result.blocked:
                 await _send_error(interaction, result.blocked_reason, label="generate_ai.regen.blocked")
                 return
+        elif regeneration_type == CUSTOM_INSTRUCTION_TYPE:
+            result = await _build_shogou_custom_instruction_result(
+                interaction, parent, custom_instruction or "", label_prefix="generate_ai.regen"
+            )
+            if result is None:
+                return
+            if result.blocked:
+                await _send_error(interaction, result.blocked_reason, label="generate_ai.regen.blocked")
+                return
         else:
             logger.error("Unknown regeneration_type encountered: %r request_id=%s", regeneration_type, request_id)
             return
@@ -800,6 +985,7 @@ async def _run_regeneration(
             reference_id=parent.reference_id,
             parent_request_id=request_id,
             regeneration_type=regeneration_type,
+            custom_instruction=custom_instruction if regeneration_type == CUSTOM_INSTRUCTION_TYPE else None,
         )
     except Exception:
         logger.exception(

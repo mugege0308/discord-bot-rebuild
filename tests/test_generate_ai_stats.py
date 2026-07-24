@@ -205,6 +205,26 @@ class BuildGenerationStatsEmbedTestCase(unittest.TestCase):
         # not silently presented as if it were a confident comparison.
         self.assertLess(0, breakdown.count("（件数少なめ）"))
 
+    def test_regeneration_breakdown_lists_custom_instruction_type(self):
+        stats = _make_stats(
+            total_requests=1,
+            total_images=1,
+            rated_images=1,
+            unrated_images=0,
+            ratings_all_time=RatingCounts(like=1),
+            regeneration_breakdown=(
+                RegenerationTypeStats(
+                    regeneration_type="custom_instruction", request_count=1, ratings=RatingCounts(like=1)
+                ),
+            ),
+        )
+
+        embed = _build_generation_stats_embed(stats)
+
+        field_values = {field.name: field.value for field in embed.fields}
+        breakdown = field_values["再生成傾向"]
+        self.assertIn("指示を追加して再生成: 1件", breakdown)
+
     def test_tag_trend_hidden_behind_sufficient_sample_thresholds(self):
         stats = _make_stats(
             total_requests=5,

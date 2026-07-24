@@ -32,6 +32,7 @@ def _make_parent(**overrides) -> GenerationRequestDetail:
         selection_message="画像選別AIで上位1枚を選びました。",
         parent_request_id=None,
         regeneration_type=None,
+        custom_instruction=None,
     )
     defaults.update(overrides)
     return GenerationRequestDetail(**defaults)
@@ -206,6 +207,72 @@ class RunRegenerationTestCase(unittest.IsolatedAsyncioTestCase):
         _, kwargs = interaction.followup.send.call_args
         self.assertEqual(kwargs["content"], "NGワードを検出しました。")
         self.assertTrue(kwargs["ephemeral"])
+
+    async def test_custom_instruction_calls_prompt_designer_with_parent_fields_and_instruction(self):
+        parent = _make_parent(id=20, reference_id=9)
+        new_result = ShogouPromptResult(
+            positive="1girl, cafe, ponytail, reading, rain",
+            negative="lowres",
+            summary="ポニーテールに変更した要約",
+            assumptions=("髪型を変更",),
+        )
+        interaction = self._interaction()
+
+        with mock.patch("commands.prompt.get_generation_request", return_value=parent), mock.patch(
+            "commands.prompt.generate_shogou_custom_instruction_variation", return_value=new_result
+        ) as variation_mock, mock.patch(
+            "commands.prompt._generate_images_from_shogou_result"
+        ) as generate_mock:
+            await prompt_module._run_regeneration(
+                interaction, 20, "custom_instruction", custom_instruction="髪型をポニーテールに"
+            )
+
+        variation_mock.assert_called_once_with(
+            parent.request_text,
+            parent.positive,
+            parent.negative,
+            parent.summary,
+            parent.assumptions,
+            "髪型をポニーテールに",
+            interaction.user.id,
+            parent.reference_id,
+        )
+        generate_mock.assert_called_once()
+        args, kwargs = generate_mock.call_args
+        self.assertIs(args[1], new_result)
+        self.assertEqual(kwargs["parent_request_id"], 20)
+        self.assertEqual(kwargs["regeneration_type"], "custom_instruction")
+        self.assertEqual(kwargs["custom_instruction"], "髪型をポニーテールに")
+
+    async def test_custom_instruction_blocked_result_is_reported_and_stops(self):
+        parent = _make_parent(id=21)
+        blocked_result = ShogouPromptResult(blocked_reason="NGワードを検出しました。")
+        interaction = self._interaction()
+
+        with mock.patch("commands.prompt.get_generation_request", return_value=parent), mock.patch(
+            "commands.prompt.generate_shogou_custom_instruction_variation", return_value=blocked_result
+        ), mock.patch("commands.prompt._generate_images_from_shogou_result") as generate_mock:
+            await prompt_module._run_regeneration(
+                interaction, 21, "custom_instruction", custom_instruction="笑顔にして"
+            )
+
+        generate_mock.assert_not_called()
+        interaction.followup.send.assert_awaited_once()
+        _, kwargs = interaction.followup.send.call_args
+        self.assertEqual(kwargs["content"], "NGワードを検出しました。")
+        self.assertTrue(kwargs["ephemeral"])
+
+    async def test_same_prompt_and_change_composition_do_not_leak_custom_instruction_into_history(self):
+        parent = _make_parent(id=22)
+        interaction = self._interaction()
+
+        with mock.patch("commands.prompt.get_generation_request", return_value=parent), mock.patch(
+            "commands.prompt.generate_shogou_composition_variation"
+        ), mock.patch("commands.prompt._generate_images_from_shogou_result") as generate_mock:
+            await prompt_module._run_regeneration(interaction, 22, "same_prompt")
+
+        _, kwargs = generate_mock.call_args
+        self.assertIsNone(kwargs["custom_instruction"])
 
     async def test_unknown_regeneration_type_is_a_safe_no_op(self):
         parent = _make_parent(id=13)

@@ -165,6 +165,80 @@ def _build_composition_variation_instruction(
     )
 
 
+def _build_custom_instruction_variation_instruction(
+    parent_request_text: str,
+    parent_positive: str,
+    parent_negative: str,
+    parent_summary: str,
+    parent_assumptions: Sequence[str],
+    custom_instruction: str,
+) -> str:
+    return (
+        "\n\n---\n"
+        "これは既存の生成結果をもとにした「追加指示付き再生成」リクエストです。"
+        "元の生成方針をできるだけ維持し、追加指示に関係する部分のみを変更してください。"
+        "追加指示と矛盾しない限り、元の色彩・ライティング・構図・雰囲気・衣装などは維持してください。\n\n"
+        f"元のリクエスト: {parent_request_text}\n"
+        f"元のPositive: {parent_positive}\n"
+        f"元のNegative: {parent_negative}\n"
+        f"元のSummary: {parent_summary}\n"
+        f"元のAssumptions: {json.dumps(list(parent_assumptions), ensure_ascii=False)}\n\n"
+        f"今回の追加指示: {custom_instruction}\n"
+    )
+
+
+def generate_shogou_custom_instruction_variation(
+    parent_request_text: str,
+    parent_positive: str,
+    parent_negative: str,
+    parent_summary: str,
+    parent_assumptions: Sequence[str],
+    custom_instruction: str,
+    user_id: int | None = None,
+    reference_id: int | None = None,
+) -> ShogouPromptResult:
+    """"指示を追加して再生成": reuses the same shogou instruction/system
+    prompt as a normal /generate_ai call, but appends the parent request's
+    positive/negative/summary/assumptions plus the user's own free-text
+    instruction (from the regenerate modal), with an explicit instruction to
+    keep the original generation policy and only change what the new
+    instruction targets.
+    """
+    instruction_text = custom_instruction.strip()
+    if not instruction_text:
+        raise PromptGeneratorError("追加指示を入力してください。")
+    if len(instruction_text) > 1000:
+        raise PromptGeneratorError("追加指示は1000文字以内にしてください。")
+
+    text = parent_request_text.strip() or "(元のリクエスト文なし)"
+    logger.info("Shogou custom instruction variation generation start: user_id=%s", user_id)
+    system_prompt = append_memory_to_system_prompt(load_shogou_instruction(), user_id, text, mode="prompt")
+    if user_id is not None:
+        try:
+            reference_context = build_image_memory_prompt_context(user_id, text, reference_id)
+        except ValueError as exc:
+            raise PromptGeneratorError(str(exc)) from exc
+        if reference_context:
+            system_prompt += "\n\n" + reference_context
+    system_prompt += _build_custom_instruction_variation_instruction(
+        parent_request_text, parent_positive, parent_negative, parent_summary, parent_assumptions, instruction_text
+    )
+    logger.info(
+        "Shogou custom instruction variation system prompt complete: user_id=%s length=%s", user_id, len(system_prompt)
+    )
+
+    raw_content = _post_chat_completion(system_prompt, text, temperature=0.35)
+    logger.info("Shogou custom instruction variation postprocess start: raw_content_length=%s", len(raw_content))
+    result = parse_shogou_prompt_response(raw_content)
+    logger.info(
+        "Shogou custom instruction variation postprocess complete: positive_length=%s negative_length=%s blocked=%s",
+        len(result.positive),
+        len(result.negative),
+        result.blocked,
+    )
+    return result
+
+
 def generate_shogou_composition_variation(
     parent_request_text: str,
     parent_positive: str,

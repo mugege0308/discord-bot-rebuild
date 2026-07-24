@@ -21,7 +21,7 @@ DB_FILE = DATA_DIR / "generation_history.db"
 # future change can tell which shape an existing file has and migrate it.
 # Bump this whenever the CREATE TABLE statements below change, and add the
 # matching migration step to _apply_schema_version().
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 _HASH_CHUNK_SIZE = 1024 * 1024
 
@@ -33,7 +33,7 @@ ALLOWED_RATINGS = ("favorite", "like", "meh", "off_target")
 
 # The only regeneration_type values generation_requests.regeneration_type
 # may hold (besides NULL, for a request that is not a regeneration at all).
-REGENERATION_TYPES = ("same_prompt", "change_composition")
+REGENERATION_TYPES = ("same_prompt", "change_composition", "custom_instruction")
 
 # Phase 2A: /generate_ai_stats. NULL (not a regeneration) is reported under
 # this label rather than as a Python None, so it can be used directly as a
@@ -97,6 +97,10 @@ class GenerationRequestRecord:
     # earlier one. Both stay None for a normal (non-regenerated) request.
     parent_request_id: int | None = None
     regeneration_type: str | None = None
+    # Only set when regeneration_type == "custom_instruction": the free-text
+    # instruction the user typed into the modal (e.g. "髪型をポニーテールに").
+    # None for every other regeneration_type and for normal requests.
+    custom_instruction: str | None = None
 
 
 @dataclass(frozen=True)
@@ -127,6 +131,7 @@ class GenerationRequestDetail:
     selection_message: str
     parent_request_id: int | None
     regeneration_type: str | None
+    custom_instruction: str | None
 
 
 @dataclass(frozen=True)
@@ -246,7 +251,8 @@ def init_db() -> None:
                 selection_used INTEGER NOT NULL DEFAULT 0,
                 selection_message TEXT,
                 parent_request_id INTEGER,
-                regeneration_type TEXT
+                regeneration_type TEXT,
+                custom_instruction TEXT
             )
             """
         )
@@ -309,6 +315,12 @@ def _migrate_v1_to_v2(connection: sqlite3.Connection) -> None:
     _add_column_if_missing(connection, "generation_requests", "regeneration_type", "TEXT")
 
 
+def _migrate_v2_to_v3(connection: sqlite3.Connection) -> None:
+    """Adds custom_instruction to generation_requests (additive, guarded the
+    same way as _migrate_v1_to_v2 - a no-op if the column already exists)."""
+    _add_column_if_missing(connection, "generation_requests", "custom_instruction", "TEXT")
+
+
 def _apply_schema_version(connection: sqlite3.Connection) -> None:
     """Stamps/checks PRAGMA user_version so future schema changes have a
     reliable version to migrate from.
@@ -341,9 +353,14 @@ def _apply_schema_version(connection: sqlite3.Connection) -> None:
         return
     if current == 1:
         _migrate_v1_to_v2(connection)
+        _migrate_v2_to_v3(connection)
         connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         return
-    # Reachable only once SCHEMA_VERSION > 2. Deliberately does not bump the
+    if current == 2:
+        _migrate_v2_to_v3(connection)
+        connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        return
+    # Reachable only once SCHEMA_VERSION > 3. Deliberately does not bump the
     # version: silently relabelling an un-migrated file would hide the gap.
     logger.warning(
         "generation_history.db schema version %s is older than %s and no migration step is defined yet.",
@@ -471,8 +488,8 @@ def save_generation_history_detailed(
                     created_at, user_id, request_text, reference_id,
                     positive, negative, summary, assumptions_json,
                     workflow_file, workflow_hash, selection_used, selection_message,
-                    parent_request_id, regeneration_type
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    parent_request_id, regeneration_type, custom_instruction
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     _now_text(),
@@ -489,6 +506,7 @@ def save_generation_history_detailed(
                     request.selection_message,
                     resolved_parent_id,
                     resolved_regeneration_type,
+                    request.custom_instruction,
                 ),
             )
             request_id = int(cursor.lastrowid)
@@ -685,6 +703,7 @@ def get_generation_request(request_id: int) -> GenerationRequestDetail | None:
             selection_message=row["selection_message"] or "",
             parent_request_id=row["parent_request_id"],
             regeneration_type=row["regeneration_type"],
+            custom_instruction=row["custom_instruction"],
         )
     except Exception:
         logger.exception("Failed to read generation request: request_id=%s", request_id)
