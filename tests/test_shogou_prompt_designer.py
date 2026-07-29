@@ -719,5 +719,353 @@ class AssumptionsScopeInstructionTestCase(unittest.TestCase):
         self.assertIn("moonlight", example["positive"].lower())
 
 
+class ExistingCharacterPriorityInstructionTestCase(unittest.TestCase):
+    """Reported failure: 「東方の古明地こいしが神社にいる」 was summarized correctly
+    (character recognized) but the Positive tags replaced the character with
+    generic descriptors (`ancient spirit`, `long black hair`, `red eyes`,
+    `traditional clothing`) and added unrequested `cool colors` / `blue tones`.
+    The instruction file must state, and demonstrate via few-shot, that a
+    recognized existing character's name/series must never be dropped or
+    generalized away, that unknown appearance details must not be fabricated,
+    and that this is prioritized over background/color staging. These read
+    the real instruction file so a future edit that silently weakens the
+    rule fails loudly.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.instruction = load_shogou_instruction()
+
+    def test_existing_character_section_is_present(self):
+        self.assertIn("既存キャラクターの扱い（最優先で厳守）", self.instruction)
+        self.assertIn("キャラクター再現を背景・色彩演出・雰囲気より優先する", self.instruction)
+
+    def test_character_name_must_not_be_generalized_away(self):
+        self.assertIn("一般的な特徴語", self.instruction)
+        self.assertIn("固有名を消して雰囲気語へ変換することは禁止", self.instruction)
+        self.assertIn("そのキャラクター名を出力から絶対に落とさない", self.instruction)
+
+    def test_unknown_appearance_details_must_not_be_fabricated(self):
+        self.assertIn("分からない外見情報は無理に埋めず、捏造しない", self.instruction)
+        self.assertIn("キャラ辞書や外部検索は使わない", self.instruction)
+
+    def test_scene_completion_still_allowed_for_existing_characters(self):
+        self.assertIn(
+            "ポーズ・構図・背景・時間帯・人数・カメラ距離・視線など「場面情報」は通常どおり補完してよい",
+            self.instruction,
+        )
+
+    def test_existing_character_positive_order_is_documented(self):
+        section = self.instruction[self.instruction.index("既存キャラクター時の `positive` 順序") :]
+        for phrase in (
+            "1. character name",
+            "2. series name",
+            "3. 人数・rating",
+            "4. キャラクター固有情報",
+            "9. 品質タグ",
+        ):
+            self.assertIn(phrase, section)
+
+    def test_original_character_case_is_explicitly_exempted(self):
+        self.assertIn("オリジナルキャラクター", self.instruction)
+        self.assertIn("この既存キャラクタールールを適用せず", self.instruction)
+
+    def test_pose_breakdown_guidance_is_present(self):
+        for phrase in (
+            "facing viewer",
+            "looking at viewer",
+            "one hand raised",
+            "hands at sides",
+            "weight on one leg",
+            "upper body turned",
+        ):
+            self.assertIn(phrase, self.instruction)
+        self.assertIn("ControlNetやOpenPose用の座標・骨格指定は行わない", self.instruction)
+
+
+class ExistingCharacterAssumptionsRestrictionTestCase(unittest.TestCase):
+    """`assumptions` must not carry a hair/eye/clothing/species/color guess for
+    an existing character - only genuinely missing scene information
+    (background/time/camera distance/pose/count).
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.instruction = load_shogou_instruction()
+
+    def test_assumptions_restriction_for_existing_characters_is_documented(self):
+        self.assertIn(
+            "キャラクターの髪色・瞳色・衣装・種族・設定を推定した内容は `assumptions` に書かない",
+            self.instruction,
+        )
+
+    def test_color_and_wardrobe_alteration_is_bounded_for_existing_characters(self):
+        self.assertIn("勝手な和風化・洋風化、勝手な衣装変更", self.instruction)
+        self.assertIn("キャラクター固有色を壊す全体色調", self.instruction)
+
+
+class KomeijiKoishiFewShotRegressionTestCase(unittest.TestCase):
+    """Anchors the reported failure case as a concrete few-shot example so a
+    future edit that regresses to replacing a recognized character with
+    generic descriptors, or adds unrequested cool/blue staging, fails loudly.
+    Deliberately checks for substrings/keywords rather than full-string
+    equality so minor tag-order or wording drift doesn't make this test
+    unnecessarily brittle.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.instruction = load_shogou_instruction()
+        outputs = re.findall(r"^出力:\n(\{.*\})$", cls.instruction, flags=re.MULTILINE)
+        examples = [json.loads(raw) for raw in outputs]
+        matches = [example for example in examples if "koishi" in example["positive"].lower()]
+        assert matches, "expected a Komeiji Koishi few-shot example"
+        cls.example = matches[0]
+
+    def test_character_name_and_series_are_present_in_positive(self):
+        positive = self.example["positive"].lower()
+        self.assertIn("koishi", positive)
+        self.assertIn("touhou", positive)
+
+    def test_character_is_not_replaced_with_generic_descriptors(self):
+        positive = self.example["positive"].lower()
+        for forbidden in (
+            "ancient spirit",
+            "long black hair",
+            "red eyes",
+            "traditional clothing",
+            "mysterious girl",
+            "shrine maiden",
+        ):
+            self.assertNotIn(forbidden, positive)
+
+    def test_no_unrequested_cool_or_blue_staging_is_added(self):
+        positive = self.example["positive"].lower()
+        for forbidden in ("cool colors", "cool tones", "blue tones", "blue ambient", "cyan"):
+            self.assertNotIn(forbidden, positive)
+
+    def test_assumptions_contain_no_appearance_or_color_guesses(self):
+        assumptions_text = " ".join(self.example["assumptions"]).lower()
+        for forbidden in (
+            "髪",
+            "瞳",
+            "衣装",
+            "和服",
+            "black hair",
+            "red eyes",
+            "traditional clothing",
+            "cool",
+            "blue",
+        ):
+            self.assertNotIn(forbidden, assumptions_text)
+
+    def test_summary_still_names_the_character(self):
+        self.assertIn("こいし", self.example["summary"])
+
+    def test_background_completion_is_still_allowed(self):
+        # Scene information (shrine background) may still be completed and
+        # recorded in assumptions - only appearance/color guesses are banned.
+        assumptions_text = " ".join(self.example["assumptions"])
+        self.assertIn("神社", assumptions_text)
+
+
+class KnownCharacterContextInstructionTestCase(unittest.TestCase):
+    """The instruction file must explain how to use a `Known character:`
+    context block (injected by the character tag dictionary resolver, see
+    services/character_tag_dictionary.py) when one is present in the system
+    prompt: use the given tags verbatim, near the front of positive, without
+    re-translating/splitting/generalizing them.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.instruction = load_shogou_instruction()
+
+    def test_known_character_block_format_is_documented(self):
+        self.assertIn("Known character:", self.instruction)
+        self.assertIn("- character tag:", self.instruction)
+        self.assertIn("- series tag:", self.instruction)
+
+    def test_verbatim_usage_instruction_is_present(self):
+        self.assertIn("一字一句そのまま", self.instruction)
+        self.assertIn("do not translate, split, abbreviate, replace, or generalize these tags", self.instruction)
+
+
+class SparkleFewShotRegressionTestCase(unittest.TestCase):
+    """Reported failure: 「崩壊：スターレイルの火花」was mistranslated to
+    `spark, eclipse star rail` by the Prompt Designer, which an image model
+    cannot recognize as the character. The character tag dictionary resolves
+    this to the canonical `sparkle` / `honkai: star rail` tags; this few-shot
+    example anchors the correct behavior so a future edit that regresses back
+    to a generic/mistranslated rendering fails loudly.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.instruction = load_shogou_instruction()
+        outputs = re.findall(r"^出力:\n(\{.*\})$", cls.instruction, flags=re.MULTILINE)
+        examples = [json.loads(raw) for raw in outputs]
+        matches = [example for example in examples if "sparkle" in example["positive"].lower()]
+        assert matches, "expected a Sparkle (Honkai: Star Rail) few-shot example"
+        cls.example = matches[0]
+
+    def test_character_and_series_tags_are_present_verbatim(self):
+        positive = self.example["positive"].lower()
+        self.assertIn("sparkle", positive)
+        self.assertIn("honkai: star rail", positive)
+
+    def test_character_is_not_mistranslated_or_generalized(self):
+        positive = self.example["positive"].lower()
+        for forbidden in ("eclipse star rail", "fireworks", "traditional clothing"):
+            self.assertNotIn(forbidden, positive)
+        # "spark" alone (not "sparkle") must not appear as a separate tag.
+        tags = [tag.strip() for tag in positive.split(",")]
+        self.assertNotIn("spark", tags)
+
+    def test_assumptions_contain_no_appearance_or_color_guesses(self):
+        assumptions_text = " ".join(self.example["assumptions"]).lower()
+        for forbidden in ("髪", "瞳", "衣装", "cool", "blue"):
+            self.assertNotIn(forbidden, assumptions_text)
+
+
+class KinakoNanobanaFewShotRegressionTestCase(unittest.TestCase):
+    """Reported failure: 「イナズマイレブンGOの菜花きなこ」was mistranslated to
+    `kina ko` by the Prompt Designer. The character tag dictionary resolves
+    this to `nanobana kinako` / `inazuma eleven go` (surname-first, matching
+    Danbooru's real `nanobana_kinako` tag - the dictionary's original
+    `kinako nanobana` order was corrected after external verification).
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.instruction = load_shogou_instruction()
+        outputs = re.findall(r"^出力:\n(\{.*\})$", cls.instruction, flags=re.MULTILINE)
+        examples = [json.loads(raw) for raw in outputs]
+        matches = [example for example in examples if "nanobana kinako" in example["positive"].lower()]
+        assert matches, "expected a Nanobana Kinako (Inazuma Eleven GO) few-shot example"
+        cls.example = matches[0]
+
+    def test_character_and_series_tags_are_present_verbatim(self):
+        positive = self.example["positive"].lower()
+        self.assertIn("nanobana kinako", positive)
+        self.assertIn("inazuma eleven go", positive)
+
+    def test_character_is_not_split_or_mistranslated(self):
+        positive = self.example["positive"].lower()
+        self.assertNotIn("kina ko", positive)
+
+
+class KnownCharacterContextWiringTestCase(unittest.TestCase):
+    """Character tag dictionary integration: when the request text resolves
+    to a known character, the `Known character:` context block must reach LM
+    Studio via the system prompt for all three generation entry points
+    (plain / composition variation / custom instruction variation), and must
+    NOT appear when nothing resolves (so it doesn't pollute unrelated
+    requests). Custom instruction regeneration must resolve from
+    parent_request_text so the character tags survive the "add an
+    instruction" flow.
+    """
+
+    def test_plain_generation_includes_known_character_context_when_resolved(self):
+        with mock.patch(
+            "services.shogou_prompt_designer.load_shogou_instruction",
+            return_value="INSTRUCTION_BODY",
+        ), mock.patch(
+            "services.shogou_prompt_designer.append_memory_to_system_prompt",
+            return_value="INSTRUCTION_BODY",
+        ), mock.patch(
+            "services.shogou_prompt_designer.build_image_memory_prompt_context",
+            return_value="",
+        ), mock.patch(
+            "services.shogou_prompt_designer._post_chat_completion",
+            return_value=VALID_JSON,
+        ) as post_mock:
+            generate_shogou_prompt_result("崩壊:スターレイルの火花、笑顔", user_id=1, reference_id=None)
+
+        sent_system_prompt = post_mock.call_args.args[0]
+        self.assertIn("Known character:", sent_system_prompt)
+        self.assertIn("character tag: sparkle", sent_system_prompt)
+        self.assertIn("series tag: honkai: star rail", sent_system_prompt)
+
+    def test_plain_generation_omits_known_character_context_when_nothing_resolves(self):
+        with mock.patch(
+            "services.shogou_prompt_designer.load_shogou_instruction",
+            return_value="INSTRUCTION_BODY",
+        ), mock.patch(
+            "services.shogou_prompt_designer.append_memory_to_system_prompt",
+            return_value="INSTRUCTION_BODY",
+        ), mock.patch(
+            "services.shogou_prompt_designer.build_image_memory_prompt_context",
+            return_value="",
+        ), mock.patch(
+            "services.shogou_prompt_designer._post_chat_completion",
+            return_value=VALID_JSON,
+        ) as post_mock:
+            generate_shogou_prompt_result("猫耳の女の子が公園にいる", user_id=1, reference_id=None)
+
+        sent_system_prompt = post_mock.call_args.args[0]
+        self.assertNotIn("Known character:", sent_system_prompt)
+
+    def test_composition_variation_includes_known_character_context_when_resolved(self):
+        with mock.patch(
+            "services.shogou_prompt_designer.load_shogou_instruction",
+            return_value="INSTRUCTION_BODY",
+        ), mock.patch(
+            "services.shogou_prompt_designer.append_memory_to_system_prompt",
+            return_value="INSTRUCTION_BODY",
+        ), mock.patch(
+            "services.shogou_prompt_designer.build_image_memory_prompt_context",
+            return_value="",
+        ), mock.patch(
+            "services.shogou_prompt_designer._post_chat_completion",
+            return_value=VALID_JSON,
+        ) as post_mock:
+            generate_shogou_composition_variation(
+                "イナズマイレブンGOの菜花きなこ",
+                "1girl, nanobana kinako, inazuma eleven go",
+                "lowres",
+                "菜花きなこ",
+                (),
+                user_id=1,
+            )
+
+        sent_system_prompt = post_mock.call_args.args[0]
+        self.assertIn("Known character:", sent_system_prompt)
+        self.assertIn("character tag: nanobana kinako", sent_system_prompt)
+        self.assertIn("series tag: inazuma eleven go", sent_system_prompt)
+
+    def test_custom_instruction_variation_preserves_character_tags_from_parent_request_text(self):
+        with mock.patch(
+            "services.shogou_prompt_designer.load_shogou_instruction",
+            return_value="INSTRUCTION_BODY",
+        ), mock.patch(
+            "services.shogou_prompt_designer.append_memory_to_system_prompt",
+            return_value="INSTRUCTION_BODY",
+        ), mock.patch(
+            "services.shogou_prompt_designer.build_image_memory_prompt_context",
+            return_value="",
+        ), mock.patch(
+            "services.shogou_prompt_designer._post_chat_completion",
+            return_value=VALID_JSON,
+        ) as post_mock:
+            generate_shogou_custom_instruction_variation(
+                "崩壊:スターレイルの火花",
+                "1girl, sparkle, honkai: star rail",
+                "lowres",
+                "火花",
+                (),
+                "笑顔にして",
+                user_id=1,
+            )
+
+        sent_system_prompt = post_mock.call_args.args[0]
+        # The character tag context must survive alongside the custom
+        # instruction, not be dropped or overwritten by it.
+        self.assertIn("Known character:", sent_system_prompt)
+        self.assertIn("character tag: sparkle", sent_system_prompt)
+        self.assertIn("series tag: honkai: star rail", sent_system_prompt)
+        self.assertIn("笑顔にして", sent_system_prompt)
+
+
 if __name__ == "__main__":
     unittest.main()

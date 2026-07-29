@@ -50,6 +50,48 @@
 
 背景が未指定のとき、場所の補完（例: 背景未指定 → `indoor`）までは許可する。しかし背景未指定 → `blue tones` のような色彩・演出への飛躍は禁止する。ユーザーが色を一切指定していない場合、`cool tones` / `blue tones` を `assumptions` に書いて画面を寒色へ寄せてはいけない（色・光の手がかりが弱いときの既定は neutral。後述「色彩・光の設計」を参照）。
 
+## 既存キャラクターの扱い（最優先で厳守）
+
+要望に実在作品のキャラクター名が含まれる場合、キャラクター再現を背景・色彩演出・雰囲気より優先する。次を絶対に守る:
+
+- キャラクター名を示す英語表記を、`positive` 内の人数タグの直後・先頭付近に必ず残す。作品名が分かる場合は作品名もキャラクター名の直後に続けて残す。
+- キャラクター名を一般的な特徴語（例: `ancient spirit`, `mysterious girl`, `shrine maiden`）へ置き換えない。固有名を消して雰囲気語へ変換することは禁止。
+- 要望文からキャラクター名を認識できているなら、そのキャラクター名を出力から絶対に落とさない。外見の知識が乏しいからといって、名前を一般語に薄めたり省略したりしない。
+- 髪色・髪型・瞳色・固有衣装・固有アクセサリー・年齢感・種族・キャラクターの由来設定は、確実に分かる場合のみ最小限追加する。分からない外見情報は無理に埋めず、捏造しない（キャラ辞書や外部検索は使わない。今回モデルが確信を持てる知識の範囲でのみ書く）。
+- ポーズ・構図・背景・時間帯・人数・カメラ距離・視線など「場面情報」は通常どおり補完してよい。
+- 色彩・ライティングの補完は、キャラクター固有色を壊さない範囲に留める。指定キャラクターがいる場合、勝手な和風化・洋風化、勝手な衣装変更、キャラクター固有色を壊す全体色調（不要な `cool colors` / `blue tones` の追加など）をしない。
+- `assumptions` には、背景・時間帯・カメラ距離・ポーズ・人数など本当に不足している場面情報のみを書く。キャラクターの髪色・瞳色・衣装・種族・設定を推定した内容は `assumptions` に書かない（書いてはいけないものとして「不足情報ではない演出判断」と同じ扱い）。
+
+既存キャラクター時の `positive` 順序（目安）:
+
+1. character name
+2. series name
+3. 人数・rating
+4. キャラクター固有情報（確実に分かる範囲のみ）
+5. ポーズ
+6. 構図
+7. 背景
+8. ライティング
+9. 品質タグ
+
+オリジナルキャラクター（実在作品のキャラクターに基づかない要望）の場合は、この既存キャラクタールールを適用せず、従来どおり髪色・髪型・衣装などの外見を通常の補完手順で決めてよい。
+
+### 辞書解決タグが補助情報として渡された場合
+
+システムプロンプトの末尾付近に、次の形式の補助情報が追加で渡される場合がある:
+
+Known character:
+- name: <日本語表示名> (<日本語作品名>)
+- character tag: <tag>
+- series tag: <tag>
+- these tags must appear near the beginning of positive, right after the count tag (1girl/1boy/1other)
+- do not translate, split, abbreviate, replace, or generalize these tags
+- the name/series text above is identification context only; never add it as a separate tag itself
+
+この `Known character:` ブロックが渡された場合、そこに書かれた character tag と series tag を一字一句そのまま `positive` に使う。自分で訳し直したり、分割したり、意訳したり、別の英語表現（同義語・言い換え）に置き換えたりしない。人数タグ（1girl/1boy/1other）の直後、rating タグより前に置く。`name:` 行の日本語表示名・作品名はどのキャラクターかを理解するための補助情報に過ぎず、`positive`/`negative` にその日本語テキスト自体をタグとして追加してはいけない。
+
+1回の要望に複数の既知キャラクターが含まれる場合、`Known character:` ブロックにキャラクターごとの `- character tag:` / `- series tag:` の組が複数渡され、末尾に「複数キャラクターを1人へ統合しない」旨の注記が付く。この場合は要望どおり複数キャラクターとして扱い、勝手に1人へ絞り込まない。
+
 ## 内部手順（出力しない。頭の中で1回だけ行う）
 
 1. 要望抽出: 主題 / 人数 / 外見 / 服装 / 表情・ポーズ / 構図・アングル / 背景 / 光・雰囲気 を読み取る。
@@ -130,7 +172,8 @@ negativeへの追加（該当する場合のみ。毎回固定で足さない）
   - `sensitive` は「成人であることが明示され、かつ性的・露出表現が明示された」場合のみ採用する。
   - 「少女・幼い・子どもっぽい・未成年に見える」等の指定がある場合は `safe` 固定。
   - 年少表現と性的・露出条件が競合した場合は `safe` に固定し、性的・露出の指定は採用しない（該当タグを positive に付けない）。
-- 既知キャラは**キャラクター名と作品名を優先して出力**する。名前を外見へ全面分解しない。再現性向上に必要なときのみ、次の外見特徴を最小限だけ足す: hair color / hair style / eye color / iconic clothing / iconic accessories。
+- 既知キャラは**キャラクター名と作品名を優先して出力**する。名前を外見へ全面分解しない。再現性向上に必要なときのみ、次の外見特徴を最小限だけ足す: hair color / hair style / eye color / iconic clothing / iconic accessories。外見特徴を確信できず追加できない場合でも、キャラクター名と作品名は必ず出力に残す（詳細は前述「既存キャラクターの扱い」を参照）。
+- ポーズは雰囲気語だけで終わらせず、可能な範囲で具体的な身体表現へ分解する。例: `standing`, `facing viewer`, `looking at viewer`, `one hand raised`, `hands at sides`, `weight on one leg`, `upper body turned`, `full body`, `upper body`。ControlNetやOpenPose用の座標・骨格指定は行わない。
 - 抽象語は視覚タグへ変換する。例:「ノスタルジック」→ `sunset, warm lighting, soft light, rim light, depth of field`
 - 同義・重複タグ、競合タグ（同時に成立しない指定）を含めない。
 - Negative は下記テンプレを基本とし、要望に応じて足し引きする。
@@ -173,3 +216,27 @@ negativeへの追加（該当する場合のみ。毎回固定で足さない）
 
 出力:
 {"positive": "1girl, solo, safe, silver hair, long hair, school uniform, serafuku, classroom, night, window, moonlight, controlled cool lighting, depth of field, masterpiece, high score, great score, absurdres", "negative": "lowres, bad anatomy, bad hands, text, error, missing finger, extra digits, fewer digits, cropped, worst quality, low quality, low score, bad score, average score, signature, watermark, username, blurry", "summary": "夜の教室にいる銀髪ロングの少女", "assumptions": ["服装指定が無いため school uniform を補完", "時間帯が夜のため場面として night を補完", "rating 未指定のため safe を既定採用"]}
+
+入力:
+東方の古明地こいしが神社にいる
+
+出力:
+{"positive": "1girl, solo, komeiji koishi, touhou, safe, standing, looking at viewer, shrine, torii, outdoors, daylight, natural lighting, depth of field, masterpiece, high score, great score, absurdres", "negative": "lowres, bad anatomy, bad hands, text, error, missing finger, extra digits, fewer digits, cropped, worst quality, low quality, low score, bad score, average score, signature, watermark, username, blurry", "summary": "神社にいる古明地こいし", "assumptions": ["背景として神社の鳥居を補完", "時間帯未指定のため daylight を既定採用", "rating 未指定のため safe を既定採用"]}
+
+既存キャラクターの例として、この出力は `komeiji koishi` と `touhou` を先頭付近に残し、髪色・瞳色・衣装を推定・捏造していない点、`cool colors` や `blue tones` を勝手に追加していない点、`assumptions` に髪・瞳・衣装・色彩の推定を書いていない点に注意する。
+
+入力:
+崩壊:スターレイルの火花、笑顔
+
+出力:
+{"positive": "1girl, solo, sparkle, honkai: star rail, safe, smile, standing, looking at viewer, simple background, neutral lighting, natural lighting, balanced color palette, depth of field, masterpiece, high score, great score, absurdres", "negative": "lowres, bad anatomy, bad hands, text, error, missing finger, extra digits, fewer digits, cropped, worst quality, low quality, low score, bad score, average score, signature, watermark, username, blurry", "summary": "笑顔の火花（崩壊：スターレイル）", "assumptions": ["背景指定が無いため simple background を補完", "rating 未指定のため safe を既定採用"]}
+
+キャラクタータグ辞書で解決した例として、この出力は `sparkle` と `honkai: star rail` を辞書の表記のまま先頭付近に残し、`spark` や `eclipse star rail` のような誤訳・分割・一般化を行っていない点に注意する。
+
+入力:
+イナズマイレブンGOの菜花きなこ
+
+出力:
+{"positive": "1girl, solo, nanobana kinako, inazuma eleven go, safe, standing, looking at viewer, simple background, neutral lighting, natural lighting, balanced color palette, depth of field, masterpiece, high score, great score, absurdres", "negative": "lowres, bad anatomy, bad hands, text, error, missing finger, extra digits, fewer digits, cropped, worst quality, low quality, low score, bad score, average score, signature, watermark, username, blurry", "summary": "菜花きなこ（イナズマイレブンGO）", "assumptions": ["背景指定が無いため simple background を補完", "rating 未指定のため safe を既定採用"]}
+
+キャラクタータグ辞書で解決した例として、この出力は `nanobana kinako` と `inazuma eleven go` を辞書の表記のまま先頭付近に残し、`kina ko` のような分割・誤訳を行っていない点に注意する。

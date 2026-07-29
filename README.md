@@ -1408,6 +1408,12 @@ SD_SELECT_RETURN_COUNT=1
 - 既存の生成画像保存先 `data\sd_outputs` は変更しません。
 - 選別AI側の `model\ranker.pkl` や依存ライブラリが必要です。
 
+### キャラクター辞書（キャラクター名・作品名の解決）
+
+`services/character_tag_dictionary.py` は、要望文に含まれる既知キャラクターの日本語名・短縮名・英語名・作品名付き表記などを、Prompt Designerが使う正式な character tag / series tag へ解決する辞書です。解決できたキャラクターは `Known character:` という補助情報としてPrompt Designerのsystem promptへ渡され、髪色・衣装などの外見は推測・追加しません（外見の補強は別機能です）。1回の要望に複数キャラクターが含まれる場合は、勝手に1人へ絞り込まず複数キャラクターとして渡します。辞書内の1エントリが壊れていても、そのエントリだけがログ付きでスキップされ、Bot全体は起動を継続します。
+
+キャラクターの追加方法・エイリアスの考え方（`safe_aliases` / `ambiguous_aliases` の使い分け）は `services/character_tag_dictionary.py` 冒頭のモジュールdocstringにまとまっています。
+
 ### `/image_analyze` の構造化タグ
 
 Visionモデルの解析結果は、人物・髪・目・表情・服装・背景・構図・光/雰囲気・SDタグ候補のJSONとして受け取り、英語のDanbooru風タグへ正規化します。コードフェンス付きJSONにも対応し、JSONが壊れている場合は従来の自由文解析へフォールバックします。

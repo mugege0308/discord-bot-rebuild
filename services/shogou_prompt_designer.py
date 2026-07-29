@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Sequence
 
+from services.character_tag_dictionary import CharacterTagResolution, resolve_all_character_tags
 from services.image_memory import build_image_memory_prompt_context
 from services.memory import append_memory_to_system_prompt
 from services.prompt_generator import (
@@ -50,6 +51,38 @@ def _strip_code_fence(text: str) -> str:
     stripped = re.sub(r"^```(?:json)?\s*", "", stripped, flags=re.IGNORECASE)
     stripped = re.sub(r"\s*```$", "", stripped)
     return stripped.strip()
+
+
+def _build_known_character_context(resolutions: Sequence[CharacterTagResolution]) -> str:
+    lines = ["Known character:"]
+    for resolution in resolutions:
+        lines.append(f"- name: {resolution.display_name} ({resolution.series_name})")
+        lines.append(f"- character tag: {resolution.character_tag}")
+        lines.append(f"- series tag: {resolution.series_tag}")
+    lines.append("- these tags must appear near the beginning of positive, right after the count tag (1girl/1boy/1other)")
+    lines.append("- do not translate, split, abbreviate, replace, or generalize these tags")
+    lines.append("- the name/series text above is identification context only; never add it as a separate tag itself")
+    if len(resolutions) > 1:
+        lines.append(
+            "- multiple known characters were detected in this request; keep them as distinct, separate "
+            "characters and do not merge them into one"
+        )
+    return "\n".join(lines)
+
+
+def _append_known_character_context(system_prompt: str, text: str) -> str:
+    resolutions = resolve_all_character_tags(text)
+    if not resolutions:
+        return system_prompt
+    for resolution in resolutions:
+        logger.debug(
+            "Character tag resolved: input_character=%s character_tag=%s series_tag=%s match_type=%s",
+            resolution.matched_character_alias,
+            resolution.character_tag,
+            resolution.series_tag,
+            resolution.match_type,
+        )
+    return system_prompt + "\n\n" + _build_known_character_context(resolutions)
 
 
 def _extract_json_object(text: str) -> dict[str, Any] | None:
@@ -130,6 +163,7 @@ def generate_shogou_prompt_result(
             raise PromptGeneratorError(str(exc)) from exc
         if reference_context:
             system_prompt += "\n\n" + reference_context
+    system_prompt = _append_known_character_context(system_prompt, text)
     logger.info("Shogou system prompt generation complete: user_id=%s length=%s", user_id, len(system_prompt))
 
     raw_content = _post_chat_completion(system_prompt, text, temperature=0.35)
@@ -220,6 +254,7 @@ def generate_shogou_custom_instruction_variation(
             raise PromptGeneratorError(str(exc)) from exc
         if reference_context:
             system_prompt += "\n\n" + reference_context
+    system_prompt = _append_known_character_context(system_prompt, text)
     system_prompt += _build_custom_instruction_variation_instruction(
         parent_request_text, parent_positive, parent_negative, parent_summary, parent_assumptions, instruction_text
     )
@@ -263,6 +298,7 @@ def generate_shogou_composition_variation(
             raise PromptGeneratorError(str(exc)) from exc
         if reference_context:
             system_prompt += "\n\n" + reference_context
+    system_prompt = _append_known_character_context(system_prompt, text)
     system_prompt += _build_composition_variation_instruction(
         parent_request_text, parent_positive, parent_negative, parent_summary, parent_assumptions
     )
