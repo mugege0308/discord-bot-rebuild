@@ -11,6 +11,7 @@ from dotenv import load_dotenv
 
 import daily_log
 from commands import health
+from commands import blue_archive
 from commands import character_generate
 from commands import claude
 from commands import claude_remote
@@ -91,6 +92,7 @@ PC_CONTROL_WINDOWS_ONLY_MESSAGE = "PCシャットダウン機能はWindowsでだ
 PC_SHUTDOWN_CANCEL_FAILED_MESSAGE = "シャットダウン予約のキャンセルに失敗したみたい。Botのログを確認してね。"
 GUILD_ONLY_MESSAGE = "このコマンドはサーバー内で使ってね。"
 REQUIRED_SLASH_COMMANDS = {
+    "ba_damage",
     "generate_raw",
     "generate_ai",
     "image_memory_list",
@@ -206,6 +208,7 @@ class SecretaryClient(discord.Client):
 client = SecretaryClient()
 daily_log.setup(client)
 health.setup(client)
+blue_archive.setup(client)
 claude.setup(client)
 claude_remote.setup(client)
 dev_task.setup(client)
