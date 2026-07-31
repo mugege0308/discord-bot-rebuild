@@ -25,6 +25,148 @@ class FakeClient:
         self.tree = FakeCommandTree()
 
 
+class CharacterDictionaryCommandTestCase(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.client = FakeClient()
+        character_dictionary_command.setup(self.client)
+
+    @staticmethod
+    def _interaction(user_id: int = 1):
+        interaction = mock.MagicMock()
+        interaction.user.id = user_id
+        interaction.response.send_message = mock.AsyncMock()
+        interaction.response.defer = mock.AsyncMock()
+        interaction.followup.send = mock.AsyncMock()
+        return interaction
+
+    def test_setup_registers_all_five_commands(self):
+        self.assertEqual(
+            set(self.client.tree.commands.keys()),
+            {"character_list", "character_info", "character_search", "character_missing", "character_validate"},
+        )
+
+    async def test_character_list_returns_embed_grouped_by_series(self):
+        command = self.client.tree.commands["character_list"]
+        interaction = self._interaction()
+
+        await command(interaction, page=1)
+
+        interaction.response.send_message.assert_awaited_once()
+        _, kwargs = interaction.response.send_message.call_args
+        embed = kwargs["embed"]
+        self.assertIsInstance(embed, discord.Embed)
+        self.assertIn("総登録数", embed.description)
+        field_names = [field.name for field in embed.fields]
+        self.assertTrue(any("ブルーアーカイブ" in name for name in field_names))
+        self.assertTrue(kwargs["ephemeral"])
+
+    async def test_character_list_out_of_range_page_clamps_to_last_page(self):
+        command = self.client.tree.commands["character_list"]
+        interaction = self._interaction()
+
+        await command(interaction, page=9999)
+
+        _, kwargs = interaction.response.send_message.call_args
+        embed = kwargs["embed"]
+        self.assertIn("ページ", embed.footer.text)
+
+    async def test_character_info_unique_partial_match_returns_detail_embed(self):
+        command = self.client.tree.commands["character_info"]
+        interaction = self._interaction()
+
+        await command(interaction, character="こいし")
+
+        _, kwargs = interaction.response.send_message.call_args
+        embed = kwargs["embed"]
+        self.assertEqual(embed.title, "古明地こいし")
+        field_names = {field.name for field in embed.fields}
+        self.assertIn("character_tag", field_names)
+        self.assertIn("series_tag", field_names)
+
+    async def test_character_info_no_match_returns_not_found_message(self):
+        command = self.client.tree.commands["character_info"]
+        interaction = self._interaction()
+
+        await command(interaction, character="該当なしのクエリ")
+
+        args, kwargs = interaction.response.send_message.call_args
+        self.assertEqual(args[0], character_dictionary_command.NOT_FOUND_MESSAGE)
+        self.assertTrue(kwargs["ephemeral"])
+
+    async def test_character_info_ambiguous_match_lists_candidates(self):
+        command = self.client.tree.commands["character_info"]
+        interaction = self._interaction()
+
+        # "chi" partially matches both "nanami chiaki" and "shikano chinatsu".
+        await command(interaction, character="chi")
+
+        args, kwargs = interaction.response.send_message.call_args
+        self.assertIn("複数のキャラクター", args[0])
+        self.assertTrue(kwargs["ephemeral"])
+        self.assertNotIn("embed", kwargs)
+
+    async def test_character_search_by_series_alias_groups_all_matches(self):
+        command = self.client.tree.commands["character_search"]
+        interaction = self._interaction()
+
+        await command(interaction, query="ブルアカ", page=1)
+
+        _, kwargs = interaction.response.send_message.call_args
+        embed = kwargs["embed"]
+        self.assertIn("ブルアカ", embed.title)
+        field_names = [field.name for field in embed.fields]
+        self.assertTrue(any("ブルーアーカイブ" in name for name in field_names))
+
+    async def test_character_search_no_match_returns_not_found_message(self):
+        command = self.client.tree.commands["character_search"]
+        interaction = self._interaction()
+
+        await command(interaction, query="該当なしのクエリ", page=1)
+
+        args, kwargs = interaction.response.send_message.call_args
+        self.assertEqual(args[0], character_dictionary_command.NOT_FOUND_MESSAGE)
+        self.assertTrue(kwargs["ephemeral"])
+
+
+class BuildCharacterDetailEmbedFutureFieldTestCase(unittest.TestCase):
+    """extra_fields内の未知キーも表示できることを確認する（appearance_tags等が
+    将来追加された場合に表示コードの変更が不要であることの保証）。"""
+
+    def test_unknown_extra_field_key_falls_back_to_raw_name(self):
+        from services.character_tag_dictionary import CharacterDetail
+
+        detail = CharacterDetail(
+            character_tag="dummy",
+            display_name="ダミー",
+            series_tag="dummy series",
+            series_name="ダミー作品",
+            extra_fields={"appearance_tags": ("long hair",), "brand_new_field": "some value"},
+        )
+
+        embed = character_dictionary_command.build_character_detail_embed(detail)
+
+        field_by_name = {field.name: field.value for field in embed.fields}
+        self.assertEqual(field_by_name["外見タグ"], "long hair")
+        self.assertEqual(field_by_name["brand_new_field"], "some value")
+
+    def test_unset_extra_field_value_displays_as_placeholder(self):
+        from services.character_tag_dictionary import CharacterDetail
+
+        detail = CharacterDetail(
+            character_tag="dummy",
+            display_name="ダミー",
+            series_tag="dummy series",
+            series_name="ダミー作品",
+            extra_fields={"identity_hints": (), "notes": ""},
+        )
+
+        embed = character_dictionary_command.build_character_detail_embed(detail)
+
+        field_by_name = {field.name: field.value for field in embed.fields}
+        self.assertEqual(field_by_name["識別ヒント"], "未設定")
+        self.assertEqual(field_by_name["備考"], "未設定")
+
+
 class CharacterMissingCommandTestCase(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.client = FakeClient()

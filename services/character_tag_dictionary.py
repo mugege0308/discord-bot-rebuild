@@ -373,6 +373,7 @@ def _build_character_entries(
 
 _SERIES_ENTRIES: tuple[_SeriesEntry, ...] = _build_series_entries(_RAW_SERIES)
 _SERIES_NAME_BY_TAG: dict[str, str] = {series.series_tag: series.series_name for series in _SERIES_ENTRIES}
+_SERIES_BY_TAG: dict[str, _SeriesEntry] = {series.series_tag: series for series in _SERIES_ENTRIES}
 _CHARACTER_ENTRIES: tuple[_CharacterEntry, ...] = _build_character_entries(
     _RAW_CHARACTERS, frozenset(_SERIES_NAME_BY_TAG)
 )
@@ -577,6 +578,16 @@ def find_blocked_alias_mentions(user_text: str) -> tuple[BlockedAliasMention, ..
     return tuple(mentions)
 
 
+# ---------------------------------------------------------------------------
+# Read-only browsing API (list / search / detail).
+#
+# These are for surfacing what's registered in this dictionary (e.g. Discord
+# `/character_list`, `/character_info`, `/character_search` commands) - they
+# do not participate in `resolve_character_tags` / `resolve_all_character_tags`
+# matching above, and this module remains the only place character data is
+# defined; callers only ever get read-only snapshots derived from it.
+
+
 @dataclass(frozen=True)
 class SeriesListEntry:
     """One row of the browsable series list - identity + its own aliases.
@@ -590,6 +601,16 @@ class SeriesListEntry:
     series_tag: str
     series_name: str
     aliases: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class CharacterListEntry:
+    """One row of the browsable character list - identity + which series."""
+
+    character_tag: str
+    display_name: str
+    series_tag: str
+    series_name: str
 
 
 @dataclass(frozen=True)
@@ -613,6 +634,24 @@ class CharacterDetail:
 
 
 _CHARACTER_DETAIL_CORE_FIELD_NAMES = frozenset({"character_tag", "display_name", "series_tag"})
+
+
+def _character_list_entry(character: _CharacterEntry) -> CharacterListEntry:
+    return CharacterListEntry(
+        character_tag=character.character_tag,
+        display_name=character.display_name,
+        series_tag=character.series_tag,
+        series_name=_SERIES_NAME_BY_TAG.get(character.series_tag, character.series_tag),
+    )
+
+
+def list_characters() -> tuple[CharacterListEntry, ...]:
+    """Every registered character, in dictionary declaration order.
+
+    Read-only snapshot for `/character_list`. Grouping by series (if wanted
+    by the caller) can be done from `series_tag`/`series_name` on each entry.
+    """
+    return tuple(_character_list_entry(character) for character in _CHARACTER_ENTRIES)
 
 
 def list_series() -> tuple[SeriesListEntry, ...]:
@@ -659,3 +698,58 @@ def list_character_details() -> tuple[CharacterDetail, ...]:
     every known `character_tag`, but without the repeated O(n) scans.
     """
     return tuple(_character_detail_from_entry(character) for character in _CHARACTER_ENTRIES)
+
+
+def find_characters_by_name(query: str) -> tuple[CharacterListEntry, ...]:
+    """Characters whose own identity (display_name / character_tag / any of
+    its aliases) contains `query` (partial match, same Unicode/casefold
+    normalization as alias resolution above). Does not consider series name
+    or series aliases - use `search_characters` for that. Read-only snapshot
+    for `/character_info`.
+    """
+    normalized_query = _normalize(query)
+    if not normalized_query:
+        return ()
+
+    matches: list[CharacterListEntry] = []
+    for character in _CHARACTER_ENTRIES:
+        haystacks = (
+            character.display_name,
+            character.character_tag,
+            *character.safe_aliases,
+            *character.ambiguous_aliases,
+        )
+        if any(normalized_query in _normalize(text) for text in haystacks if text):
+            matches.append(_character_list_entry(character))
+    return tuple(matches)
+
+
+def search_characters(query: str) -> tuple[CharacterListEntry, ...]:
+    """Characters found via a broad, series-inclusive partial match: series
+    name, series_tag, any series alias, character display_name,
+    character_tag, or any character alias containing `query`. Matching on a
+    series alias (e.g. "ブルアカ") returns every character in that series.
+    Read-only snapshot for `/character_search`.
+    """
+    normalized_query = _normalize(query)
+    if not normalized_query:
+        return ()
+
+    matches: list[CharacterListEntry] = []
+    for character in _CHARACTER_ENTRIES:
+        series = _SERIES_BY_TAG.get(character.series_tag)
+        haystacks = [
+            character.display_name,
+            character.character_tag,
+            *character.safe_aliases,
+            *character.ambiguous_aliases,
+        ]
+        if series is not None:
+            haystacks.append(series.series_name)
+            haystacks.append(series.series_tag)
+            haystacks.extend(series.aliases)
+        else:
+            haystacks.append(character.series_tag)
+        if any(normalized_query in _normalize(text) for text in haystacks if text):
+            matches.append(_character_list_entry(character))
+    return tuple(matches)

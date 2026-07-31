@@ -5,9 +5,13 @@ from services.character_tag_dictionary import (
     _build_character_entries,
     _build_series_entries,
     _normalize,
+    find_characters_by_name,
+    get_character_detail,
     known_character_and_series_tags,
+    list_characters,
     resolve_all_character_tags,
     resolve_character_tags,
+    search_characters,
 )
 
 
@@ -338,6 +342,99 @@ class BrokenDictionaryEntryIsolationTestCase(unittest.TestCase):
         built = _build_character_entries(raw, frozenset({"ok series"}))
 
         self.assertEqual(built, ())
+
+
+class ListCharactersTestCase(unittest.TestCase):
+    def test_returns_every_registered_character_with_series_name(self):
+        entries = list_characters()
+
+        self.assertEqual(len(entries), 14)
+        by_tag = {entry.character_tag: entry for entry in entries}
+        self.assertEqual(by_tag["kisaki"].display_name, "竜華キサキ")
+        self.assertEqual(by_tag["kisaki"].series_tag, "blue archive")
+        self.assertEqual(by_tag["kisaki"].series_name, "ブルーアーカイブ")
+
+    def test_does_not_mutate_between_calls(self):
+        first = list_characters()
+        second = list_characters()
+
+        self.assertEqual(first, second)
+        self.assertIsNot(first, second)
+
+
+class GetCharacterDetailTestCase(unittest.TestCase):
+    def test_known_character_tag_returns_full_detail(self):
+        detail = get_character_detail("sparkle")
+
+        self.assertIsNotNone(detail)
+        self.assertEqual(detail.display_name, "花火")
+        self.assertEqual(detail.series_tag, "honkai: star rail")
+        self.assertEqual(detail.series_name, "崩壊：スターレイル")
+        self.assertIn("safe_aliases", detail.extra_fields)
+        self.assertIn("ambiguous_aliases", detail.extra_fields)
+        self.assertIn("notes", detail.extra_fields)
+        self.assertEqual(detail.extra_fields["safe_aliases"], ("sparkle",))
+
+    def test_unknown_character_tag_returns_none(self):
+        self.assertIsNone(get_character_detail("no such character"))
+
+    def test_extra_fields_excludes_core_identity_fields(self):
+        detail = get_character_detail("kei")
+
+        self.assertIsNotNone(detail)
+        self.assertNotIn("character_tag", detail.extra_fields)
+        self.assertNotIn("display_name", detail.extra_fields)
+        self.assertNotIn("series_tag", detail.extra_fields)
+
+
+class FindCharactersByNameTestCase(unittest.TestCase):
+    def test_partial_display_name_match_finds_character(self):
+        matches = find_characters_by_name("こいし")
+
+        self.assertEqual([m.character_tag for m in matches], ["komeiji koishi"])
+
+    def test_partial_character_tag_match_finds_character(self):
+        matches = find_characters_by_name("nanobana")
+
+        self.assertEqual([m.character_tag for m in matches], ["nanobana kinako"])
+
+    def test_series_name_alone_does_not_match_any_character(self):
+        # find_characters_by_name only looks at the character's own identity
+        # (display_name/character_tag/aliases), not the series - that broader
+        # match is search_characters' job.
+        self.assertEqual(find_characters_by_name("ブルーアーカイブ"), ())
+
+    def test_empty_query_returns_no_matches(self):
+        self.assertEqual(find_characters_by_name(""), ())
+
+    def test_no_match_returns_empty_tuple(self):
+        self.assertEqual(find_characters_by_name("該当なしのクエリ"), ())
+
+
+class SearchCharactersTestCase(unittest.TestCase):
+    def test_series_alias_returns_every_character_in_that_series(self):
+        matches = search_characters("ブルアカ")
+
+        self.assertEqual(
+            {m.character_tag for m in matches},
+            {"shimoe koharu", "kisaki", "kei"},
+        )
+
+    def test_series_name_returns_every_character_in_that_series(self):
+        matches = search_characters("東方Project")
+
+        self.assertEqual({m.character_tag for m in matches}, {"komeiji koishi"})
+
+    def test_character_alias_still_matches(self):
+        matches = search_characters("hu tao")
+
+        self.assertEqual([m.character_tag for m in matches], ["hu tao"])
+
+    def test_empty_query_returns_no_matches(self):
+        self.assertEqual(search_characters(""), ())
+
+    def test_no_match_returns_empty_tuple(self):
+        self.assertEqual(search_characters("該当なしのクエリ"), ())
 
 
 if __name__ == "__main__":
