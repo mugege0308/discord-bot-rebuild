@@ -17,12 +17,26 @@ from services.blue_archive_damage import (
     calculate_damage,
     round_damage,
 )
+from services.blue_archive_timeline import (
+    MAX_TIMELINE_TEXT_LENGTH,
+    TimelineConfig,
+    TimelineSimulationResult,
+    TimelineValidationError,
+    format_cost,
+    format_remaining_time,
+    parse_timeline,
+    simulate_timeline,
+)
 
 
 logger = logging.getLogger("secretary-bot.blue_archive")
 
 CALCULATION_FAILED_MESSAGE = "ダメージ計算に失敗しました。入力値を確認して、もう一度試してください。"
 CAUTION_MESSAGE = "実際のゲーム内表示とは、端数処理、個別スキル仕様、敵固有補正などにより差が出る可能性があります。"
+TIMELINE_FAILED_MESSAGE = "TLコスト検査に失敗しました。入力内容を確認して、もう一度試してください。"
+TIMELINE_CAUTION_MESSAGE = (
+    "回復速度は入力値に基づく汎用計算です。ゲーム内の内部式・特殊効果・端数処理により差が出る可能性があります。"
+)
 
 
 @dataclass(frozen=True)
@@ -41,6 +55,25 @@ class DamageEmbedData:
     title: str
     description: str
     fields: tuple[DamageEmbedField, ...]
+    footer: str
+
+
+@dataclass(frozen=True)
+class TimelineEmbedField:
+    """TL検査結果をDiscord Embedへ変換する前の表示フィールド。"""
+
+    name: str
+    value: str
+    inline: bool = False
+
+
+@dataclass(frozen=True)
+class TimelineEmbedData:
+    """Discord APIを呼ばずにテストできるTL検査の表示データ。"""
+
+    title: str
+    description: str
+    fields: tuple[TimelineEmbedField, ...]
     footer: str
 
 
@@ -143,8 +176,103 @@ def build_damage_embed(data: DamageEmbedData) -> discord.Embed:
     return embed
 
 
+def build_timeline_embed_data(
+    config: TimelineConfig,
+    result: TimelineSimulationResult,
+) -> TimelineEmbedData:
+    """TL設定とシミュレーション結果からDiscord非依存の表示データを作る。"""
+
+    overall = "✅ 成立" if result.is_valid else "❌ 不成立"
+    fields: list[TimelineEmbedField] = [
+        TimelineEmbedField(
+            name="検査設定",
+            value="\n".join(
+                (
+                    f"戦闘開始: {format_remaining_time(config.battle_time)}",
+                    f"開始 / 最大コスト: {format_cost(config.start_cost)} / {format_cost(config.max_cost)}",
+                    f"基礎回復: {format_cost(config.cost_per_second)}/秒",
+                    f"回復倍率: ×{format_cost(config.recovery_multiplier)}",
+                    f"実効回復: {format_cost(result.effective_recovery_rate)}/秒",
+                    "モード: strict（不足時は消費せず指定時刻のまま継続）",
+                )
+            ),
+            inline=False,
+        ),
+        TimelineEmbedField(
+            name=f"TL全体: {overall}",
+            value="\n".join(
+                (
+                    f"総回復: {format_cost(result.total_recovered_cost)}",
+                    f"総消費: {format_cost(result.total_spent_cost)}",
+                    f"総溢れ: {format_cost(result.total_overflow_cost)}",
+                    f"最終コスト: {format_cost(result.final_cost)}",
+                )
+            ),
+            inline=False,
+        ),
+    ]
+
+    for action in result.actions:
+        status = "✅ 使用可" if action.is_available else "❌ コスト不足"
+        earliest = (
+            format_remaining_time(action.earliest_available_time)
+            if action.earliest_available_time is not None
+            else "算出不能"
+        )
+        details = [
+            (
+                f"使用前 {format_cost(action.cost_before)} / "
+                f"要求 {format_cost(action.required_cost)} / "
+                f"実消費 {format_cost(action.cost_spent)} / "
+                f"使用後 {format_cost(action.cost_after)}"
+            ),
+            (
+                f"不足 {format_cost(action.shortage)} / "
+                f"区間溢れ {format_cost(action.overflow_cost)} / "
+                f"最短 {earliest}"
+            ),
+        ]
+        if action.base_cost != action.required_cost:
+            details.append(
+                f"基本コスト {format_cost(action.base_cost)} → 実消費 {format_cost(action.required_cost)}"
+            )
+        if action.warning:
+            details.append(action.warning)
+        fields.append(
+            TimelineEmbedField(
+                name=(
+                    f"{status}｜{action.line_number}行目 "
+                    f"{format_remaining_time(action.remaining_time)} {action.display_name}"
+                ),
+                value="\n".join(details),
+                inline=False,
+            )
+        )
+
+    return TimelineEmbedData(
+        title="ブルーアーカイブ TLコスト検査",
+        description="入力した順番で、カウントダウン時刻ごとの自然回復とEX消費をstrictモードで検査します。",
+        fields=tuple(fields),
+        footer=TIMELINE_CAUTION_MESSAGE,
+    )
+
+
+def build_timeline_embed(data: TimelineEmbedData) -> discord.Embed:
+    """TL表示データをdiscord.pyのEmbedへ変換する。"""
+
+    embed = discord.Embed(
+        title=data.title,
+        description=data.description,
+        color=discord.Color.green() if "不成立" not in data.fields[1].name else discord.Color.orange(),
+    )
+    for field in data.fields:
+        embed.add_field(name=field.name, value=field.value, inline=field.inline)
+    embed.set_footer(text=data.footer)
+    return embed
+
+
 def setup(client: discord.Client) -> None:
-    """``/ba_damage`` をクライアントのCommandTreeへ登録する。"""
+    """``/ba_damage`` と ``/ba_tl_cost`` をCommandTreeへ登録する。"""
 
     @client.tree.command(name="ba_damage", description="ブルーアーカイブの想定ダメージを手動入力で計算します。")
     @app_commands.describe(
@@ -205,6 +333,46 @@ def setup(client: discord.Client) -> None:
 
         embed_data = build_damage_embed_data(values, result)
         await interaction.response.send_message(embed=build_damage_embed(embed_data))
+
+    @client.tree.command(name="ba_tl_cost", description="入力したブルーアーカイブTLのEXコスト成立可否を検査します。")
+    @app_commands.describe(
+        timeline="TL。例: 3:55 | ヒマリ | 3（改行かセミコロンで複数行）",
+        cost_per_second="1秒当たりの基礎回復量（公式値を仮定しないため必須）",
+        battle_time="戦闘開始時の残り秒数（既定: 240）",
+        start_cost="戦闘開始時のコスト（既定: 0）",
+        max_cost="最大コスト（既定: 10）",
+        recovery_multiplier="回復速度倍率（既定: 1.0）",
+    )
+    async def slash_ba_tl_cost(
+        interaction: discord.Interaction,
+        timeline: app_commands.Range[str, 1, MAX_TIMELINE_TEXT_LENGTH],
+        cost_per_second: app_commands.Range[float, 0.0, 1000.0],
+        battle_time: app_commands.Range[float, 0.1, 3600.0] = 240.0,
+        start_cost: app_commands.Range[float, 0.0, 1000.0] = 0.0,
+        max_cost: app_commands.Range[float, 0.01, 1000.0] = 10.0,
+        recovery_multiplier: app_commands.Range[float, 0.0, 1000.0] = 1.0,
+    ) -> None:
+        try:
+            actions = parse_timeline(timeline)
+            config = TimelineConfig.from_values(
+                battle_time=battle_time,
+                start_cost=start_cost,
+                max_cost=max_cost,
+                cost_per_second=cost_per_second,
+                recovery_multiplier=recovery_multiplier,
+                mode="strict",
+            )
+            result = simulate_timeline(actions, config)
+            embed = build_timeline_embed(build_timeline_embed_data(config, result))
+        except TimelineValidationError as exc:
+            await interaction.response.send_message(f"入力エラー: {exc}", ephemeral=True)
+            return
+        except Exception:
+            logger.exception("Failed to inspect /ba_tl_cost.")
+            await interaction.response.send_message(TIMELINE_FAILED_MESSAGE, ephemeral=True)
+            return
+
+        await interaction.response.send_message(embed=embed)
 
 
 def _format_range(values: DamageRange) -> str:
