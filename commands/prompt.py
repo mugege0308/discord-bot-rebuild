@@ -121,6 +121,45 @@ STATS_FAILED_MESSAGE = "評価統計の集計に失敗しました。時間を�
 _active_regenerations: set[int] = set()
 
 
+async def _disable_view_message_safely(
+    view: discord.ui.View, message: "discord.Message | None", *, log_label: str
+) -> None:
+    """Disables every child of `view` and tries to reflect that on the
+    already-sent Discord message, on a timeout.
+
+    `message` (when a View that timed out has one) was obtained from
+    `interaction.followup.send(..., wait=True)`, so editing it directly goes
+    through the original interaction's webhook route - and by the time
+    RATING_VIEW_TIMEOUT_SECONDS (1 hour) has elapsed, that webhook token is
+    long expired, which raises `401 Unauthorized (error code: 50027 Invalid
+    Webhook Token)`. Re-fetching the message through its channel instead uses
+    the normal bot-token message-edit route, which has no such expiry.
+
+    Safe to call more than once (re-disabling already-disabled children and
+    re-fetching/re-editing the message are both harmless no-ops the second
+    time). Never raises: a message that is gone, no longer accessible, or -
+    for an ephemeral message, which was never a normal channel message to
+    begin with - simply not fetchable this way, is logged as a warning and
+    otherwise ignored. The already-delivered content and any stored ratings
+    are unaffected either way.
+    """
+    for child in view.children:
+        child.disabled = True
+    if message is None:
+        return
+    try:
+        fetched_message = await message.channel.fetch_message(message.id)
+        await fetched_message.edit(view=view)
+    except Exception:
+        logger.warning(
+            "Could not disable %s view buttons after timeout (message deleted, inaccessible, "
+            "or the original interaction webhook token expired): message_id=%s",
+            log_label,
+            message.id,
+            exc_info=True,
+        )
+
+
 class ImageRatingButton(discord.ui.Button):
     def __init__(self, *, image_id: int, rating: str, display_index: int, row: int) -> None:
         super().__init__(
@@ -180,16 +219,7 @@ class ImageRatingView(discord.ui.View):
                 )
 
     async def on_timeout(self) -> None:
-        for child in self.children:
-            child.disabled = True
-        if self.message is None:
-            return
-        try:
-            await self.message.edit(view=self)
-        except Exception:
-            # The message may be gone or no longer editable; the already
-            # delivered images and stored ratings still stand.
-            logger.info("Could not disable rating buttons after timeout.", exc_info=True)
+        await _disable_view_message_safely(self, self.message, log_label="rating")
 
 
 class RegenerateButton(discord.ui.Button):

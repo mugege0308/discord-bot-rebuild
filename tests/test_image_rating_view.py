@@ -2,6 +2,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import discord
+
 import commands.prompt as prompt_module
 from commands.prompt import (
     MAX_RATEABLE_IMAGES,
@@ -220,15 +222,30 @@ class ImageRatingButtonCallbackTestCase(unittest.IsolatedAsyncioTestCase):
 
 
 class ImageRatingViewTimeoutTestCase(unittest.IsolatedAsyncioTestCase):
-    async def test_timeout_disables_buttons_and_edits_message(self):
+    """on_timeout must never depend on the original interaction's webhook
+    token, which is long expired by the time RATING_VIEW_TIMEOUT_SECONDS (1
+    hour) elapses - see commands.prompt._disable_view_message_safely."""
+
+    @staticmethod
+    def _message_with_fetchable_channel():
+        message = mock.MagicMock()
+        message.id = 101
+        fetched_message = mock.MagicMock()
+        fetched_message.edit = mock.AsyncMock()
+        message.channel.fetch_message = mock.AsyncMock(return_value=fetched_message)
+        return message, fetched_message
+
+    async def test_timeout_fetches_the_channel_message_and_edits_it(self):
         view = ImageRatingView([(1, 101)])
-        view.message = mock.MagicMock()
-        view.message.edit = mock.AsyncMock()
+        view.message, fetched_message = self._message_with_fetchable_channel()
 
         await view.on_timeout()
 
         self.assertTrue(all(child.disabled for child in view.children))
-        view.message.edit.assert_awaited_once()
+        view.message.channel.fetch_message.assert_awaited_once_with(view.message.id)
+        fetched_message.edit.assert_awaited_once_with(view=view)
+        # Must never touch the interaction-webhook-bound edit route directly.
+        view.message.edit.assert_not_called()
 
     async def test_timeout_without_message_is_a_no_op(self):
         view = ImageRatingView([(1, 101)])
@@ -238,12 +255,53 @@ class ImageRatingViewTimeoutTestCase(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(all(child.disabled for child in view.children))
 
-    async def test_timeout_edit_failure_is_swallowed(self):
+    async def test_timeout_invalid_webhook_token_is_swallowed(self):
+        # The exact failure from the bug report: editing through the expired
+        # interaction webhook raises 401 Unauthorized / error code 50027.
         view = ImageRatingView([(1, 101)])
         view.message = mock.MagicMock()
-        view.message.edit = mock.AsyncMock(side_effect=RuntimeError("message gone"))
+        view.message.id = 101
+        response = mock.Mock(status=401, reason="Unauthorized")
+        view.message.channel.fetch_message = mock.AsyncMock(
+            side_effect=discord.HTTPException(response, {"code": 50027, "message": "Invalid Webhook Token"})
+        )
 
         await view.on_timeout()  # must not raise
+
+        self.assertTrue(all(child.disabled for child in view.children))
+
+    async def test_timeout_not_found_is_swallowed(self):
+        # Deleted message, or an ephemeral message that was never a normal
+        # channel message to begin with.
+        view = ImageRatingView([(1, 101)])
+        view.message = mock.MagicMock()
+        view.message.id = 101
+        response = mock.Mock(status=404, reason="Not Found")
+        view.message.channel.fetch_message = mock.AsyncMock(
+            side_effect=discord.NotFound(response, "Unknown Message")
+        )
+
+        await view.on_timeout()  # must not raise
+
+        self.assertTrue(all(child.disabled for child in view.children))
+
+    async def test_timeout_edit_failure_after_successful_fetch_is_swallowed(self):
+        view = ImageRatingView([(1, 101)])
+        view.message, fetched_message = self._message_with_fetchable_channel()
+        fetched_message.edit = mock.AsyncMock(side_effect=RuntimeError("message gone"))
+
+        await view.on_timeout()  # must not raise
+
+    async def test_timeout_is_safe_to_call_more_than_once(self):
+        view = ImageRatingView([(1, 101)])
+        view.message, fetched_message = self._message_with_fetchable_channel()
+
+        await view.on_timeout()
+        await view.on_timeout()
+
+        self.assertTrue(all(child.disabled for child in view.children))
+        self.assertEqual(view.message.channel.fetch_message.await_count, 2)
+        self.assertEqual(fetched_message.edit.await_count, 2)
 
 
 class RatingViewBuildTestCase(unittest.IsolatedAsyncioTestCase):
