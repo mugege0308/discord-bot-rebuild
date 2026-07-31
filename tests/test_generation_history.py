@@ -17,6 +17,7 @@ from services.generation_history import (
     get_generation_request,
     get_generation_stats,
     init_db,
+    list_request_texts,
     resolve_image_ids_for_paths,
     save_generation_history,
     save_generation_history_detailed,
@@ -1186,6 +1187,46 @@ class GenerationStatsTestCase(GenerationHistoryTestCase):
             side_effect=sqlite3.OperationalError("disk I/O error"),
         ):
             self.assertIsNone(get_generation_stats(42))
+
+
+class RequestTextScanTestCase(GenerationHistoryTestCase):
+    """list_request_texts - the read used by /character_missing to scan
+    generation history for known-but-unresolved character aliases."""
+
+    def test_returns_saved_rows_most_recent_first(self):
+        save_generation_history(_make_request(user_id=1, request_text="最初の依頼"), [])
+        save_generation_history(_make_request(user_id=2, request_text="二番目の依頼"), [])
+
+        rows = list_request_texts()
+
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0].request_text, "二番目の依頼")
+        self.assertEqual(rows[1].request_text, "最初の依頼")
+        self.assertEqual(rows[0].user_id, 2)
+
+    def test_no_rows_returns_empty_list(self):
+        self.assertEqual(list_request_texts(), [])
+
+    def test_respects_limit_parameter(self):
+        for i in range(5):
+            save_generation_history(_make_request(user_id=1, request_text=f"依頼{i}"), [])
+
+        rows = list_request_texts(limit=2)
+
+        self.assertEqual(len(rows), 2)
+
+    def test_db_error_returns_empty_list_without_raising(self):
+        with mock.patch(
+            "services.generation_history.sqlite3.connect",
+            side_effect=sqlite3.OperationalError("disk I/O error"),
+        ):
+            self.assertEqual(list_request_texts(), [])
+
+    def test_corrupted_db_file_returns_empty_list_without_raising(self):
+        self.db_file.parent.mkdir(parents=True, exist_ok=True)
+        self.db_file.write_bytes(b"this is not a sqlite database file")
+
+        self.assertEqual(list_request_texts(), [])
 
 
 if __name__ == "__main__":

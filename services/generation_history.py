@@ -879,3 +879,65 @@ def get_generation_stats(user_id: int) -> GenerationStats | None:
         good_sample_count=good_sample_count,
         low_sample_count=low_sample_count,
     )
+
+
+@dataclass(frozen=True)
+class RequestTextRow:
+    """Read-only: the (id, created_at, user_id, request_text) columns of one
+    generation_requests row - deliberately not positive/negative/summary/
+    assumptions, which are LM Studio's own output rather than the user's own
+    wording. Used to cross-reference generation history against the
+    character dictionary (e.g. /character_missing); this module has no
+    dedicated character_name/resolved_character column to read instead - see
+    services/character_missing_finder.py's module docstring for why.
+    """
+
+    id: int
+    created_at: str
+    user_id: int
+    request_text: str
+
+
+# Defensive cap on one /character_missing scan, so a very large history file
+# cannot make one diagnostic command scan unboundedly many rows. Generous
+# relative to expected history sizes; raise via the `limit` parameter if a
+# deployment genuinely needs more scanned at once.
+REQUEST_TEXT_SCAN_ROW_LIMIT = 5000
+
+
+def list_request_texts(limit: int = REQUEST_TEXT_SCAN_ROW_LIMIT) -> list[RequestTextRow]:
+    """Read-only: up to `limit` most recent generation_requests rows' id/
+    created_at/user_id/request_text, most recent first.
+
+    Deliberately NOT scoped to one user_id, unlike get_generation_stats/
+    get_rated_prompt_rows above: a dictionary-coverage scan needs to see
+    every user's requests to be useful at all. Callers must gate who is
+    allowed to invoke this - it can surface other users' raw request text.
+
+    Never raises: any DB error (corruption, locked file, ...) is logged and
+    reported as an empty list, matching every other read function in this
+    module - a scan feature must never be able to crash the bot.
+    """
+    try:
+        with _connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT id, created_at, user_id, request_text
+                FROM generation_requests
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [
+            RequestTextRow(
+                id=int(row["id"]),
+                created_at=row["created_at"],
+                user_id=int(row["user_id"]),
+                request_text=row["request_text"] or "",
+            )
+            for row in rows
+        ]
+    except Exception:
+        logger.exception("Failed to read request texts for character dictionary scan.")
+        return []

@@ -47,7 +47,7 @@ appearance details from this module's output.
 import logging
 import re
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, fields as dataclass_fields
 
 
 logger = logging.getLogger("secretary-bot.character_tag_dictionary")
@@ -520,3 +520,142 @@ def resolve_all_character_tags(user_text: str) -> tuple[CharacterTagResolution, 
     its own aliases in the same text still only appears once here.
     """
     return tuple(_resolve_all(user_text))
+
+
+@dataclass(frozen=True)
+class BlockedAliasMention:
+    """One already-registered character whose `ambiguous_alias` is present in
+    `user_text` but did NOT resolve, because this character's own series
+    alias was not also present (the same series-gate `_resolve_all` already
+    enforces above). Never produced for a `safe_alias` match, since a
+    safe_alias always resolves unconditionally whenever present - there is no
+    "blocked" state for it.
+
+    This is the one signal `/character_missing` (services/
+    character_missing_finder.py) uses that is not a guess: the character and
+    its alias are both already curated dictionary entries, and "did
+    resolve_character_tags return it or not" is the exact same ground truth
+    resolve_character_tags itself uses - not a separate heuristic.
+    """
+
+    character_tag: str
+    display_name: str
+    series_tag: str
+    series_name: str
+    matched_alias: str
+
+
+def find_blocked_alias_mentions(user_text: str) -> tuple[BlockedAliasMention, ...]:
+    """Every registered character whose ambiguous_alias appears in
+    `user_text` but that did not resolve because the character's own series
+    alias was not also present. Read-only: calls the exact same private
+    matching helpers `_resolve_all` uses (never modifies them), so this can
+    never disagree with what `resolve_character_tags`/`resolve_all_character_tags`
+    would actually return for the same text.
+    """
+    normalized_text = _normalize(user_text)
+    if not normalized_text:
+        return ()
+
+    resolved_tags = {resolution.character_tag for resolution in _resolve_all(user_text)}
+    mentions: list[BlockedAliasMention] = []
+    for character in _CHARACTER_ENTRIES:
+        if character.character_tag in resolved_tags:
+            continue
+        matched_ambiguous = _find_alias(normalized_text, character.ambiguous_aliases)
+        if matched_ambiguous is None:
+            continue
+        mentions.append(
+            BlockedAliasMention(
+                character_tag=character.character_tag,
+                display_name=character.display_name,
+                series_tag=character.series_tag,
+                series_name=_SERIES_NAME_BY_TAG.get(character.series_tag, character.series_tag),
+                matched_alias=matched_ambiguous,
+            )
+        )
+    return tuple(mentions)
+
+
+@dataclass(frozen=True)
+class SeriesListEntry:
+    """One row of the browsable series list - identity + its own aliases.
+
+    Read-only snapshot for series-level diagnostics (e.g.
+    `/character_validate`'s series-alias duplicate/collision checks), which
+    need the full alias tuple that `CharacterListEntry` (only series_tag/
+    series_name, no aliases) does not carry.
+    """
+
+    series_tag: str
+    series_name: str
+    aliases: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class CharacterDetail:
+    """Full detail for one character.
+
+    `extra_fields` holds every `_CharacterEntry` field beyond the core
+    identity (character_tag/display_name/series_tag) - currently
+    safe_aliases/ambiguous_aliases/notes - built via reflection over
+    `_CharacterEntry`'s dataclass fields rather than a hardcoded list. If a
+    future field such as appearance_tags or identity_hints is added to
+    `_CharacterEntry`/`_RAW_CHARACTERS`, it appears here automatically with
+    no change needed in this function or in any command that renders it.
+    """
+
+    character_tag: str
+    display_name: str
+    series_tag: str
+    series_name: str
+    extra_fields: dict[str, object]
+
+
+_CHARACTER_DETAIL_CORE_FIELD_NAMES = frozenset({"character_tag", "display_name", "series_tag"})
+
+
+def list_series() -> tuple[SeriesListEntry, ...]:
+    """Every registered series, in dictionary declaration order.
+
+    Read-only snapshot for series-level diagnostics (e.g.
+    `/character_validate`).
+    """
+    return tuple(
+        SeriesListEntry(series_tag=series.series_tag, series_name=series.series_name, aliases=series.aliases)
+        for series in _SERIES_ENTRIES
+    )
+
+
+def _character_detail_from_entry(character: _CharacterEntry) -> CharacterDetail:
+    extra_fields = {
+        field.name: getattr(character, field.name)
+        for field in dataclass_fields(character)
+        if field.name not in _CHARACTER_DETAIL_CORE_FIELD_NAMES
+    }
+    return CharacterDetail(
+        character_tag=character.character_tag,
+        display_name=character.display_name,
+        series_tag=character.series_tag,
+        series_name=_SERIES_NAME_BY_TAG.get(character.series_tag, character.series_tag),
+        extra_fields=extra_fields,
+    )
+
+
+def get_character_detail(character_tag: str) -> CharacterDetail | None:
+    """Full detail for one character by its exact `character_tag`, or None
+    if unknown. Read-only snapshot for `/character_info`.
+    """
+    for character in _CHARACTER_ENTRIES:
+        if character.character_tag == character_tag:
+            return _character_detail_from_entry(character)
+    return None
+
+
+def list_character_details() -> tuple[CharacterDetail, ...]:
+    """Full detail for every registered character, in dictionary declaration
+    order. Read-only snapshot for bulk diagnostics (e.g.
+    `/character_validate`) - equivalent to calling `get_character_detail` for
+    every known `character_tag`, but without the repeated O(n) scans.
+    """
+    return tuple(_character_detail_from_entry(character) for character in _CHARACTER_ENTRIES)
