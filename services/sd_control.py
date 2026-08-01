@@ -33,6 +33,10 @@ DEFAULT_NEGATIVE_PROMPT = (
     "bad hands, blurry, jpeg artifacts, watermark, text, logo"
 )
 DEFAULT_COMFY_WORKFLOW_FILE = Path("workflows") / "comfy_workflow.json"
+COMFY_CHECKPOINTS = {
+    "janku": "JANKUTrainedChenkinNoobai_v777.safetensors",
+    "animagine": "animaginexl40opt_clear.safetensors",
+}
 COMFY_POLL_INTERVAL_SECONDS = 2
 COMFY_TIMEOUT_SECONDS = 600
 STARTUP_STATUS_WAIT_SECONDS = 5
@@ -47,6 +51,7 @@ _shutdown_after_done = False
 class SdGenerationOptions:
     prompt: str
     negative_prompt: str | None = None
+    model_key: str | None = None
     preserve_prompt_text: bool = False
     count: int = 1
     width: int = 512
@@ -186,6 +191,7 @@ def validate_options(options: SdGenerationOptions) -> SdGenerationOptions:
     return SdGenerationOptions(
         prompt=prompt,
         negative_prompt=negative_prompt,
+        model_key=options.model_key,
         preserve_prompt_text=options.preserve_prompt_text,
         count=_clamp_int(options.count, 1, max_count),
         width=_clamp_int(options.width, 256, max_width),
@@ -620,9 +626,41 @@ def _set_node_input(workflow: dict[str, Any], node_id: str, key: str, value: Any
     inputs[key] = value
 
 
+def _resolve_comfy_checkpoint(model_key: str) -> str:
+    try:
+        return COMFY_CHECKPOINTS[model_key]
+    except KeyError as exc:
+        raise ValueError("指定された画像生成モデルには対応していません。") from exc
+
+
+def _find_checkpoint_loader_node_id(workflow: dict[str, Any]) -> str:
+    node_ids = [
+        str(node_id)
+        for node_id, node in workflow.items()
+        if isinstance(node, dict) and str(node.get("class_type", "")) == "CheckpointLoaderSimple"
+    ]
+    if not node_ids:
+        raise RuntimeError(
+            "ComfyUI workflow に CheckpointLoaderSimple ノードが見つかりません。"
+            "モデルを選択するにはチェックポイント読込ノードが1個必要です。"
+        )
+    if len(node_ids) > 1:
+        raise RuntimeError(
+            "ComfyUI workflow に CheckpointLoaderSimple ノードが複数あります。"
+            "変更対象を特定できないためモデルを適用できません。"
+        )
+    return node_ids[0]
+
+
 def _apply_comfy_options(
     workflow: dict[str, Any], options: SdGenerationOptions
 ) -> tuple[dict[str, Any], str | None, str | None]:
+    checkpoint_name = None
+    checkpoint_node_id = None
+    if options.model_key is not None:
+        checkpoint_name = _resolve_comfy_checkpoint(options.model_key)
+        checkpoint_node_id = _find_checkpoint_loader_node_id(workflow)
+
     save_nodes = _find_save_image_nodes(workflow)
     if not save_nodes:
         raise RuntimeError("ComfyUI workflow に SaveImage ノードが見つかりません。完成画像を保存するWorkflowを指定してください。")
@@ -638,6 +676,9 @@ def _apply_comfy_options(
             "Positive/Negative用のCLIPTextEncodeノードを自動検出できませんでした。"
             "KSamplerのpositive/negative接続を確認してください。"
         )
+
+    if checkpoint_node_id is not None and checkpoint_name is not None:
+        _set_node_input(workflow, checkpoint_node_id, "ckpt_name", checkpoint_name)
 
     _set_node_input(workflow, positive_node_id, "text", options.prompt)
     _set_node_input(workflow, negative_node_id, "text", options.negative_prompt or "")

@@ -693,8 +693,15 @@ async def slash_sd_status(interaction: discord.Interaction) -> None:
 
 
 @client.tree.command(name="sd_generate", description="ローカルStable Diffusion WebUIで画像生成します。")
+@app_commands.choices(
+    model=[
+        app_commands.Choice(name="JANKU v7.77", value="janku"),
+        app_commands.Choice(name="Animagine XL 4.0 Clear", value="animagine"),
+    ]
+)
 @app_commands.describe(
     prompt="生成プロンプト",
+    model="ComfyUIで使用するモデル。未指定ならWorkflowの設定を使います。",
     negative_prompt="ネガティブプロンプト。未指定なら既定テンプレートを使います。",
     count="生成枚数。最大10枚",
     width="画像幅",
@@ -707,6 +714,7 @@ async def slash_sd_status(interaction: discord.Interaction) -> None:
 async def slash_sd_generate(
     interaction: discord.Interaction,
     prompt: str,
+    model: app_commands.Choice[str] | None = None,
     negative_prompt: str = "",
     count: int = 1,
     width: int = 512,
@@ -725,6 +733,7 @@ async def slash_sd_generate(
     options = SdGenerationOptions(
         prompt=prompt,
         negative_prompt=negative_prompt or None,
+        model_key=model.value if model is not None else None,
         count=count,
         width=width,
         height=height,

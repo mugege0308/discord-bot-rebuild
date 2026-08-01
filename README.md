@@ -1083,8 +1083,9 @@ Discordから家PC上のStability Matrix / ComfyUI APIを操作するための�
   - それ以外の場合は `.env` の `SD_START_FILE` に設定した bat/cmd/exe を起動します。
 - `/sd_status`
   - `SD_API_URL` のAPIが応答しているか確認します。ComfyUIの場合は通常 `http://127.0.0.1:8188` を使います。
-- `/sd_generate prompt:内容`
+- `/sd_generate prompt:内容 model:任意`
   - ComfyUI API にWorkflowを投げ、生成画像をDiscordに返します。
+  - `model` は `JANKU v7.77` または `Animagine XL 4.0 Clear` の2つだけから選択できます。省略時はWorkflow JSON内の既存`ckpt_name`をそのまま使います。
 - `/sd_latest`
   - 最新生成画像をDiscordに送ります。
 - `/sd_save_favorite`
@@ -1117,6 +1118,8 @@ SD_MAX_CFG=20
 - 生成枚数、解像度、steps、cfgには上限があります。
 - 生成中は二重実行できないようにロックします。
 - ComfyUIでは、Workflow JSON内のPositive / Negativeノードを自動検出して書き換えます。
+- `/sd_generate` でモデルを指定した場合だけ、単一の `CheckpointLoaderSimple` ノードの `ckpt_name` を実行時に上書きします。Workflow JSONファイル自体は変更しません。
+- 現時点ではチェックポイントだけを切り替えます。モデル固有の推奨Steps、CFG、Sampler、プロンプトなどの自動切替は未実装です。
 - Seedは `RandomNoise.noise_seed` または `seed` 入力を自動検出し、Bot側で毎回ランダムに設定します。
 - `SaveImage` ノードも自動検出し、生成後の画像をDiscordへ返します。
 
