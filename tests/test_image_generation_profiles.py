@@ -44,6 +44,14 @@ class ImageGenerationProfileTestCase(unittest.TestCase):
         self.assertIn("Animagine XL 4.0", instruction)
         self.assertNotIn("JANKU v7.77 向け", instruction)
 
+    def test_animagine_instruction_makes_summary_and_assumptions_model_neutral(self):
+        instruction = load_shogou_instruction("animagine")
+        for prohibited_subject in ("生成モデル名", "checkpoint名", "Prompt Designer名"):
+            self.assertIn(prohibited_subject, instruction)
+        self.assertIn("使用する生成モデルを推測・説明しない", instruction)
+        self.assertIn("画像内容だけ", instruction)
+        self.assertIn("実際に補完した条件や解決した矛盾だけ", instruction)
+
     def test_janku_instruction_contains_required_positive_and_negative_policy(self):
         instruction = load_shogou_instruction("janku")
         for tag in ("anime style", "2d", "illustration", "clean lineart", "detailed shading"):
@@ -52,6 +60,15 @@ class ImageGenerationProfileTestCase(unittest.TestCase):
             self.assertIn(tag, instruction)
         self.assertIn("タグ順序", instruction)
         self.assertIn("重複", instruction)
+
+    def test_janku_instruction_makes_summary_and_assumptions_model_neutral(self):
+        instruction = load_shogou_instruction("janku")
+        for prohibited_subject in ("生成モデル名", "checkpoint名", "Prompt Designer名"):
+            self.assertIn(prohibited_subject, instruction)
+        self.assertIn("使用する生成モデルを推測・説明しない", instruction)
+        self.assertIn("画像内容だけ", instruction)
+        self.assertIn("実際に補完した条件や解決した矛盾だけ", instruction)
+        self.assertNotIn("Animagine XL 4.0", instruction)
 
     def test_prompt_designer_rejects_unknown_model(self):
         with self.assertRaises(PromptGeneratorError):

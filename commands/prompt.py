@@ -608,10 +608,14 @@ def _build_shogou_generated_image_message(
     selection,
     send_count: int,
     generated_count: int,
+    *,
+    model_key: str = DEFAULT_IMAGE_GENERATION_MODEL_KEY,
 ) -> str:
+    profile = get_image_generation_profile(model_key)
     selection_text = _selection_message(selection, send_count, generated_count)
     message = (
         f"{selection_text}\n\n"
+        f"Model: {profile.display_name}\n\n"
         "Summary:\n"
         f"{_truncate_prompt(result.summary, limit=SHOGOU_SUMMARY_LIMIT)}\n\n"
         "Assumptions:\n"
@@ -808,6 +812,7 @@ async def _generate_images_from_shogou_result(
         selection,
         len(send_paths),
         len(paths),
+        model_key=profile.model_key,
     )
 
     saved = await _save_generation_history_safely(

@@ -54,6 +54,49 @@ def _make_generated_images(count: int = 1) -> list[GeneratedImage]:
     ]
 
 
+class GenerateAiModelDisplayTestCase(unittest.TestCase):
+    def _message(self, model_key=None, *, selection=None, send_count=1, generated_count=1) -> str:
+        if selection is None:
+            selection = ImageSelectionResult(selected_paths=[], used_selection=False)
+        kwargs = {} if model_key is None else {"model_key": model_key}
+        return prompt_module._build_shogou_generated_image_message(
+            _make_result(), selection, send_count, generated_count, **kwargs
+        )
+
+    def test_janku_model_display_is_deterministic(self):
+        self.assertIn("Model: JANKU v7.77", self._message("janku"))
+
+    def test_animagine_model_display_is_deterministic(self):
+        self.assertIn("Model: Animagine XL 4.0 Clear", self._message("animagine"))
+
+    def test_unspecified_model_display_defaults_to_animagine(self):
+        self.assertIn("Model: Animagine XL 4.0 Clear", self._message())
+
+    def test_model_display_survives_selection_success_and_failure(self):
+        selected = ImageSelectionResult(
+            selected_paths=[Path("data/sd_outputs/test_1.png")],
+            used_selection=True,
+            message="画像選別AIで上位1枚を選びました。",
+        )
+        failed = ImageSelectionResult(
+            selected_paths=[],
+            used_selection=False,
+            error="画像選別AIの実行に失敗しました。",
+        )
+        selected_message = self._message("janku", selection=selected, generated_count=2)
+        failed_message = self._message("janku", selection=failed, generated_count=2)
+        self.assertIn("画像選別AIで上位1枚を選びました。", selected_message)
+        self.assertIn("画像選別AIの実行に失敗しました。", failed_message)
+        self.assertIn("Model: JANKU v7.77", selected_message)
+        self.assertIn("Model: JANKU v7.77", failed_message)
+
+    def test_generate_and_generate_raw_message_builder_is_unchanged(self):
+        message = prompt_module._build_generated_image_message(
+            "1girl", "lowres", ImageSelectionResult([], False), 1, 1
+        )
+        self.assertNotIn("Model:", message)
+
+
 class HistorySaveDoesNotBlockDiscordDeliveryTestCase(unittest.IsolatedAsyncioTestCase):
     async def test_db_save_returning_none_still_sends_images(self):
         interaction = mock.MagicMock()
@@ -203,7 +246,7 @@ class SelectionAiWasSelectedWiringTestCase(unittest.IsolatedAsyncioTestCase):
             "commands.prompt.save_generation_history_detailed", return_value=None
         ) as save_mock, mock.patch(
             "commands.prompt._send_image_files"
-        ):
+        ) as send_mock:
             await prompt_module._generate_images_from_shogou_result(
                 interaction,
                 _make_result(),
@@ -219,6 +262,31 @@ class SelectionAiWasSelectedWiringTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(options.model_selection_explicit)
         request_record = save_mock.call_args.args[0]
         self.assertEqual(request_record.model_key, "janku")
+        self.assertIn("Model: JANKU v7.77", send_mock.call_args.args[1])
+
+    async def test_default_animagine_model_is_displayed(self):
+        interaction = mock.MagicMock()
+        interaction.user.id = 777
+        images = _make_generated_images(1)
+        selection = ImageSelectionResult(selected_paths=[], used_selection=False)
+
+        with mock.patch(
+            "commands.prompt.generate_images_with_metadata", return_value=images
+        ), mock.patch(
+            "commands.prompt.select_generated_images", return_value=selection
+        ), mock.patch(
+            "commands.prompt.save_generation_history_detailed", return_value=None
+        ), mock.patch(
+            "commands.prompt._send_image_files"
+        ) as send_mock:
+            await prompt_module._generate_images_from_shogou_result(
+                interaction,
+                _make_result(),
+                label_prefix="generate_ai",
+                request_text="既定モデルテスト",
+            )
+
+        self.assertIn("Model: Animagine XL 4.0 Clear", send_mock.call_args.args[1])
 
 
 class ExistingCommandsUnaffectedByHistoryIntegrationTestCase(unittest.TestCase):
