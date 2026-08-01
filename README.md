@@ -1311,7 +1311,9 @@ LM Studio側でローカルサーバーが起動していない場合、`/health
 
 `/generate_ai` の動作:
 
-- 入力項目は `request`（日本語の要望、必須）と `reference_id`（画像参考メモID、任意）だけです。
+- 入力項目は `request`（日本語の要望、必須）、`model`（任意）、`reference_id`（画像参考メモID、任意）です。
+- `model` は `Animagine XL 4.0 Clear` または `JANKU v7.77` の2つだけから選択できます。省略時は明示的にAnimagineとして扱い、同条件・構図変更・追加指示の再生成でも元のモデルを維持します。
+- Animagineは既存の `shogou_chan_prompt_designer_instruction.md`、JANKUは `shogou_chan_prompt_designer_instruction_janku.md` を使います。JANKUではアニメ調・2D・線画・陰影をPositive方針に、写実・3D・人形・renderをNegative方針に含めます。
 - system promptには、リポジトリ直下の `shogou_chan_prompt_designer_instruction.md`（`outputs/shogou-chan-prompt-designer/SKILL.md` からClaude Code向けの記述を除いて作成した専用ファイル）を使います。`fixed_template_llm_instruction.md` を使う `/prompt` `/generate` とは別の指示文です。
 - 色彩・明るさの判断は、`shogou_chan_prompt_designer_instruction.md` の「色彩・光の設計」セクションで決まります（Phase 1E）。ユーザーの明示指定 → 既知キャラクターの配色 → 髪色・瞳色・衣装 → シーンの種類 → 指定が弱い場合はニュートラルな明るさ、の優先順位で判断し、指定が弱いときの既定は `neutral lighting` / `natural lighting` / `balanced color palette` です。寒色・暗さ・強い逆光をデフォルトで追加しません。
 - 通常Memoryと画像参考Memory（Image Memory）はどちらも使います。`reference_id` を指定した場合はそのMemoryのタグを優先し、未指定の場合は既存の自動関連判定をそのまま使います。

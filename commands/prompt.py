@@ -27,6 +27,10 @@ from services.image_selection import (
     is_image_selection_available,
     select_generated_images,
 )
+from services.image_generation_profiles import (
+    DEFAULT_IMAGE_GENERATION_MODEL_KEY,
+    get_image_generation_profile,
+)
 from services.pc_control import is_pc_control_allowed
 from services.prompt_generator import PromptGeneratorError, PromptGeneratorTimeout, generate_sd_prompt_result
 from services.sd_control import (
@@ -35,6 +39,7 @@ from services.sd_control import (
     generate_images,
     generate_images_with_metadata,
     get_negative_prompt,
+    is_comfy_backend,
 )
 from services.shogou_prompt_designer import (
     ShogouPromptResult,
@@ -54,6 +59,10 @@ SHOGOU_MAX_ASSUMPTIONS_DISPLAY = 5
 SHOGOU_ASSUMPTION_ITEM_LIMIT = 200
 SHOGOU_SUMMARY_LIMIT = 300
 SHOGOU_MESSAGE_LIMIT = 1900
+GENERATE_AI_MODEL_CHOICES = [
+    app_commands.Choice(name="Animagine XL 4.0 Clear", value="animagine"),
+    app_commands.Choice(name="JANKU v7.77", value="janku"),
+]
 
 
 # Discord allows at most 10 attachments per message.
@@ -517,6 +526,9 @@ def _build_generation_options(
     negative_prompt: str,
     *,
     preserve_prompt_text: bool = False,
+    model_key: str | None = None,
+    filename_prefix: str | None = None,
+    model_selection_explicit: bool = False,
 ) -> SdGenerationOptions:
     selection_available = is_image_selection_available()
     count = get_selection_generate_count() if selection_available else 1
@@ -528,6 +540,9 @@ def _build_generation_options(
     return SdGenerationOptions(
         prompt=positive_prompt,
         negative_prompt=negative_prompt,
+        model_key=model_key,
+        filename_prefix=filename_prefix,
+        model_selection_explicit=model_selection_explicit,
         preserve_prompt_text=preserve_prompt_text,
         count=count,
         width=512,
@@ -622,6 +637,7 @@ async def _save_generation_history_safely(
     parent_request_id: int | None = None,
     regeneration_type: str | None = None,
     custom_instruction: str | None = None,
+    model_key: str = DEFAULT_IMAGE_GENERATION_MODEL_KEY,
 ) -> SavedGeneration | None:
     # Best-effort only: a history-save failure must never block the Discord
     # result from being sent, and must never crash the bot. Any exception
@@ -646,6 +662,7 @@ async def _save_generation_history_safely(
             parent_request_id=parent_request_id,
             regeneration_type=regeneration_type,
             custom_instruction=custom_instruction,
+            model_key=model_key,
         )
         saved = await asyncio.to_thread(
             save_generation_history_detailed,
@@ -757,13 +774,19 @@ async def _generate_images_from_shogou_result(
     parent_request_id: int | None = None,
     regeneration_type: str | None = None,
     custom_instruction: str | None = None,
+    model_key: str = DEFAULT_IMAGE_GENERATION_MODEL_KEY,
+    model_selection_explicit: bool = False,
 ) -> None:
     # Mirrors _generate_images_from_prompts' preserve_prompt_text=True path exactly,
     # but keeps its own message builder so /generate_raw's behavior stays untouched.
+    profile = get_image_generation_profile(model_key)
     options = _build_generation_options(
         result.positive,
         result.negative,
         preserve_prompt_text=True,
+        model_key=profile.model_key,
+        filename_prefix=profile.filename_prefix,
+        model_selection_explicit=model_selection_explicit,
     )
     try:
         generated_images = await asyncio.to_thread(generate_images_with_metadata, options)
@@ -797,6 +820,7 @@ async def _generate_images_from_shogou_result(
         parent_request_id=parent_request_id,
         regeneration_type=regeneration_type,
         custom_instruction=custom_instruction,
+        model_key=profile.model_key,
     )
 
     view, rated_image_ids = await _build_result_view(saved, generated_images, send_paths, interaction.user.id)
@@ -821,9 +845,16 @@ async def _build_shogou_prompt_result(
     *,
     label_prefix: str,
     reference_id: int | None = None,
+    model_key: str = DEFAULT_IMAGE_GENERATION_MODEL_KEY,
 ) -> ShogouPromptResult | None:
     try:
-        result = await asyncio.to_thread(generate_shogou_prompt_result, text, interaction.user.id, reference_id)
+        result = await asyncio.to_thread(
+            generate_shogou_prompt_result,
+            text,
+            interaction.user.id,
+            reference_id,
+            model_key,
+        )
         logger.info(
             "%s result received: positive_length=%s negative_length=%s blocked=%s",
             label_prefix,
@@ -870,6 +901,7 @@ async def _build_shogou_regeneration_result(
             parent.assumptions,
             interaction.user.id,
             parent.reference_id,
+            parent.model_key,
         )
         logger.info(
             "%s result received: positive_length=%s negative_length=%s blocked=%s",
@@ -919,6 +951,7 @@ async def _build_shogou_custom_instruction_result(
             custom_instruction,
             interaction.user.id,
             parent.reference_id,
+            parent.model_key,
         )
         logger.info(
             "%s result received: positive_length=%s negative_length=%s blocked=%s",
@@ -1016,6 +1049,8 @@ async def _run_regeneration(
             parent_request_id=request_id,
             regeneration_type=regeneration_type,
             custom_instruction=custom_instruction if regeneration_type == CUSTOM_INSTRUCTION_TYPE else None,
+            model_key=parent.model_key,
+            model_selection_explicit=parent.model_key != DEFAULT_IMAGE_GENERATION_MODEL_KEY,
         )
     except Exception:
         logger.exception(
@@ -1332,13 +1367,16 @@ def setup(client: discord.Client) -> None:
         name="generate_ai",
         description="日本語の要望からshogou-chan-prompt-designerでプロンプト生成し画像生成します。",
     )
+    @app_commands.choices(model=GENERATE_AI_MODEL_CHOICES)
     @app_commands.describe(
         request="作りたい画像の日本語要望。",
+        model="画像生成モデル。未指定時はAnimagine XL 4.0 Clearを使います。",
         reference_id="任意。全タグを使う画像参考メモID",
     )
     async def slash_generate_ai(
         interaction: discord.Interaction,
         request: str,
+        model: app_commands.Choice[str] | None = None,
         reference_id: int | None = None,
     ) -> None:
         await interaction.response.defer(ephemeral=True)
@@ -1347,7 +1385,26 @@ def setup(client: discord.Client) -> None:
             await _send_error(interaction, SD_DENIED_MESSAGE, label="generate_ai.denied")
             return
 
-        result = await _build_shogou_prompt_result(interaction, request, label_prefix="generate_ai", reference_id=reference_id)
+        try:
+            profile = get_image_generation_profile(model.value if model is not None else None)
+        except ValueError as exc:
+            await _send_error(interaction, str(exc), label="generate_ai.model_invalid")
+            return
+        if model is not None and not is_comfy_backend():
+            await _send_error(
+                interaction,
+                "モデルを明示選択できるのはComfyUIバックエンドだけです。SD_BACKEND=comfyを指定してください。",
+                label="generate_ai.model_backend_unsupported",
+            )
+            return
+
+        result = await _build_shogou_prompt_result(
+            interaction,
+            request,
+            label_prefix="generate_ai",
+            reference_id=reference_id,
+            model_key=profile.model_key,
+        )
         if result is None:
             return
 
@@ -1367,6 +1424,8 @@ def setup(client: discord.Client) -> None:
             label_prefix="generate_ai",
             request_text=request,
             reference_id=reference_id,
+            model_key=profile.model_key,
+            model_selection_explicit=model is not None,
         )
 
     @client.tree.command(

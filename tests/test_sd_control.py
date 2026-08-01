@@ -4,7 +4,13 @@ from copy import deepcopy
 from pathlib import Path
 from unittest import mock
 
-from services.sd_control import DEFAULT_NEGATIVE_PROMPT, SdGenerationOptions, _apply_comfy_options, validate_options
+from services.sd_control import (
+    DEFAULT_NEGATIVE_PROMPT,
+    SdGenerationOptions,
+    _apply_comfy_options,
+    generate_images_with_metadata,
+    validate_options,
+)
 
 
 def _workflow(checkpoints: int = 1) -> dict:
@@ -110,7 +116,7 @@ class ComfyCheckpointSelectionTestCase(unittest.TestCase):
 
         self.assertEqual(
             result["checkpoint_0"]["inputs"]["ckpt_name"],
-            "animaginexl40opt_clear.safetensors",
+            "animagineXL40Opt_clear.safetensors",
         )
 
     def test_janku_selects_allowed_checkpoint(self):
@@ -143,6 +149,46 @@ class ComfyCheckpointSelectionTestCase(unittest.TestCase):
         self.assertEqual(result["unrelated"], unrelated_before)
         self.assertEqual(result["checkpoint_0"]["inputs"]["other"], checkpoint_other_before)
 
+    def test_animagine_filename_prefix_is_applied_to_single_save_node(self):
+        workflow = _workflow()
+        result, _, _ = _apply_comfy_options(
+            workflow,
+            SdGenerationOptions(
+                prompt="positive",
+                negative_prompt="negative",
+                model_key="animagine",
+                filename_prefix="Shogou_AnimagineXL",
+            ),
+        )
+        self.assertEqual(result["save"]["inputs"]["filename_prefix"], "Shogou_AnimagineXL")
+
+    def test_janku_filename_prefix_is_applied_to_single_save_node(self):
+        workflow = _workflow()
+        result, _, _ = _apply_comfy_options(
+            workflow,
+            SdGenerationOptions(
+                prompt="positive",
+                negative_prompt="negative",
+                model_key="janku",
+                filename_prefix="Shogou_JANKU",
+            ),
+        )
+        self.assertEqual(result["save"]["inputs"]["filename_prefix"], "Shogou_JANKU")
+
+    def test_filename_prefix_rejects_multiple_save_nodes(self):
+        workflow = _workflow()
+        workflow["save_2"] = deepcopy(workflow["save"])
+        with self.assertRaisesRegex(RuntimeError, "SaveImage ノードが複数"):
+            _apply_comfy_options(
+                workflow,
+                SdGenerationOptions(
+                    prompt="positive",
+                    negative_prompt="negative",
+                    model_key="janku",
+                    filename_prefix="Shogou_JANKU",
+                ),
+            )
+
     def test_existing_generate_builder_does_not_select_a_model(self):
         prompt_path = Path(__file__).resolve().parents[1] / "commands" / "prompt.py"
         tree = ast.parse(prompt_path.read_text(encoding="utf-8"), filename=str(prompt_path))
@@ -159,8 +205,40 @@ class ComfyCheckpointSelectionTestCase(unittest.TestCase):
             and node.func.id == "SdGenerationOptions"
         )
 
-        self.assertNotIn("model_key", {keyword.arg for keyword in options_call.keywords})
+        model_keyword = next(keyword for keyword in options_call.keywords if keyword.arg == "model_key")
+        self.assertIsInstance(model_keyword.value, ast.Name)
+        self.assertEqual(model_keyword.value.id, "model_key")
+        defaults = dict(zip((arg.arg for arg in builder.args.kwonlyargs), builder.args.kw_defaults))
+        self.assertIsNone(defaults["model_key"].value)
         self.assertIsNone(SdGenerationOptions(prompt="existing generate").model_key)
+
+
+class ModelBackendValidationTestCase(unittest.TestCase):
+    def test_explicit_model_selection_is_rejected_outside_comfy(self):
+        options = SdGenerationOptions(
+            prompt="positive",
+            model_key="janku",
+            model_selection_explicit=True,
+        )
+        with mock.patch("services.sd_control._backend", return_value="webui"), mock.patch(
+            "services.sd_control._generate_webui_images_with_metadata"
+        ) as webui_mock:
+            with self.assertRaisesRegex(RuntimeError, "ComfyUIバックエンド"):
+                generate_images_with_metadata(options)
+        webui_mock.assert_not_called()
+
+    def test_default_animagine_marker_does_not_break_existing_webui_path(self):
+        options = SdGenerationOptions(
+            prompt="positive",
+            model_key="animagine",
+            model_selection_explicit=False,
+        )
+        with mock.patch("services.sd_control._backend", return_value="webui"), mock.patch(
+            "services.sd_control._generate_webui_images_with_metadata", return_value=[]
+        ) as webui_mock, mock.patch("services.sd_control._save_latest_paths"):
+            result = generate_images_with_metadata(options)
+        self.assertEqual(result, [])
+        webui_mock.assert_called_once()
 
 
 if __name__ == "__main__":

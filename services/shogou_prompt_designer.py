@@ -7,6 +7,10 @@ from typing import Any, Sequence
 
 from services.character_tag_dictionary import CharacterTagResolution, resolve_all_character_tags
 from services.image_memory import build_image_memory_prompt_context
+from services.image_generation_profiles import (
+    DEFAULT_IMAGE_GENERATION_MODEL_KEY,
+    get_image_generation_profile,
+)
 from services.memory import append_memory_to_system_prompt
 from services.prompt_generator import (
     PromptGeneratorError,
@@ -33,10 +37,15 @@ class ShogouPromptResult:
         return bool(self.blocked_reason)
 
 
-def load_shogou_instruction() -> str:
-    if not INSTRUCTION_FILE.exists():
-        raise PromptGeneratorError("shogou_chan_prompt_designer_instruction.md が見つかりません。")
-    return INSTRUCTION_FILE.read_text(encoding="utf-8")
+def load_shogou_instruction(model_key: str = DEFAULT_IMAGE_GENERATION_MODEL_KEY) -> str:
+    try:
+        profile = get_image_generation_profile(model_key)
+    except ValueError as exc:
+        raise PromptGeneratorError(str(exc)) from exc
+    instruction_file = INSTRUCTION_FILE if profile.model_key == DEFAULT_IMAGE_GENERATION_MODEL_KEY else profile.prompt_designer_instruction
+    if not instruction_file.exists():
+        raise PromptGeneratorError(f"{instruction_file} が見つかりません。")
+    return instruction_file.read_text(encoding="utf-8")
 
 
 def _strip_think_blocks(text: str) -> str:
@@ -147,6 +156,7 @@ def generate_shogou_prompt_result(
     user_input: str,
     user_id: int | None = None,
     reference_id: int | None = None,
+    model_key: str = DEFAULT_IMAGE_GENERATION_MODEL_KEY,
 ) -> ShogouPromptResult:
     text = user_input.strip()
     if not text:
@@ -155,7 +165,7 @@ def generate_shogou_prompt_result(
         raise PromptGeneratorError("少し長すぎます。1000文字以内にしてください。")
 
     logger.info("Shogou system prompt generation start: user_id=%s input_length=%s", user_id, len(text))
-    system_prompt = append_memory_to_system_prompt(load_shogou_instruction(), user_id, text, mode="prompt")
+    system_prompt = append_memory_to_system_prompt(load_shogou_instruction(model_key), user_id, text, mode="prompt")
     if user_id is not None:
         try:
             reference_context = build_image_memory_prompt_context(user_id, text, reference_id)
@@ -230,6 +240,7 @@ def generate_shogou_custom_instruction_variation(
     custom_instruction: str,
     user_id: int | None = None,
     reference_id: int | None = None,
+    model_key: str = DEFAULT_IMAGE_GENERATION_MODEL_KEY,
 ) -> ShogouPromptResult:
     """"指示を追加して再生成": reuses the same shogou instruction/system
     prompt as a normal /generate_ai call, but appends the parent request's
@@ -246,7 +257,7 @@ def generate_shogou_custom_instruction_variation(
 
     text = parent_request_text.strip() or "(元のリクエスト文なし)"
     logger.info("Shogou custom instruction variation generation start: user_id=%s", user_id)
-    system_prompt = append_memory_to_system_prompt(load_shogou_instruction(), user_id, text, mode="prompt")
+    system_prompt = append_memory_to_system_prompt(load_shogou_instruction(model_key), user_id, text, mode="prompt")
     if user_id is not None:
         try:
             reference_context = build_image_memory_prompt_context(user_id, text, reference_id)
@@ -282,6 +293,7 @@ def generate_shogou_composition_variation(
     parent_assumptions: Sequence[str],
     user_id: int | None = None,
     reference_id: int | None = None,
+    model_key: str = DEFAULT_IMAGE_GENERATION_MODEL_KEY,
 ) -> ShogouPromptResult:
     """Phase 1C "change_composition" regeneration: reuses the same shogou
     instruction/system prompt as a normal /generate_ai call, but appends the
@@ -290,7 +302,7 @@ def generate_shogou_composition_variation(
     """
     text = parent_request_text.strip() or "(元のリクエスト文なし)"
     logger.info("Shogou composition variation generation start: user_id=%s", user_id)
-    system_prompt = append_memory_to_system_prompt(load_shogou_instruction(), user_id, text, mode="prompt")
+    system_prompt = append_memory_to_system_prompt(load_shogou_instruction(model_key), user_id, text, mode="prompt")
     if user_id is not None:
         try:
             reference_context = build_image_memory_prompt_context(user_id, text, reference_id)

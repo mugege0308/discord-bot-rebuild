@@ -2,8 +2,10 @@ import ast
 import unittest
 from pathlib import Path
 
+from commands.prompt import GENERATE_AI_MODEL_CHOICES
 
 PROMPT_SOURCE = Path(__file__).resolve().parents[1] / "commands" / "prompt.py"
+MAIN_SOURCE = Path(__file__).resolve().parents[1] / "main.py"
 
 
 def _find_function(tree: ast.AST, name: str):
@@ -25,12 +27,22 @@ class GenerateAiWiringTestCase(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.tree = ast.parse(PROMPT_SOURCE.read_text(encoding="utf-8"), filename=str(PROMPT_SOURCE))
+        cls.main_tree = ast.parse(MAIN_SOURCE.read_text(encoding="utf-8-sig"), filename=str(MAIN_SOURCE))
 
-    def test_generate_ai_command_only_takes_request_and_reference_id(self):
+    def test_generate_ai_command_keeps_request_and_reference_id_and_adds_model(self):
         function = _find_function(self.tree, "slash_generate_ai")
         arg_names = [arg.arg for arg in function.args.args]
 
-        self.assertEqual(arg_names, ["interaction", "request", "reference_id"])
+        self.assertEqual(arg_names, ["interaction", "request", "model", "reference_id"])
+
+    def test_generate_ai_model_choices_are_exactly_animagine_and_janku(self):
+        self.assertEqual(
+            [(choice.name, choice.value) for choice in GENERATE_AI_MODEL_CHOICES],
+            [
+                ("Animagine XL 4.0 Clear", "animagine"),
+                ("JANKU v7.77", "janku"),
+            ],
+        )
 
     def test_generate_ai_uses_shogou_result_generator_not_legacy_pipeline(self):
         function = _find_function(self.tree, "slash_generate_ai")
@@ -109,6 +121,30 @@ class GenerateAiWiringTestCase(unittest.TestCase):
         self.assertEqual(arg_names, ["interaction", "positive", "negative", "use_default_negative", "public"])
         self.assertTrue(_find_calls(function, "_generate_images_from_prompts"))
         self.assertFalse(_find_calls(function, "_generate_images_from_shogou_result"))
+
+    def test_sd_generate_choices_and_omitted_model_behavior_are_unchanged(self):
+        function = _find_function(self.main_tree, "slash_sd_generate")
+        choices_decorator = next(
+            decorator
+            for decorator in function.decorator_list
+            if isinstance(decorator, ast.Call)
+            and isinstance(decorator.func, ast.Attribute)
+            and decorator.func.attr == "choices"
+        )
+        model_list = next(keyword.value for keyword in choices_decorator.keywords if keyword.arg == "model")
+        pairs = []
+        for choice_call in model_list.elts:
+            values = {keyword.arg: keyword.value.value for keyword in choice_call.keywords}
+            pairs.append((values["name"], values["value"]))
+        self.assertEqual(
+            pairs,
+            [
+                ("JANKU v7.77", "janku"),
+                ("Animagine XL 4.0 Clear", "animagine"),
+            ],
+        )
+        defaults = dict(zip((arg.arg for arg in function.args.args[-len(function.args.defaults):]), function.args.defaults))
+        self.assertIsNone(defaults["model"].value)
 
 
 if __name__ == "__main__":

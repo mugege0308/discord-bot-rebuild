@@ -33,6 +33,7 @@ def _make_parent(**overrides) -> GenerationRequestDetail:
         parent_request_id=None,
         regeneration_type=None,
         custom_instruction=None,
+        model_key="janku",
     )
     defaults.update(overrides)
     return GenerationRequestDetail(**defaults)
@@ -159,6 +160,8 @@ class RunRegenerationTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(kwargs["reference_id"], parent.reference_id)
         self.assertEqual(kwargs["parent_request_id"], 10)
         self.assertEqual(kwargs["regeneration_type"], "same_prompt")
+        self.assertEqual(kwargs["model_key"], "janku")
+        self.assertTrue(kwargs["model_selection_explicit"])
 
     async def test_change_composition_calls_prompt_designer_with_parent_fields(self):
         parent = _make_parent(id=11, reference_id=7)
@@ -185,12 +188,14 @@ class RunRegenerationTestCase(unittest.IsolatedAsyncioTestCase):
             parent.assumptions,
             interaction.user.id,
             parent.reference_id,
+            parent.model_key,
         )
         generate_mock.assert_called_once()
         args, kwargs = generate_mock.call_args
         self.assertIs(args[1], new_result)
         self.assertEqual(kwargs["parent_request_id"], 11)
         self.assertEqual(kwargs["regeneration_type"], "change_composition")
+        self.assertEqual(kwargs["model_key"], "janku")
 
     async def test_change_composition_blocked_result_is_reported_and_stops(self):
         parent = _make_parent(id=12)
@@ -236,6 +241,7 @@ class RunRegenerationTestCase(unittest.IsolatedAsyncioTestCase):
             "髪型をポニーテールに",
             interaction.user.id,
             parent.reference_id,
+            parent.model_key,
         )
         generate_mock.assert_called_once()
         args, kwargs = generate_mock.call_args
@@ -243,6 +249,7 @@ class RunRegenerationTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(kwargs["parent_request_id"], 20)
         self.assertEqual(kwargs["regeneration_type"], "custom_instruction")
         self.assertEqual(kwargs["custom_instruction"], "髪型をポニーテールに")
+        self.assertEqual(kwargs["model_key"], "janku")
 
     async def test_custom_instruction_blocked_result_is_reported_and_stops(self):
         parent = _make_parent(id=21)

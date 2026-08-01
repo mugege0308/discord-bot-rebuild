@@ -8,6 +8,11 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Sequence
 
+from services.image_generation_profiles import (
+    DEFAULT_IMAGE_GENERATION_MODEL_KEY,
+    get_image_generation_profile,
+    get_model_key_for_checkpoint,
+)
 from services.sd_control import GeneratedImage
 from services.weather import JST
 
@@ -21,7 +26,7 @@ DB_FILE = DATA_DIR / "generation_history.db"
 # future change can tell which shape an existing file has and migrate it.
 # Bump this whenever the CREATE TABLE statements below change, and add the
 # matching migration step to _apply_schema_version().
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 _HASH_CHUNK_SIZE = 1024 * 1024
 
@@ -101,6 +106,7 @@ class GenerationRequestRecord:
     # instruction the user typed into the modal (e.g. "髪型をポニーテールに").
     # None for every other regeneration_type and for normal requests.
     custom_instruction: str | None = None
+    model_key: str = DEFAULT_IMAGE_GENERATION_MODEL_KEY
 
 
 @dataclass(frozen=True)
@@ -132,6 +138,7 @@ class GenerationRequestDetail:
     parent_request_id: int | None
     regeneration_type: str | None
     custom_instruction: str | None
+    model_key: str = DEFAULT_IMAGE_GENERATION_MODEL_KEY
 
 
 @dataclass(frozen=True)
@@ -242,6 +249,7 @@ def init_db() -> None:
                 user_id INTEGER NOT NULL,
                 request_text TEXT NOT NULL,
                 reference_id INTEGER,
+                model_key TEXT,
                 positive TEXT NOT NULL,
                 negative TEXT NOT NULL,
                 summary TEXT NOT NULL,
@@ -321,6 +329,15 @@ def _migrate_v2_to_v3(connection: sqlite3.Connection) -> None:
     _add_column_if_missing(connection, "generation_requests", "custom_instruction", "TEXT")
 
 
+def _migrate_v3_to_v4(connection: sqlite3.Connection) -> None:
+    """Adds the selected /generate_ai model key without rewriting old rows.
+
+    Existing records remain NULL and are resolved from their stored image
+    checkpoint when read, with Animagine as the compatibility fallback.
+    """
+    _add_column_if_missing(connection, "generation_requests", "model_key", "TEXT")
+
+
 def _apply_schema_version(connection: sqlite3.Connection) -> None:
     """Stamps/checks PRAGMA user_version so future schema changes have a
     reliable version to migrate from.
@@ -339,8 +356,11 @@ def _apply_schema_version(connection: sqlite3.Connection) -> None:
         return
     if current == 0:
         # Either a brand-new file, or one written before versioning existed.
-        # The CREATE TABLE IF NOT EXISTS statements above have just brought
-        # it to the current shape either way, so stamping it is safe.
+        # Apply every additive, guarded migration too: CREATE TABLE IF NOT
+        # EXISTS does not add columns to an old unversioned table.
+        _migrate_v1_to_v2(connection)
+        _migrate_v2_to_v3(connection)
+        _migrate_v3_to_v4(connection)
         connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         return
     if current > SCHEMA_VERSION:
@@ -354,14 +374,20 @@ def _apply_schema_version(connection: sqlite3.Connection) -> None:
     if current == 1:
         _migrate_v1_to_v2(connection)
         _migrate_v2_to_v3(connection)
+        _migrate_v3_to_v4(connection)
         connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         return
     if current == 2:
         _migrate_v2_to_v3(connection)
+        _migrate_v3_to_v4(connection)
         connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         return
-    # Reachable only once SCHEMA_VERSION > 3. Deliberately does not bump the
-    # version: silently relabelling an un-migrated file would hide the gap.
+    if current == 3:
+        _migrate_v3_to_v4(connection)
+        connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        return
+    # Deliberately does not bump an unknown older version: silently
+    # relabelling an un-migrated file would hide the gap.
     logger.warning(
         "generation_history.db schema version %s is older than %s and no migration step is defined yet.",
         current,
@@ -485,17 +511,18 @@ def save_generation_history_detailed(
             cursor = connection.execute(
                 """
                 INSERT INTO generation_requests (
-                    created_at, user_id, request_text, reference_id,
+                    created_at, user_id, request_text, reference_id, model_key,
                     positive, negative, summary, assumptions_json,
                     workflow_file, workflow_hash, selection_used, selection_message,
                     parent_request_id, regeneration_type, custom_instruction
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     _now_text(),
                     request.user_id,
                     request.request_text,
                     request.reference_id,
+                    request.model_key,
                     request.positive,
                     request.negative,
                     request.summary,
@@ -672,6 +699,25 @@ def set_image_discord_message(
         return False
 
 
+def _resolve_request_model_key(connection: sqlite3.Connection, row: sqlite3.Row) -> str:
+    stored_key = row["model_key"]
+    if stored_key:
+        try:
+            return get_image_generation_profile(str(stored_key)).model_key
+        except ValueError:
+            logger.warning("Unknown stored generation model key; falling back from checkpoint: %r", stored_key)
+
+    checkpoint_rows = connection.execute(
+        "SELECT DISTINCT checkpoint_name FROM generation_images WHERE request_id = ? AND checkpoint_name IS NOT NULL",
+        (int(row["id"]),),
+    ).fetchall()
+    if len(checkpoint_rows) == 1:
+        inferred = get_model_key_for_checkpoint(checkpoint_rows[0]["checkpoint_name"])
+        if inferred is not None:
+            return inferred
+    return DEFAULT_IMAGE_GENERATION_MODEL_KEY
+
+
 def get_generation_request(request_id: int) -> GenerationRequestDetail | None:
     """Read-only lookup of one generation_requests row (Phase 1C: used to
     look up the original request a regeneration button should build from).
@@ -685,8 +731,9 @@ def get_generation_request(request_id: int) -> GenerationRequestDetail | None:
             row = connection.execute(
                 "SELECT * FROM generation_requests WHERE id = ?", (request_id,)
             ).fetchone()
-        if row is None:
-            return None
+            if row is None:
+                return None
+            model_key = _resolve_request_model_key(connection, row)
         return GenerationRequestDetail(
             id=int(row["id"]),
             created_at=row["created_at"],
@@ -704,6 +751,7 @@ def get_generation_request(request_id: int) -> GenerationRequestDetail | None:
             parent_request_id=row["parent_request_id"],
             regeneration_type=row["regeneration_type"],
             custom_instruction=row["custom_instruction"],
+            model_key=model_key,
         )
     except Exception:
         logger.exception("Failed to read generation request: request_id=%s", request_id)

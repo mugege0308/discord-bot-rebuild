@@ -35,7 +35,7 @@ DEFAULT_NEGATIVE_PROMPT = (
 DEFAULT_COMFY_WORKFLOW_FILE = Path("workflows") / "comfy_workflow.json"
 COMFY_CHECKPOINTS = {
     "janku": "JANKUTrainedChenkinNoobai_v777.safetensors",
-    "animagine": "animaginexl40opt_clear.safetensors",
+    "animagine": "animagineXL40Opt_clear.safetensors",
 }
 COMFY_POLL_INTERVAL_SECONDS = 2
 COMFY_TIMEOUT_SECONDS = 600
@@ -52,6 +52,8 @@ class SdGenerationOptions:
     prompt: str
     negative_prompt: str | None = None
     model_key: str | None = None
+    filename_prefix: str | None = None
+    model_selection_explicit: bool = False
     preserve_prompt_text: bool = False
     count: int = 1
     width: int = 512
@@ -96,6 +98,10 @@ def _api_url(path: str) -> str:
 
 def _backend() -> str:
     return os.getenv("SD_BACKEND", "comfy").strip().lower() or "comfy"
+
+
+def is_comfy_backend() -> bool:
+    return _backend() == "comfy"
 
 
 def _max_int(name: str, default: int) -> int:
@@ -192,6 +198,8 @@ def validate_options(options: SdGenerationOptions) -> SdGenerationOptions:
         prompt=prompt,
         negative_prompt=negative_prompt,
         model_key=options.model_key,
+        filename_prefix=options.filename_prefix,
+        model_selection_explicit=options.model_selection_explicit,
         preserve_prompt_text=options.preserve_prompt_text,
         count=_clamp_int(options.count, 1, max_count),
         width=_clamp_int(options.width, 256, max_width),
@@ -664,6 +672,13 @@ def _apply_comfy_options(
     save_nodes = _find_save_image_nodes(workflow)
     if not save_nodes:
         raise RuntimeError("ComfyUI workflow に SaveImage ノードが見つかりません。完成画像を保存するWorkflowを指定してください。")
+    if options.filename_prefix is not None:
+        if len(save_nodes) != 1:
+            raise RuntimeError(
+                "ComfyUI workflow に SaveImage ノードが複数あります。"
+                "モデル別の保存先を安全に特定できないため filename_prefix を適用できません。"
+            )
+        _set_node_input(workflow, save_nodes[0], "filename_prefix", options.filename_prefix)
 
     env_positive_node_id = _get_node_id("COMFY_POSITIVE_NODE_ID")
     env_negative_node_id = _get_node_id("COMFY_NEGATIVE_NODE_ID")
@@ -923,9 +938,12 @@ def generate_images_with_metadata(options: SdGenerationOptions) -> list[Generate
 
     safe_options = validate_options(options)
     try:
-        if _backend() == "comfy":
+        backend = _backend()
+        if backend != "comfy" and safe_options.model_key is not None and safe_options.model_selection_explicit:
+            raise RuntimeError("モデルを明示選択できるのはComfyUIバックエンドだけです。SD_BACKEND=comfyを指定してください。")
+        if backend == "comfy":
             images = _generate_comfy_images_with_metadata(safe_options)
-        elif _backend() == "webui":
+        elif backend == "webui":
             images = _generate_webui_images_with_metadata(safe_options)
         else:
             raise RuntimeError("SD_BACKEND は comfy または webui を指定してね。")

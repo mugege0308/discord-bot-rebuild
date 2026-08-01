@@ -168,6 +168,7 @@ class GenerationHistoryTestCase(unittest.TestCase):
         self.assertEqual(request_row["workflow_file"], request.workflow_file)
         self.assertEqual(request_row["workflow_hash"], request.workflow_hash)
         self.assertEqual(request_row["selection_used"], 1)
+        self.assertEqual(request_row["model_key"], "animagine")
 
         self.assertEqual(len(image_rows), 2)
         self.assertEqual(image_rows[0]["image_path"], str(images[0].path))
@@ -376,6 +377,7 @@ class SchemaMigrationTestCase(GenerationHistoryTestCase):
         self.assertIn("parent_request_id", columns)
         self.assertIn("regeneration_type", columns)
         self.assertIn("custom_instruction", columns)
+        self.assertIn("model_key", columns)
 
     def test_migration_preserves_existing_row_and_backfills_null(self):
         self._create_v1_db()
@@ -392,6 +394,7 @@ class SchemaMigrationTestCase(GenerationHistoryTestCase):
         self.assertIsNone(row["parent_request_id"])
         self.assertIsNone(row["regeneration_type"])
         self.assertIsNone(row["custom_instruction"])
+        self.assertIsNone(row["model_key"])
 
     def test_migration_is_idempotent_when_rerun_against_an_already_migrated_file(self):
         self._create_v1_db()
@@ -534,6 +537,30 @@ class SchemaMigrationTestCase(GenerationHistoryTestCase):
             version = connection.execute("PRAGMA user_version").fetchone()[0]
         self.assertEqual(version, SCHEMA_VERSION)
 
+    def _create_v3_db(self) -> None:
+        self._create_v2_db()
+        with self._connect() as connection:
+            connection.execute("ALTER TABLE generation_requests ADD COLUMN custom_instruction TEXT")
+            connection.execute("PRAGMA user_version = 3")
+            connection.commit()
+
+    def test_v3_to_v4_migration_adds_model_key_without_rewriting_existing_row(self):
+        self._create_v3_db()
+
+        init_db()
+
+        with self._connect() as connection:
+            version = connection.execute("PRAGMA user_version").fetchone()[0]
+            columns = {row["name"] for row in connection.execute("PRAGMA table_info(generation_requests)")}
+            row = connection.execute(
+                "SELECT request_text, positive, model_key FROM generation_requests WHERE request_text = 'v2の依頼'"
+            ).fetchone()
+        self.assertEqual(version, 4)
+        self.assertIn("model_key", columns)
+        self.assertEqual(row["request_text"], "v2の依頼")
+        self.assertEqual(row["positive"], "1girl")
+        self.assertIsNone(row["model_key"])
+
 
 class RegenerationFieldsTestCase(GenerationHistoryTestCase):
     """Phase 1C: parent_request_id/regeneration_type on save, and the
@@ -659,6 +686,44 @@ class RegenerationFieldsTestCase(GenerationHistoryTestCase):
         self.assertIsNone(detail.parent_request_id)
         self.assertIsNone(detail.regeneration_type)
         self.assertIsNone(detail.custom_instruction)
+        self.assertEqual(detail.model_key, "animagine")
+
+    def test_get_generation_request_restores_explicit_janku_model(self):
+        request_id = self._save_request(request_text="JANKU履歴", model_key="janku")
+        detail = get_generation_request(request_id)
+        self.assertEqual(detail.model_key, "janku")
+
+    def test_null_model_key_is_inferred_from_janku_checkpoint(self):
+        request_id = self._save_request(request_text="旧JANKU履歴")
+        with self._connect() as connection:
+            connection.execute("UPDATE generation_requests SET model_key = NULL WHERE id = ?", (request_id,))
+            connection.execute(
+                "UPDATE generation_images SET checkpoint_name = ? WHERE request_id = ?",
+                ("JANKUTrainedChenkinNoobai_v777.safetensors", request_id),
+            )
+            connection.commit()
+        detail = get_generation_request(request_id)
+        self.assertEqual(detail.model_key, "janku")
+
+    def test_null_model_key_is_inferred_from_animagine_checkpoint(self):
+        request_id = self._save_request(request_text="旧Animagine履歴")
+        with self._connect() as connection:
+            connection.execute("UPDATE generation_requests SET model_key = NULL WHERE id = ?", (request_id,))
+            connection.commit()
+        detail = get_generation_request(request_id)
+        self.assertEqual(detail.model_key, "animagine")
+
+    def test_null_model_key_with_unknown_checkpoint_falls_back_to_animagine(self):
+        request_id = self._save_request(request_text="判定不能な旧履歴")
+        with self._connect() as connection:
+            connection.execute("UPDATE generation_requests SET model_key = NULL WHERE id = ?", (request_id,))
+            connection.execute(
+                "UPDATE generation_images SET checkpoint_name = ? WHERE request_id = ?",
+                ("unknown.safetensors", request_id),
+            )
+            connection.commit()
+        detail = get_generation_request(request_id)
+        self.assertEqual(detail.model_key, "animagine")
 
     def test_get_generation_request_includes_custom_instruction(self):
         parent_id = self._save_request(request_text="元祖2")

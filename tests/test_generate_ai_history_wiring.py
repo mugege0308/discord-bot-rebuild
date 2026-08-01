@@ -189,6 +189,37 @@ class SelectionAiWasSelectedWiringTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(saved_images, images)
         self.assertEqual(kwargs["selected_paths"], selection.selected_paths)
 
+    async def test_janku_model_and_prefix_reach_generation_and_history(self):
+        interaction = mock.MagicMock()
+        interaction.user.id = 777
+        images = _make_generated_images(1)
+        selection = ImageSelectionResult(selected_paths=[], used_selection=False)
+
+        with mock.patch(
+            "commands.prompt.generate_images_with_metadata", return_value=images
+        ) as generate_mock, mock.patch(
+            "commands.prompt.select_generated_images", return_value=selection
+        ), mock.patch(
+            "commands.prompt.save_generation_history_detailed", return_value=None
+        ) as save_mock, mock.patch(
+            "commands.prompt._send_image_files"
+        ):
+            await prompt_module._generate_images_from_shogou_result(
+                interaction,
+                _make_result(),
+                label_prefix="generate_ai",
+                request_text="JANKUテスト",
+                model_key="janku",
+                model_selection_explicit=True,
+            )
+
+        options = generate_mock.call_args.args[0]
+        self.assertEqual(options.model_key, "janku")
+        self.assertEqual(options.filename_prefix, "Shogou_JANKU")
+        self.assertTrue(options.model_selection_explicit)
+        request_record = save_mock.call_args.args[0]
+        self.assertEqual(request_record.model_key, "janku")
+
 
 class ExistingCommandsUnaffectedByHistoryIntegrationTestCase(unittest.TestCase):
     @classmethod
