@@ -70,6 +70,64 @@ class ImageGenerationProfileTestCase(unittest.TestCase):
         self.assertIn("実際に補完した条件や解決した矛盾だけ", instruction)
         self.assertNotIn("Animagine XL 4.0", instruction)
 
+    def test_janku_instruction_checks_six_completion_categories_and_respects_explicit_input(self):
+        instruction = load_shogou_instruction("janku")
+        for category in (
+            "A. framing / composition",
+            "B. gaze",
+            "C. pose",
+            "D. character features",
+            "E. outfit details",
+            "F. background",
+        ):
+            self.assertIn(category, instruction)
+        self.assertIn("足りないカテゴリだけを補う", instruction)
+        self.assertIn("明示指定と競合する補完をしない", instruction)
+        self.assertIn("物語設定や小物を勝手に大量追加しない", instruction)
+
+    def test_janku_instruction_avoids_default_close_up_and_completes_background(self):
+        instruction = load_shogou_instruction("janku")
+        self.assertIn("`close-up` / `face close-up` を既定にしない", instruction)
+        self.assertIn("`upper body` または `medium shot` を基本候補", instruction)
+        self.assertIn("`medium shot` または `cowboy shot` を優先", instruction)
+        self.assertIn("`portrait` という語だけを理由に", instruction)
+        for explicit_background in ("plain background", "white background", "transparent background"):
+            self.assertIn(explicit_background, instruction)
+        self.assertIn("背景要素を最低1つ補完", instruction)
+        self.assertIn("`detailed background` を機械的に毎回追加しない", instruction)
+
+    def test_janku_instruction_prioritizes_known_character_details_without_strong_invention(self):
+        instruction = load_shogou_instruction("janku")
+        self.assertIn("キャラクター辞書から渡された正式タグ", instruction)
+        self.assertIn("正式な視覚特徴を `positive` へ反映", instruction)
+        self.assertIn("強く捏造しない", instruction)
+        self.assertIn("控えめな補完", instruction)
+
+    def test_janku_instruction_concretizes_expression_without_overexpansion(self):
+        instruction = load_shogou_instruction("janku")
+        for vague_expression in ("sexy expression", "cute expression", "sad expression"):
+            self.assertIn(vague_expression, instruction)
+        for concrete_expression in (
+            "slightly blushed cheeks",
+            "half-lidded eyes",
+            "soft smile",
+            "slightly parted lips",
+            "teary eyes",
+        ):
+            self.assertIn(concrete_expression, instruction)
+        self.assertIn("毎回すべての表情タグを追加せず", instruction)
+        self.assertIn("ユーザーの意図より強い表現へ勝手に拡張せず", instruction)
+        self.assertIn("表情だけで構図全体を決めない", instruction)
+
+    def test_janku_instruction_avoids_duplicate_and_conflicting_visual_tags(self):
+        instruction = load_shogou_instruction("janku")
+        self.assertIn("genericなタグより具体的な視覚タグを優先", instruction)
+        self.assertIn("`cool colors` と `blue tones`", instruction)
+        self.assertIn("`soft lighting` と `neutral lighting`", instruction)
+        self.assertIn("矛盾・競合する照明タグを同時に出さない", instruction)
+        self.assertIn("`positive` を極端に短くしすぎず", instruction)
+        self.assertIn("長大で散漫なタグ列", instruction)
+
     def test_prompt_designer_rejects_unknown_model(self):
         with self.assertRaises(PromptGeneratorError):
             load_shogou_instruction("unknown")
