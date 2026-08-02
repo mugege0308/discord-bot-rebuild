@@ -171,6 +171,34 @@ _RAW_SERIES: tuple[dict, ...] = (
         "series_name": "アオのハコ",
         "aliases": ("アオのハコ", "青のハコ", "ao no hako", "blue box"),
     },
+    {
+        "series_tag": "cafe stella to shinigami no chou",
+        "series_name": "喫茶ステラと死神の蝶",
+        "aliases": (
+            "喫茶ステラと死神の蝶",
+            "喫茶ステラ",
+            "cafe stella",
+            "cafe stella to shinigami no chou",
+        ),
+    },
+    {
+        # 既存の "inazuma eleven go" とは別作品・別ロースターのため独立した
+        # series_tag として登録する（統合しないこと）。
+        "series_tag": "inazuma eleven victory road",
+        "series_name": "イナズマイレブン 英雄たちのヴィクトリーロード",
+        "aliases": (
+            "イナズマイレブン 英雄たちのヴィクトリーロード",
+            "英雄たちのヴィクトリーロード",
+            "ヴィクトリーロード",
+            "イナイレV",
+            "inazuma eleven victory road",
+        ),
+    },
+    {
+        "series_tag": "zenless zone zero",
+        "series_name": "ゼンレスゾーンゼロ",
+        "aliases": ("ゼンレスゾーンゼロ", "ゼンゼロ", "ZZZ", "zenless zone zero"),
+    },
 )
 
 
@@ -369,6 +397,111 @@ _RAW_CHARACTERS: tuple[dict, ...] = (
         "ambiguous_aliases": ("千夏", "chinatsu"),
         "notes": "character_tagはリポジトリ内で未確認。保守的な姓名順ローマ字表記を仮採用。要確認。",
     },
+    {
+        "character_tag": "chiaki (blue archive)",
+        "display_name": "元宮チアキ",
+        "series_tag": "blue archive",
+        "safe_aliases": ("元宮チアキ", "motomiya chiaki", "chiaki motomiya"),
+        # "チアキ"/"chiaki" alone is also this dictionary's existing
+        # "nanami chiaki" (Danganronpa) given name - nanami chiaki has no
+        # bare "チアキ"/"chiaki" alias registered (safe_aliases only), so
+        # there is no alias collision, but this character's bare given name
+        # still stays series-gated on principle.
+        "ambiguous_aliases": ("チアキ", "chiaki"),
+        # 髪色は資料間で不一致（黒髪 vs 青髪の両説あり）のため signature_tags
+        # には含めない。角(horns)と長髪は複数資料で一致。
+        "signature_tags": ("long hair", "horns"),
+        "notes": (
+            "character_tagはリポジトリ内・Danbooru上で未確認。既存の 'kei (blue archive)' で確認された"
+            "曖昧タグ問題（bare 'kei' が別キャラ寄りに混ざる）と同型の問題を避けるため、'chiaki' 単独ではなく"
+            "'chiaki (blue archive)' を暫定character_tagとして採用。要確認。"
+            "固有武器名「カメラブリッツ」は実際のカメラ機能を持たない小銃であり、別途目撃される"
+            "デジタルカメラ小道具とは別物のため、'camera'系タグはsignature_tagsに含めていない。"
+            "目の色（赤目、単独ソースのみ）も確証不足のため未採用。"
+        ),
+    },
+    {
+        "character_tag": "ichikawa hinana",
+        "display_name": "市川雛菜",
+        "series_tag": "idolmaster shiny colors",
+        "safe_aliases": ("市川雛菜", "ichikawa hinana", "hinana ichikawa"),
+        "ambiguous_aliases": ("雛菜", "ひなな", "hinana"),
+        "signature_tags": (),
+        "notes": (
+            "character_tagはリポジトリ内で未確認。保守的な姓名順ローマ字表記を仮採用。要確認。"
+            "髪色・髪型・目の色ともに信頼できる資料で確認できなかったため signature_tags は空のまま登録。"
+            "所属ユニット「ノクチル」の他メンバー（芹沢あさひ・樋口円香・福丸小糸など）との外見上の"
+            "区別に使える確定情報も今回は得られなかった。将来的な視覚資料での確認を推奨。"
+        ),
+    },
+    {
+        "character_tag": "shiki natsume",
+        "display_name": "四季ナツメ",
+        "series_tag": "cafe stella to shinigami no chou",
+        "safe_aliases": ("四季ナツメ", "shiki natsume", "natsume shiki"),
+        # "ナツメ"/"natsume" alone is also an ordinary Japanese given name
+        # (and the word for jujube), so it stays series-gated.
+        "ambiguous_aliases": ("ナツメ", "natsume"),
+        "signature_tags": ("black hair", "long hair"),
+        "notes": (
+            "character_tag・series_tagともにリポジトリ内・Danbooru上で未確認。保守的な姓名順ローマ字/"
+            "ローマ字化タイトルを仮採用。要確認。signature_tagsの黒髪・ロングヘアは複数の検索結果で"
+            "共通して言及されたが、キャラクター専門wikiでの明示記載ではなく暫定採用（要確認）。"
+            "目の色は確認できず。作中設定上、本人は死神ではなく人間で、死亡時に魂の一部が蝶となった"
+            "という設定のため、尻尾・翼等の死神的な身体的特徴は本人には適用しないこと。"
+        ),
+    },
+    {
+        "character_tag": "shinohara raika",
+        "display_name": "忍原来夏",
+        "series_tag": "inazuma eleven victory road",
+        "safe_aliases": ("忍原来夏", "shinohara raika", "raika shinohara"),
+        # "来夏"/"らいか"/"raika" alone reads as an ordinary Japanese given
+        # name, so it stays series-gated.
+        "ambiguous_aliases": ("来夏", "らいか", "raika"),
+        "signature_tags": ("pink hair", "ponytail", "pink eyes"),
+        "notes": (
+            "character_tagはリポジトリ内・Danbooru上で未確認。保守的な姓名順ローマ字表記を仮採用。要確認。"
+            "出典は『イナズマイレブン 英雄たちのヴィクトリーロード』であり、既存の series_tag "
+            "'inazuma eleven go' とは別作品・別ロースターのため series_tag を分離した（混同しないこと）。"
+            "ピンク髪・ロングポニーテール・ピンク目は独立した2件の情報源で一致したため signature_tags に採用。"
+        ),
+    },
+    {
+        "character_tag": "castorice",
+        "display_name": "キャストリス",
+        "series_tag": "honkai: star rail",
+        # "キャストリス"/"castorice" はいずれも一般語・一般的な人名ではない
+        # 固有名のため、safe_aliases として単独解決可能とする
+        # (ambiguous_aliasesは不要)。
+        "safe_aliases": ("キャストリス", "castorice"),
+        "signature_tags": ("purple hair", "very long hair", "purple eyes", "pointy ears"),
+        "notes": (
+            "character_tagは公式ローカライズ名 'Castorice' をそのまま採用（他の新規エントリより確度が高い）。"
+            "ただしDanbooru上の実タグそのものはリポジトリ内で未確認。要確認。"
+            "髪色・目の色・尖った耳は独立した2件の情報源で一致したため signature_tags に採用。"
+            "蝶モチーフの髪飾りや武器（大鎌）については単独ソースかつ状況証拠のみで確証不足のため含めていない。"
+        ),
+    },
+    {
+        "character_tag": "remielle dan",
+        "display_name": "レミエール・ダン",
+        "series_tag": "zenless zone zero",
+        # "remielle"/"レミエール" 単独でも一般語ではない固有名のため
+        # safe_aliases として単独解決可能とする（ambiguous_aliasesは不要）。
+        # character_tagは "remielle" 単独ではなくフルネーム "remielle dan" を
+        # 優先的に採用しているが、単独形も同じ人物を指すエイリアスとして
+        # safe_aliases に含める。
+        "safe_aliases": ("レミエール", "レミエール・ダン", "remielle", "remielle dan"),
+        "signature_tags": ("pink hair", "very long hair", "pink eyes", "wings"),
+        "notes": (
+            "character_tagは 'remielle' 単独ではなくフルネーム 'remielle dan' を暫定採用。"
+            "Danbooru上の実タグそのものはリポジトリ内で未確認。旧コードネーム「Ramiel」の存在も"
+            "示唆されており、表記揺れの可能性がある。要確認。"
+            "髪色・目の色・翼は単独の情報源（タグ集計サイト）のみに基づく暫定採用のため、"
+            "外見特徴全体の確証は他エントリより弱いことに注意。"
+        ),
+    },
 )
 
 
@@ -509,16 +642,24 @@ def _resolve_all(user_text: str) -> list[CharacterTagResolution]:
         matched_series_tag, matched_series_alias = _match_series(normalized_text)
 
         if matched_safe_alias is not None:
-            resolved_series_tag = matched_series_tag or character.series_tag
-            match_type = "character_and_series" if matched_series_tag else "character_only"
+            # A safe_alias always resolves to this character's own
+            # series_tag - never to whatever series happens to be mentioned
+            # elsewhere in the same text. Without this check, a request
+            # naming both this character's safe_alias AND an unrelated
+            # (wrong) series - e.g. two similarly-named series like
+            # "inazuma eleven go" vs "inazuma eleven victory road" - would
+            # silently overwrite the character's real series_tag with the
+            # wrong one. match_type only reflects whether the text also
+            # happened to confirm the character's own series.
+            match_type = "character_and_series" if matched_series_tag == character.series_tag else "character_only"
             resolutions.append(
                 CharacterTagResolution(
                     character_tag=character.character_tag,
                     display_name=character.display_name,
-                    series_tag=resolved_series_tag,
-                    series_name=_SERIES_NAME_BY_TAG.get(resolved_series_tag, resolved_series_tag),
+                    series_tag=character.series_tag,
+                    series_name=_SERIES_NAME_BY_TAG.get(character.series_tag, character.series_tag),
                     matched_character_alias=matched_safe_alias,
-                    matched_series_alias=matched_series_alias,
+                    matched_series_alias=matched_series_alias if matched_series_tag == character.series_tag else None,
                     match_type=match_type,
                     signature_tags=character.signature_tags,
                 )

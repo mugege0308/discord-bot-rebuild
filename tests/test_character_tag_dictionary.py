@@ -188,6 +188,25 @@ _RESOLVES_CASES: tuple[tuple[str, str, str, str], ...] = (
     ("shikano-chinatsu-romaji", "shikano chinatsu", "shikano chinatsu", "ao no hako"),
     ("shikano-chinatsu-abbrev-series", "アオのハコの千夏", "shikano chinatsu", "ao no hako"),
     ("shikano-chinatsu-english-series-alias", "blue box chinatsu", "shikano chinatsu", "ao no hako"),
+    ("chiaki-motomiya-full-name", "元宮チアキ", "chiaki (blue archive)", "blue archive"),
+    ("chiaki-motomiya-romaji", "motomiya chiaki", "chiaki (blue archive)", "blue archive"),
+    ("chiaki-motomiya-abbrev-series", "ブルアカのチアキ", "chiaki (blue archive)", "blue archive"),
+    ("hinana-full-name", "市川雛菜", "ichikawa hinana", "idolmaster shiny colors"),
+    ("hinana-romaji", "ichikawa hinana", "ichikawa hinana", "idolmaster shiny colors"),
+    ("hinana-abbrev-series", "シャニマスの雛菜", "ichikawa hinana", "idolmaster shiny colors"),
+    ("natsume-full-name", "四季ナツメ", "shiki natsume", "cafe stella to shinigami no chou"),
+    ("natsume-romaji", "shiki natsume", "shiki natsume", "cafe stella to shinigami no chou"),
+    ("natsume-abbrev-series", "喫茶ステラの四季ナツメ", "shiki natsume", "cafe stella to shinigami no chou"),
+    ("raika-full-name", "忍原来夏", "shinohara raika", "inazuma eleven victory road"),
+    ("raika-romaji", "shinohara raika", "shinohara raika", "inazuma eleven victory road"),
+    ("raika-abbrev-series", "イナイレVの来夏", "shinohara raika", "inazuma eleven victory road"),
+    ("castorice-japanese", "キャストリス", "castorice", "honkai: star rail"),
+    ("castorice-romaji-standalone", "castorice", "castorice", "honkai: star rail"),
+    ("castorice-with-series", "崩壊スターレイルのキャストリス", "castorice", "honkai: star rail"),
+    ("remielle-full-japanese", "レミエール・ダン", "remielle dan", "zenless zone zero"),
+    ("remielle-short-japanese", "レミエール", "remielle dan", "zenless zone zero"),
+    ("remielle-romaji-standalone", "remielle", "remielle dan", "zenless zone zero"),
+    ("remielle-with-series", "ゼンゼロのレミエール", "remielle dan", "zenless zone zero"),
 )
 
 
@@ -282,6 +301,137 @@ class KeiStudentAndFormerSplitTestCase(unittest.TestCase):
         self.assertEqual(former_detail.extra_fields["signature_tags"], ())
 
 
+class NewSixCharacterBatchTestCase(unittest.TestCase):
+    """The 6-character batch added for character-dictionary expansion:
+    元宮チアキ (chiaki (blue archive)), 市川雛菜 (ichikawa hinana),
+    四季ナツメ (shiki natsume), 忍原来夏 (shinohara raika), キャストリス
+    (castorice), レミエール・ダン (remielle dan). Covers the specific risks
+    identified while designing the batch: "chiaki" must not collide with the
+    pre-existing "nanami chiaki" (Danganronpa), the two "inazuma eleven"
+    series_tags must stay distinct, and signature_tags reach
+    CharacterTagResolution/get_character_detail correctly (including the
+    empty-tuple case for 市川雛菜, whose appearance is unconfirmed).
+    """
+
+    def test_chiaki_motomiya_full_name_does_not_collide_with_nanami_chiaki(self):
+        # Realistic inputs only: nanami chiaki has no bare "チアキ"/"chiaki"
+        # alias registered (safe_aliases only), so it can only ever resolve
+        # via its own full-name aliases, never via chiaki_motomiya's bare
+        # ambiguous "チアキ"/"chiaki".
+        motomiya = resolve_character_tags("元宮チアキ")
+        self.assertIsNotNone(motomiya)
+        self.assertEqual(motomiya.character_tag, "chiaki (blue archive)")
+
+        nanami = resolve_character_tags("七海千秋")
+        self.assertIsNotNone(nanami)
+        self.assertEqual(nanami.character_tag, "nanami chiaki")
+
+        nanami_romaji = resolve_character_tags("chiaki nanami")
+        self.assertIsNotNone(nanami_romaji)
+        self.assertEqual(nanami_romaji.character_tag, "nanami chiaki")
+
+        # Bare "チアキ"/"chiaki" without series or full-name context resolves
+        # to neither character.
+        self.assertIsNone(resolve_character_tags("チアキ"))
+        self.assertIsNone(resolve_character_tags("chiaki"))
+
+        # "ダンガンロンパのチアキ" does not resolve nanami chiaki (no bare
+        # ambiguous alias registered for it) and must not accidentally
+        # resolve chiaki_motomiya either (wrong series).
+        self.assertIsNone(resolve_character_tags("ダンガンロンパのチアキ"))
+
+        # "chiaki nanami" alone (no blue archive series alias present) must
+        # not also resolve chiaki_motomiya via its ambiguous "chiaki",
+        # despite "chiaki" being a literal substring of "chiaki nanami".
+        results = resolve_all_character_tags("chiaki nanami")
+        self.assertEqual({r.character_tag for r in results}, {"nanami chiaki"})
+
+    def test_inazuma_eleven_go_and_victory_road_stay_separate_series(self):
+        raika = resolve_character_tags("イナイレVの来夏")
+        self.assertIsNotNone(raika)
+        self.assertEqual(raika.series_tag, "inazuma eleven victory road")
+
+        kinako = resolve_character_tags("イナイレGOの菜花きなこ")
+        self.assertIsNotNone(kinako)
+        self.assertEqual(kinako.series_tag, "inazuma eleven go")
+
+        # raika's bare given name "来夏" is an ambiguous_alias (no safe_alias
+        # match here), so pairing it with the WRONG series (GO, not Victory
+        # Road) must not resolve at all.
+        self.assertIsNone(resolve_character_tags("イナイレGOの来夏"))
+
+        # nanobana_kinako's full name IS a safe_alias, so she still resolves
+        # even when paired with the wrong series text - but her series_tag
+        # must stay her own real "inazuma eleven go", never get silently
+        # overwritten by the unrelated "inazuma eleven victory road" mention
+        # (see test_wrong_series_text_never_overwrites_a_safe_alias_characters_series_tag
+        # below for the general-purpose regression this depends on).
+        kinako_wrong_series_text = resolve_character_tags("イナイレVの菜花きなこ")
+        self.assertIsNotNone(kinako_wrong_series_text)
+        self.assertEqual(kinako_wrong_series_text.character_tag, "nanobana kinako")
+        self.assertEqual(kinako_wrong_series_text.series_tag, "inazuma eleven go")
+        self.assertEqual(kinako_wrong_series_text.match_type, "character_only")
+
+    def test_wrong_series_text_never_overwrites_a_safe_alias_characters_series_tag(self):
+        # General-purpose regression (not specific to the inazuma eleven
+        # pair): a safe_alias match must always report the character's own,
+        # fixed series_tag - resolving via a full name must never let an
+        # unrelated series mention elsewhere in the same text corrupt it.
+        # Exercised here with genshin impact's hu tao (English "hu tao" is a
+        # safe_alias) paired with an unrelated but registered series alias
+        # ("pokemon").
+        result = resolve_character_tags("pokemon hu tao")
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.character_tag, "hu tao")
+        self.assertEqual(result.series_tag, "genshin impact")
+        self.assertEqual(result.match_type, "character_only")
+
+    def test_natsume_and_raika_ambiguous_aliases_require_series(self):
+        for text in ("ナツメ", "natsume", "らいか", "raika", "来夏"):
+            with self.subTest(text=text):
+                self.assertIsNone(resolve_character_tags(text))
+
+    def test_signature_tags_reach_resolution_for_each_new_character(self):
+        expectations = (
+            ("元宮チアキ", "chiaki (blue archive)", ("long hair", "horns")),
+            ("四季ナツメ", "shiki natsume", ("black hair", "long hair")),
+            ("忍原来夏", "shinohara raika", ("pink hair", "ponytail", "pink eyes")),
+            ("キャストリス", "castorice", ("purple hair", "very long hair", "purple eyes", "pointy ears")),
+            ("レミエール・ダン", "remielle dan", ("pink hair", "very long hair", "pink eyes", "wings")),
+        )
+        for text, expected_tag, expected_signature_tags in expectations:
+            with self.subTest(text=text):
+                result = resolve_character_tags(text)
+
+                self.assertIsNotNone(result)
+                self.assertEqual(result.character_tag, expected_tag)
+                self.assertEqual(result.signature_tags, expected_signature_tags)
+
+    def test_hinana_has_empty_signature_tags_and_still_resolves(self):
+        result = resolve_character_tags("市川雛菜")
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.character_tag, "ichikawa hinana")
+        self.assertEqual(result.signature_tags, ())
+
+    def test_get_character_detail_exposes_signature_tags_for_new_batch(self):
+        expectations = {
+            "chiaki (blue archive)": ("long hair", "horns"),
+            "ichikawa hinana": (),
+            "shiki natsume": ("black hair", "long hair"),
+            "shinohara raika": ("pink hair", "ponytail", "pink eyes"),
+            "castorice": ("purple hair", "very long hair", "purple eyes", "pointy ears"),
+            "remielle dan": ("pink hair", "very long hair", "pink eyes", "wings"),
+        }
+        for character_tag, expected_signature_tags in expectations.items():
+            with self.subTest(character_tag=character_tag):
+                detail = get_character_detail(character_tag)
+
+                self.assertIsNotNone(detail)
+                self.assertEqual(detail.extra_fields["signature_tags"], expected_signature_tags)
+
+
 # Bare/ambiguous aliases that must NOT resolve without their series also
 # being present in the same text - the "誤検出しやすい短い名前" safety
 # requirement for this batch.
@@ -299,6 +449,16 @@ _DOES_NOT_RESOLVE_ALONE_CASES: tuple[tuple[str, str], ...] = (
     ("meruru-bare-japanese", "メルル"),
     ("meruru-bare-romaji", "meruru"),
     ("chinatsu-bare", "千夏"),
+    ("chiaki-motomiya-bare-japanese", "チアキ"),
+    ("chiaki-motomiya-bare-romaji", "chiaki"),
+    ("hinana-bare-kanji", "雛菜"),
+    ("hinana-bare-katakana", "ひなな"),
+    ("hinana-bare-romaji", "hinana"),
+    ("natsume-bare-katakana", "ナツメ"),
+    ("natsume-bare-romaji", "natsume"),
+    ("raika-bare-kanji", "来夏"),
+    ("raika-bare-hiragana", "らいか"),
+    ("raika-bare-romaji", "raika"),
 )
 
 
@@ -434,7 +594,7 @@ class ListCharactersTestCase(unittest.TestCase):
     def test_returns_every_registered_character_with_series_name(self):
         entries = list_characters()
 
-        self.assertEqual(len(entries), 15)
+        self.assertEqual(len(entries), 21)
         by_tag = {entry.character_tag: entry for entry in entries}
         self.assertEqual(by_tag["kisaki"].display_name, "竜華キサキ")
         self.assertEqual(by_tag["kisaki"].series_tag, "blue archive")
@@ -503,7 +663,13 @@ class SearchCharactersTestCase(unittest.TestCase):
 
         self.assertEqual(
             {m.character_tag for m in matches},
-            {"shimoe koharu", "kisaki", "kei (blue archive)", "kei (former) (blue archive)"},
+            {
+                "shimoe koharu",
+                "kisaki",
+                "kei (blue archive)",
+                "kei (former) (blue archive)",
+                "chiaki (blue archive)",
+            },
         )
 
     def test_series_name_returns_every_character_in_that_series(self):

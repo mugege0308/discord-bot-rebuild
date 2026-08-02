@@ -1049,6 +1049,67 @@ class KnownCharacterContextWiringTestCase(unittest.TestCase):
         self.assertNotIn("confirmed appearance tags for kei (former) (blue archive)", sent_system_prompt)
         self.assertNotIn("confirmed appearance tags", sent_system_prompt)
 
+    def test_castorice_signature_tags_reach_context_and_positive_verbatim(self):
+        # Confirms signature_tags pass-through is generic, not Kei-specific:
+        # exercised here with the newly-added 崩壊：スターレイル "castorice".
+        response = json.dumps(
+            {
+                "positive": (
+                    "1girl, castorice, honkai: star rail, purple hair, very long hair, "
+                    "purple eyes, pointy ears, smile, masterpiece"
+                ),
+                "negative": "lowres, bad anatomy",
+                "summary": "キャストリスが笑っている画像",
+                "assumptions": [],
+            },
+            ensure_ascii=False,
+        )
+        with mock.patch(
+            "services.shogou_prompt_designer.load_shogou_instruction",
+            return_value="INSTRUCTION_BODY",
+        ), mock.patch(
+            "services.shogou_prompt_designer.append_memory_to_system_prompt",
+            return_value="INSTRUCTION_BODY",
+        ), mock.patch(
+            "services.shogou_prompt_designer.build_image_memory_prompt_context",
+            return_value="",
+        ), mock.patch(
+            "services.shogou_prompt_designer._post_chat_completion",
+            return_value=response,
+        ) as post_mock:
+            result = generate_shogou_prompt_result("崩壊スターレイルのキャストリス、笑顔", user_id=1, reference_id=None)
+
+        sent_system_prompt = post_mock.call_args.args[0]
+        self.assertIn(
+            "confirmed appearance tags for castorice: purple hair, very long hair, purple eyes, pointy ears",
+            sent_system_prompt,
+        )
+        for tag in ("purple hair", "very long hair", "purple eyes", "pointy ears"):
+            self.assertIn(tag, result.positive)
+
+    def test_hinana_empty_signature_tags_produces_no_appearance_line(self):
+        # 市川雛菜 was registered with signature_tags=() (appearance
+        # unconfirmed); the context block must still resolve the character
+        # normally, just without any "confirmed appearance tags" line.
+        with mock.patch(
+            "services.shogou_prompt_designer.load_shogou_instruction",
+            return_value="INSTRUCTION_BODY",
+        ), mock.patch(
+            "services.shogou_prompt_designer.append_memory_to_system_prompt",
+            return_value="INSTRUCTION_BODY",
+        ), mock.patch(
+            "services.shogou_prompt_designer.build_image_memory_prompt_context",
+            return_value="",
+        ), mock.patch(
+            "services.shogou_prompt_designer._post_chat_completion",
+            return_value=VALID_JSON,
+        ) as post_mock:
+            generate_shogou_prompt_result("市川雛菜、笑顔", user_id=1, reference_id=None)
+
+        sent_system_prompt = post_mock.call_args.args[0]
+        self.assertIn("character tag: ichikawa hinana", sent_system_prompt)
+        self.assertNotIn("confirmed appearance tags", sent_system_prompt)
+
     def test_known_character_context_is_identical_across_all_three_model_profiles(self):
         # Animagine / JANKU / JANKU Adult load different instruction .md
         # files (services.shogou_prompt_designer.load_shogou_instruction),
