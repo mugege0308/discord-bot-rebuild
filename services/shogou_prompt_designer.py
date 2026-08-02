@@ -68,9 +68,18 @@ def _build_known_character_context(resolutions: Sequence[CharacterTagResolution]
         lines.append(f"- name: {resolution.display_name} ({resolution.series_name})")
         lines.append(f"- character tag: {resolution.character_tag}")
         lines.append(f"- series tag: {resolution.series_tag}")
+        if resolution.signature_tags:
+            signature_tags_text = ", ".join(resolution.signature_tags)
+            lines.append(f"- confirmed appearance tags for {resolution.character_tag}: {signature_tags_text}")
     lines.append("- these tags must appear near the beginning of positive, right after the count tag (1girl/1boy/1other)")
     lines.append("- do not translate, split, abbreviate, replace, or generalize these tags")
     lines.append("- the name/series text above is identification context only; never add it as a separate tag itself")
+    if any(resolution.signature_tags for resolution in resolutions):
+        lines.append(
+            "- confirmed appearance tags listed above must also be added to positive verbatim (each as its own "
+            "tag, anywhere after the character/series tags), unless the user's own request explicitly specifies "
+            "a conflicting appearance for that character"
+        )
     if len(resolutions) > 1:
         lines.append(
             "- multiple known characters were detected in this request; keep them as distinct, separate "

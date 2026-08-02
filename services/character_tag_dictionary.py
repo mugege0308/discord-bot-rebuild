@@ -32,16 +32,25 @@ Add one dict to `_RAW_CHARACTERS` below:
 - `notes` (str, optional): free text. Use this to flag a tag/reading that
   could not be confirmed from anything in this repository, so a future
   contributor knows to verify it before trusting it.
+- `signature_tags` (tuple[str, ...], optional, default empty): confirmed,
+  already-Danbooru-style appearance tags (e.g. `"white hair"`) that should
+  always be added to `positive` alongside this character's identity tags.
+  This is an intentionally narrow escape hatch from the "no appearance data"
+  rule below - use it only when the appearance is actually confirmed for
+  this specific character (e.g. distinguishing two dictionary entries that
+  share a display name/history, such as blue archive's two "kei" entries
+  below), never as a place to guess at a character's usual look.
 
 A malformed entry (missing key, wrong type, unknown series_tag) is skipped
 with a logged warning at import time - it never prevents the rest of the
 dictionary, or the bot, from loading.
 
 Appearance (hair/eye color, outfit, build, ...) is intentionally NOT part of
-this dictionary. Character *identity* resolution and appearance
-reinforcement are two separate concerns; only character_tag/series_tag are
-resolved here, and services/shogou_prompt_designer.py never fabricates
-appearance details from this module's output.
+this dictionary, with the one narrow exception of the opt-in
+`signature_tags` field above. Character *identity* resolution and appearance
+reinforcement are otherwise two separate concerns; services/
+shogou_prompt_designer.py never fabricates appearance details from this
+module's output beyond what `signature_tags` explicitly provides.
 """
 
 import logging
@@ -62,6 +71,10 @@ class CharacterTagResolution:
     matched_character_alias: str
     matched_series_alias: str | None
     match_type: str  # "character_and_series" or "character_only"
+    # Confirmed appearance tags to always add to positive alongside this
+    # character (see _CharacterEntry.signature_tags / module docstring).
+    # Empty for every character except where explicitly curated.
+    signature_tags: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -78,6 +91,7 @@ class _CharacterEntry:
     series_tag: str
     safe_aliases: tuple[str, ...]
     ambiguous_aliases: tuple[str, ...] = ()
+    signature_tags: tuple[str, ...] = ()
     notes: str = ""
 
 
@@ -245,17 +259,48 @@ _RAW_CHARACTERS: tuple[dict, ...] = (
         ),
     },
     {
-        "character_tag": "kei",
+        # 2026年実装の「生徒版ケイ」(プレイアブルユニットとしてのケイ)。
+        # "ケイ"/"kei" は依然として一般的すぎる短い名前のため series 同時指定を
+        # 要求する ambiguous_aliases のままだが、"生徒ケイ"/"ケイ 生徒" は
+        # それ自体で十分に特定的なため safe_aliases として単独解決を許可する。
+        "character_tag": "kei (blue archive)",
         "display_name": "ケイ",
         "series_tag": "blue archive",
-        # No safe alias: this character is only ever known by a single short
-        # given name, which is also an extremely common Japanese/English
-        # name/word, so it must always require the series alias.
-        "safe_aliases": (),
+        "safe_aliases": ("生徒ケイ", "ケイ 生徒"),
         "ambiguous_aliases": ("ケイ", "kei"),
+        # 画像生成が旧来のアリス身体側のケイへ寄る問題への対処として追加。
+        # 外見情報を辞書へ持たせない原則の例外として signature_tags を使う
+        # (このケイに限り確認済みの特徴として明示的に指定されたもの)。
+        "signature_tags": (
+            "white hair",
+            "very long hair",
+            "pink eyes",
+            "sharp eyes",
+            "asymmetrical bangs",
+        ),
         "notes": (
-            "character_tagはリポジトリ内で未確認。'kei'は一般的すぎる短い名前のため、"
-            "Danbooru上は曖昧回避の表記（例: 'kei (blue archive)'）が必要な可能性がある。要確認。"
+            "正式な外部タグは未確認のため、短く曖昧な 'kei' を避け、"
+            "暫定タグとして 'kei (blue archive)' を採用（正式Danbooruタグ未確認、要確認）。"
+            "本エントリは2026年実装の『生徒版ケイ』を指す想定。旧来のアリス身体側のケイは"
+            "別エントリ 'kei (former) (blue archive)' として分離した。signature_tagsの5件は"
+            "本タスクで明示指定された確認済み特徴として採用（他エントリのような外見の当て推量ではない）。"
+        ),
+    },
+    {
+        # 旧来の「アリス身体側」のケイ。生徒版ケイと表示名(display_name)は同じ
+        # "ケイ" を共有する同一名の別形態のため、character_tag/display_name/
+        # aliases のいずれも生徒版ケイと重複させず、明示的なエイリアスでのみ
+        # 解決させる (series同時指定なしで単独解決できる safe_aliases)。
+        "character_tag": "kei (former) (blue archive)",
+        "display_name": "ケイ（旧アリス身体）",
+        "series_tag": "blue archive",
+        "safe_aliases": ("アリス身体のケイ", "旧ケイ"),
+        "notes": (
+            "正式な外部タグ・正式名称ともにリポジトリ内で未確認の暫定タグ。"
+            "生徒版ケイ('kei (blue archive)')と同じ 'ケイ' という名前を共有する別形態のため、"
+            "混同防止のため character_tag を 'kei (former) (blue archive)' として分離した。"
+            "'former' は本辞書がこの区別のために付けた仮の英語表記であり、Danbooru上の実タグとは"
+            "無関係（要確認）。外見タグは追加していない(旧形態の外見は本タスクで確認されていないため)。"
         ),
     },
     {
@@ -355,6 +400,7 @@ def _build_character_entries(
                 series_tag=str(raw["series_tag"]),
                 safe_aliases=tuple(str(alias) for alias in raw.get("safe_aliases", ())),
                 ambiguous_aliases=tuple(str(alias) for alias in raw.get("ambiguous_aliases", ())),
+                signature_tags=tuple(str(tag) for tag in raw.get("signature_tags", ())),
                 notes=str(raw.get("notes", "")),
             )
         except Exception:
@@ -474,6 +520,7 @@ def _resolve_all(user_text: str) -> list[CharacterTagResolution]:
                     matched_character_alias=matched_safe_alias,
                     matched_series_alias=matched_series_alias,
                     match_type=match_type,
+                    signature_tags=character.signature_tags,
                 )
             )
             continue
@@ -490,10 +537,53 @@ def _resolve_all(user_text: str) -> list[CharacterTagResolution]:
                     matched_character_alias=matched_ambiguous_alias,
                     matched_series_alias=matched_series_alias,
                     match_type="character_and_series",
+                    signature_tags=character.signature_tags,
                 )
             )
 
-    return resolutions
+    return _drop_alias_subsumed_matches(resolutions)
+
+
+def _drop_alias_subsumed_matches(
+    resolutions: list[CharacterTagResolution],
+) -> list[CharacterTagResolution]:
+    """Same-series safety valve for two dictionary entries that share an
+    underlying name (e.g. blue archive's "kei (blue archive)" 生徒版 vs "kei
+    (former) (blue archive)" 旧形態, both matched via a Japanese alias
+    containing "ケイ"). Japanese alias matching is plain substring
+    containment (see `_alias_present`), so a more specific character's own
+    alias (e.g. "旧ケイ") always also contains a less specific sibling
+    character's alias (e.g. "ケイ") as a literal substring. Without this
+    step, mentioning the more specific character together with a series name
+    (e.g. "ブルアカの旧ケイ") would resolve BOTH characters at once instead of
+    only the one actually named.
+
+    Drops a resolution only when another resolution in the same series has a
+    matched_character_alias that literally contains this one's
+    matched_character_alias as a substring (the more specific match wins).
+    Every one of this dictionary's other alias pairs is already
+    substring-disjoint (verified by the full test suite), so this is a no-op
+    for every character except the one pair it exists for.
+    """
+    if len(resolutions) < 2:
+        return resolutions
+
+    subsumed_tags: set[str] = set()
+    for shorter in resolutions:
+        shorter_alias = _normalize(shorter.matched_character_alias)
+        if not shorter_alias:
+            continue
+        for longer in resolutions:
+            if longer.character_tag == shorter.character_tag or longer.series_tag != shorter.series_tag:
+                continue
+            longer_alias = _normalize(longer.matched_character_alias)
+            if longer_alias != shorter_alias and shorter_alias in longer_alias:
+                subsumed_tags.add(shorter.character_tag)
+                break
+
+    if not subsumed_tags:
+        return resolutions
+    return [resolution for resolution in resolutions if resolution.character_tag not in subsumed_tags]
 
 
 def resolve_character_tags(user_text: str) -> CharacterTagResolution | None:
@@ -550,18 +640,34 @@ def find_blocked_alias_mentions(user_text: str) -> tuple[BlockedAliasMention, ..
     """Every registered character whose ambiguous_alias appears in
     `user_text` but that did not resolve because the character's own series
     alias was not also present. Read-only: calls the exact same private
-    matching helpers `_resolve_all` uses (never modifies them), so this can
-    never disagree with what `resolve_character_tags`/`resolve_all_character_tags`
-    would actually return for the same text.
+    matching helpers `_resolve_all`/`_match_series` use (never modifies
+    them), so this can never disagree with what
+    `resolve_character_tags`/`resolve_all_character_tags` would actually
+    return for the same text.
+
+    Checks "was this character's own series alias present" directly via
+    `_match_series` rather than merely "is this character_tag absent from
+    `_resolve_all`'s output" - the latter would also be true for a character
+    dropped by `_drop_alias_subsumed_matches` (a more specific sibling
+    character, e.g. blue archive's two "kei" entries, matched instead), which
+    is a different situation from "series alias missing" and must not be
+    reported as one.
     """
     normalized_text = _normalize(user_text)
     if not normalized_text:
         return ()
 
     resolved_tags = {resolution.character_tag for resolution in _resolve_all(user_text)}
+    matched_series_tag, _matched_series_alias = _match_series(normalized_text)
     mentions: list[BlockedAliasMention] = []
     for character in _CHARACTER_ENTRIES:
         if character.character_tag in resolved_tags:
+            continue
+        if matched_series_tag == character.series_tag:
+            # Its own series alias WAS present - this is not the "series
+            # missing" case find_missing_character_candidates surfaces, even
+            # though this character_tag ended up absent from _resolve_all's
+            # output (e.g. subsumed by a more specific sibling character).
             continue
         matched_ambiguous = _find_alias(normalized_text, character.ambiguous_aliases)
         if matched_ambiguous is None:

@@ -65,6 +65,7 @@ _FIELD_LABELS: dict[str, str] = {
     "notes": "備考",
     "appearance_tags": "外見タグ",
     "identity_hints": "識別ヒント",
+    "signature_tags": "外見補助タグ（Positiveへ常時付加）",
 }
 
 

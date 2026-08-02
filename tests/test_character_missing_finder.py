@@ -57,8 +57,22 @@ class AggregatesBlockedMentionsTestCase(unittest.TestCase):
         candidates = find_missing_character_candidates(rows=rows)
 
         self.assertEqual(len(candidates), 1)
-        self.assertEqual(candidates[0].character_tag, "kei")
+        self.assertEqual(candidates[0].character_tag, "kei (blue archive)")
         self.assertEqual(candidates[0].occurrence_count, 2)
+
+    def test_former_kei_fully_resolved_with_series_produces_no_candidate(self):
+        # "ブルアカの旧ケイ" fully resolves to the former-Kei entry (its own
+        # explicit alias). The generic student-Kei entry's ambiguous alias
+        # "ケイ" is also a literal substring of "旧ケイ" and the series name
+        # is present too, but this must not be reported as a "series not
+        # co-mentioned" candidate for student-Kei - it was correctly resolved
+        # elsewhere (subsumed by the more specific former-Kei match), not
+        # blocked by a missing series.
+        rows = [_row(1, "2026-01-01T10:00:00+09:00", "ブルアカの旧ケイが立っている")]
+
+        candidates = find_missing_character_candidates(rows=rows)
+
+        self.assertEqual(candidates, [])
 
     def test_multiple_characters_are_sorted_by_occurrence_count_descending(self):
         rows = (

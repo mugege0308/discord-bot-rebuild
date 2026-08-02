@@ -162,8 +162,12 @@ _RESOLVES_CASES: tuple[tuple[str, str, str, str], ...] = (
     ("kisaki-full-series-name", "ブルーアーカイブの竜華キサキ", "kisaki", "blue archive"),
     ("kisaki-abbrev-series-japanese", "ブルアカのキサキ", "kisaki", "blue archive"),
     ("kisaki-abbrev-series-romaji", "blue archive kisaki", "kisaki", "blue archive"),
-    ("kei-abbrev-series", "ブルアカのケイ", "kei", "blue archive"),
-    ("kei-uppercase-abbrev-series", "ブルアカのKEI", "kei", "blue archive"),
+    ("kei-abbrev-series", "ブルアカのケイ", "kei (blue archive)", "blue archive"),
+    ("kei-uppercase-abbrev-series", "ブルアカのKEI", "kei (blue archive)", "blue archive"),
+    ("kei-student-explicit-no-series", "生徒ケイ", "kei (blue archive)", "blue archive"),
+    ("kei-student-explicit-alt-order-no-series", "ケイ 生徒", "kei (blue archive)", "blue archive"),
+    ("kei-former-explicit-no-series", "旧ケイ", "kei (former) (blue archive)", "blue archive"),
+    ("kei-former-explicit-phrase-no-series", "アリス身体のケイ", "kei (former) (blue archive)", "blue archive"),
     ("leafa-full-series-name", "ソードアート・オンラインのリーファ", "leafa", "sword art online"),
     ("leafa-abbrev-series-no-space", "SAOのリーファ", "leafa", "sword art online"),
     ("leafa-romaji-abbrev-series", "sao leafa", "leafa", "sword art online"),
@@ -196,6 +200,86 @@ class NewCharacterResolutionTableTestCase(unittest.TestCase):
                 self.assertIsNotNone(result, f"expected {input_text!r} to resolve")
                 self.assertEqual(result.character_tag, expected_character_tag)
                 self.assertEqual(result.series_tag, expected_series_tag)
+
+
+class KeiStudentAndFormerSplitTestCase(unittest.TestCase):
+    """The single, ambiguous "kei (blue archive)" entry was split into two:
+    "kei (blue archive)" (2026's student-ver. Kei, the common case) and
+    "kei (former) (blue archive)" (the old Alice-body-side Kei), reachable
+    only via its own explicit aliases. Covers the exact scenarios requested
+    when the split was designed: bare ambiguous resolution is unchanged,
+    student-ver. resolves under series/explicit-context, the former form
+    resolves only via its own explicit aliases, and mentioning both an
+    explicit former-Kei alias and the series name together must resolve to
+    the former only - not both at once.
+    """
+
+    def test_bare_kei_alone_still_does_not_resolve(self):
+        # Unchanged from before the split: "kei"/"ケイ" alone remain too
+        # generic to resolve without series or another explicit alias.
+        self.assertIsNone(resolve_character_tags("kei"))
+        self.assertIsNone(resolve_character_tags("ケイ"))
+
+    def test_series_qualified_bare_kei_resolves_to_student_version(self):
+        result = resolve_character_tags("ブルアカのケイ")
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.character_tag, "kei (blue archive)")
+        self.assertEqual(
+            result.signature_tags,
+            ("white hair", "very long hair", "pink eyes", "sharp eyes", "asymmetrical bangs"),
+        )
+
+    def test_student_explicit_aliases_resolve_without_series(self):
+        for text in ("生徒ケイ", "ケイ 生徒"):
+            with self.subTest(text=text):
+                result = resolve_character_tags(text)
+
+                self.assertIsNotNone(result)
+                self.assertEqual(result.character_tag, "kei (blue archive)")
+
+    def test_former_explicit_aliases_resolve_without_series(self):
+        for text in ("旧ケイ", "アリス身体のケイ"):
+            with self.subTest(text=text):
+                result = resolve_character_tags(text)
+
+                self.assertIsNotNone(result)
+                self.assertEqual(result.character_tag, "kei (former) (blue archive)")
+                self.assertEqual(result.signature_tags, ())
+
+    def test_former_alias_with_series_resolves_only_to_former_not_both(self):
+        # Alias collision case: "旧ケイ"/"アリス身体のケイ" both literally
+        # contain "ケイ" (Japanese matching is plain substring containment),
+        # so student-ver. Kei's own ambiguous alias "ケイ" is also present in
+        # the same text. Combined with a series mention, both characters'
+        # match conditions would technically be satisfied at once; the
+        # dictionary must resolve this to the former only.
+        for text in ("ブルアカの旧ケイ", "ブルアカのアリス身体のケイ", "blue archive 旧ケイ"):
+            with self.subTest(text=text):
+                results = resolve_all_character_tags(text)
+
+                self.assertEqual(len(results), 1, f"expected exactly one resolution for {text!r}: {results!r}")
+                self.assertEqual(results[0].character_tag, "kei (former) (blue archive)")
+
+    def test_two_genuinely_different_blue_archive_characters_still_both_resolve(self):
+        # Confirms the alias-subsumption safety valve added for the two kei
+        # entries does not suppress an unrelated pair of characters from the
+        # same series when mentioned together (pre-existing behavior).
+        results = resolve_all_character_tags("下江コハルと竜華キサキが一緒に写っている")
+
+        self.assertEqual({r.character_tag for r in results}, {"shimoe koharu", "kisaki"})
+
+    def test_get_character_detail_exposes_signature_tags_only_for_student_version(self):
+        student_detail = get_character_detail("kei (blue archive)")
+        former_detail = get_character_detail("kei (former) (blue archive)")
+
+        self.assertIsNotNone(student_detail)
+        self.assertIsNotNone(former_detail)
+        self.assertEqual(
+            student_detail.extra_fields["signature_tags"],
+            ("white hair", "very long hair", "pink eyes", "sharp eyes", "asymmetrical bangs"),
+        )
+        self.assertEqual(former_detail.extra_fields["signature_tags"], ())
 
 
 # Bare/ambiguous aliases that must NOT resolve without their series also
@@ -293,7 +377,9 @@ class KnownCharacterAndSeriesTagsIncludesNewEntriesTestCase(unittest.TestCase):
     def test_new_character_and_series_tags_are_included(self):
         tags = known_character_and_series_tags()
 
-        for expected_tag in ("nanami chiaki", "kei", "leafa", "hu tao", "blue archive", "genshin impact"):
+        for expected_tag in (
+            "nanami chiaki", "kei (blue archive)", "leafa", "hu tao", "blue archive", "genshin impact"
+        ):
             self.assertIn(expected_tag, tags)
 
 
@@ -348,7 +434,7 @@ class ListCharactersTestCase(unittest.TestCase):
     def test_returns_every_registered_character_with_series_name(self):
         entries = list_characters()
 
-        self.assertEqual(len(entries), 14)
+        self.assertEqual(len(entries), 15)
         by_tag = {entry.character_tag: entry for entry in entries}
         self.assertEqual(by_tag["kisaki"].display_name, "竜華キサキ")
         self.assertEqual(by_tag["kisaki"].series_tag, "blue archive")
@@ -379,7 +465,7 @@ class GetCharacterDetailTestCase(unittest.TestCase):
         self.assertIsNone(get_character_detail("no such character"))
 
     def test_extra_fields_excludes_core_identity_fields(self):
-        detail = get_character_detail("kei")
+        detail = get_character_detail("kei (blue archive)")
 
         self.assertIsNotNone(detail)
         self.assertNotIn("character_tag", detail.extra_fields)
@@ -417,7 +503,7 @@ class SearchCharactersTestCase(unittest.TestCase):
 
         self.assertEqual(
             {m.character_tag for m in matches},
-            {"shimoe koharu", "kisaki", "kei"},
+            {"shimoe koharu", "kisaki", "kei (blue archive)", "kei (former) (blue archive)"},
         )
 
     def test_series_name_returns_every_character_in_that_series(self):

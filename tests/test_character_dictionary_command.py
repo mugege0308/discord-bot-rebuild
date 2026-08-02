@@ -167,6 +167,34 @@ class BuildCharacterDetailEmbedFutureFieldTestCase(unittest.TestCase):
         self.assertEqual(field_by_name["備考"], "未設定")
 
 
+class BuildCharacterDetailEmbedSignatureTagsTestCase(unittest.TestCase):
+    """The student-ver. Kei entry (services/character_tag_dictionary.py) is
+    the first live entry to use signature_tags; /character_info must render
+    it with a human label, and must render an empty tuple (every other
+    character, including former-Kei) as "未設定" rather than a raw "()"."""
+
+    def test_student_kei_signature_tags_render_with_label(self):
+        from services.character_tag_dictionary import get_character_detail
+
+        detail = get_character_detail("kei (blue archive)")
+        embed = character_dictionary_command.build_character_detail_embed(detail)
+
+        field_by_name = {field.name: field.value for field in embed.fields}
+        self.assertEqual(
+            field_by_name["外見補助タグ（Positiveへ常時付加）"],
+            "white hair、very long hair、pink eyes、sharp eyes、asymmetrical bangs",
+        )
+
+    def test_former_kei_empty_signature_tags_render_as_unset(self):
+        from services.character_tag_dictionary import get_character_detail
+
+        detail = get_character_detail("kei (former) (blue archive)")
+        embed = character_dictionary_command.build_character_detail_embed(detail)
+
+        field_by_name = {field.name: field.value for field in embed.fields}
+        self.assertEqual(field_by_name["外見補助タグ（Positiveへ常時付加）"], "未設定")
+
+
 class CharacterMissingCommandTestCase(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.client = FakeClient()
