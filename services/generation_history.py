@@ -26,7 +26,7 @@ DB_FILE = DATA_DIR / "generation_history.db"
 # future change can tell which shape an existing file has and migrate it.
 # Bump this whenever the CREATE TABLE statements below change, and add the
 # matching migration step to _apply_schema_version().
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 _HASH_CHUNK_SIZE = 1024 * 1024
 
@@ -35,6 +35,22 @@ _HASH_CHUNK_SIZE = 1024 * 1024
 # existing three - the column is untyped TEXT, so no schema change was
 # needed, and existing like/meh/off_target rows are unaffected.
 ALLOWED_RATINGS = ("favorite", "like", "meh", "off_target")
+
+# Self-improvement Phase 1: the only issue_categories_json entries
+# image_generation_feedback.issue_categories_json may hold. Deliberately
+# disjoint from ALLOWED_RATINGS above - image_ratings is a separate, lighter
+# thumbs-up/down-style signal used by selection/prompt preference, while
+# image_generation_feedback records structured, multi-select adoption
+# feedback plus a snapshot of the generation conditions. Neither table reads
+# from or writes to the other.
+ALLOWED_ISSUE_CATEGORIES = (
+    "face_mismatch",
+    "hair_mismatch",
+    "outfit_mismatch",
+    "composition_mismatch",
+    "low_quality",
+    "other",
+)
 
 # The only regeneration_type values generation_requests.regeneration_type
 # may hold (besides NULL, for a request that is not a regeneration at all).
@@ -139,6 +155,52 @@ class GenerationRequestDetail:
     regeneration_type: str | None
     custom_instruction: str | None
     model_key: str = DEFAULT_IMAGE_GENERATION_MODEL_KEY
+
+
+@dataclass(frozen=True)
+class FeedbackImageTarget:
+    """Read-only: one generation_images row plus its parent request's
+    owner, joined by (channel_id, message_id) - used by the image feedback
+    context menu to find which image(s) a Discord message is offering
+    without requiring the caller to know any internal id. Carries every
+    generation_images column the feedback snapshot needs, unlike the leaner
+    GenerationImageRecord used by the "他の候補を見る" feature.
+    """
+
+    image_id: int
+    request_id: int
+    request_user_id: int
+    image_index: int
+    image_path: str
+    seed: int | None
+    checkpoint_name: str | None
+    sampler_name: str | None
+    scheduler: str | None
+    steps: int | None
+    cfg: float | None
+    width: int | None
+    height: int | None
+    was_selected_by_ai: bool
+
+
+@dataclass(frozen=True)
+class ImageFeedbackRecord:
+    """Read-only view of one image_generation_feedback row."""
+
+    id: int
+    image_id: int
+    image_index: int
+    image_path: str
+    user_id: int
+    guild_id: int | None
+    channel_id: int | None
+    message_id: int | None
+    accepted: bool
+    issue_categories: tuple[str, ...]
+    comment: str | None
+    generation_snapshot: dict
+    created_at: str
+    updated_at: str
 
 
 @dataclass(frozen=True)
@@ -298,6 +360,35 @@ def init_db() -> None:
             )
             """
         )
+        # Self-improvement Phase 1 (image feedback): structured, multi-select
+        # adoption feedback ("採用"/problem categories/free comment) plus a
+        # frozen snapshot of the generation conditions at the time feedback
+        # was recorded, so a later change to prompts/dictionary/models never
+        # rewrites what an earlier evaluation was actually judging. A brand
+        # new table needs no ALTER-based migration - CREATE TABLE IF NOT
+        # EXISTS alone brings an older DB file up to date - so
+        # _migrate_v4_to_v5 below is a documented no-op.
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS image_generation_feedback (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                image_id INTEGER NOT NULL REFERENCES generation_images(id) ON DELETE CASCADE,
+                image_index INTEGER NOT NULL,
+                image_path TEXT NOT NULL,
+                user_id INTEGER NOT NULL,
+                guild_id INTEGER,
+                channel_id INTEGER,
+                message_id INTEGER,
+                accepted INTEGER NOT NULL DEFAULT 0,
+                issue_categories_json TEXT NOT NULL DEFAULT '[]',
+                comment TEXT,
+                generation_snapshot_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(image_id, user_id)
+            )
+            """
+        )
         _apply_schema_version(connection)
         connection.commit()
 
@@ -338,6 +429,17 @@ def _migrate_v3_to_v4(connection: sqlite3.Connection) -> None:
     _add_column_if_missing(connection, "generation_requests", "model_key", "TEXT")
 
 
+def _migrate_v4_to_v5(connection: sqlite3.Connection) -> None:
+    """No-op: image_generation_feedback is a brand new table, already created
+    by the unconditional CREATE TABLE IF NOT EXISTS in init_db() regardless
+    of the file's prior version. This step exists only so SCHEMA_VERSION's
+    "bump on every CREATE TABLE change" rule has a matching migration entry,
+    and so PRAGMA user_version reaches 5 the same way every other version
+    bump does.
+    """
+    return
+
+
 def _apply_schema_version(connection: sqlite3.Connection) -> None:
     """Stamps/checks PRAGMA user_version so future schema changes have a
     reliable version to migrate from.
@@ -361,6 +463,7 @@ def _apply_schema_version(connection: sqlite3.Connection) -> None:
         _migrate_v1_to_v2(connection)
         _migrate_v2_to_v3(connection)
         _migrate_v3_to_v4(connection)
+        _migrate_v4_to_v5(connection)
         connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         return
     if current > SCHEMA_VERSION:
@@ -375,15 +478,22 @@ def _apply_schema_version(connection: sqlite3.Connection) -> None:
         _migrate_v1_to_v2(connection)
         _migrate_v2_to_v3(connection)
         _migrate_v3_to_v4(connection)
+        _migrate_v4_to_v5(connection)
         connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         return
     if current == 2:
         _migrate_v2_to_v3(connection)
         _migrate_v3_to_v4(connection)
+        _migrate_v4_to_v5(connection)
         connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         return
     if current == 3:
         _migrate_v3_to_v4(connection)
+        _migrate_v4_to_v5(connection)
+        connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        return
+    if current == 4:
+        _migrate_v4_to_v5(connection)
         connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         return
     # Deliberately does not bump an unknown older version: silently
@@ -697,6 +807,256 @@ def set_image_discord_message(
             len(ids),
         )
         return False
+
+
+def get_generation_images_for_message(channel_id: int, message_id: int) -> list[FeedbackImageTarget]:
+    """Read-only: every generation_images row attached to one Discord
+    message (via the discord_message_id/discord_channel_id set by
+    set_image_discord_message), ordered by batch_index - i.e. attachment
+    order. Used by the image feedback context menu, which acts on a message
+    rather than a slash-command argument, so it never needs the caller to
+    know any internal id.
+
+    Never raises: any DB error is logged and reported as an empty list,
+    matching every other read function in this module.
+    """
+    try:
+        with _connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT gi.id AS id, gi.request_id AS request_id, gr.user_id AS request_user_id,
+                       gi.batch_index AS batch_index, gi.image_path AS image_path, gi.seed AS seed,
+                       gi.checkpoint_name AS checkpoint_name, gi.sampler_name AS sampler_name,
+                       gi.scheduler AS scheduler, gi.steps AS steps, gi.cfg AS cfg,
+                       gi.width AS width, gi.height AS height, gi.was_selected_by_ai AS was_selected_by_ai
+                FROM generation_images gi
+                JOIN generation_requests gr ON gr.id = gi.request_id
+                WHERE gi.discord_channel_id = ? AND gi.discord_message_id = ?
+                ORDER BY gi.batch_index ASC, gi.id ASC
+                """,
+                (channel_id, message_id),
+            ).fetchall()
+        return [
+            FeedbackImageTarget(
+                image_id=int(row["id"]),
+                request_id=int(row["request_id"]),
+                request_user_id=int(row["request_user_id"]),
+                image_index=int(row["batch_index"]),
+                image_path=row["image_path"],
+                seed=row["seed"],
+                checkpoint_name=row["checkpoint_name"],
+                sampler_name=row["sampler_name"],
+                scheduler=row["scheduler"],
+                steps=row["steps"],
+                cfg=row["cfg"],
+                width=row["width"],
+                height=row["height"],
+                was_selected_by_ai=bool(row["was_selected_by_ai"]),
+            )
+            for row in rows
+        ]
+    except Exception:
+        logger.exception(
+            "Failed to read generation images for message: channel_id=%s message_id=%s", channel_id, message_id
+        )
+        return []
+
+
+def _image_feedback_record_from_row(row: sqlite3.Row) -> ImageFeedbackRecord:
+    try:
+        issue_categories = tuple(json.loads(row["issue_categories_json"] or "[]"))
+    except (TypeError, json.JSONDecodeError):
+        issue_categories = ()
+    try:
+        generation_snapshot = json.loads(row["generation_snapshot_json"] or "{}")
+    except (TypeError, json.JSONDecodeError):
+        generation_snapshot = {}
+    return ImageFeedbackRecord(
+        id=int(row["id"]),
+        image_id=int(row["image_id"]),
+        image_index=int(row["image_index"]),
+        image_path=row["image_path"],
+        user_id=int(row["user_id"]),
+        guild_id=row["guild_id"],
+        channel_id=row["channel_id"],
+        message_id=row["message_id"],
+        accepted=bool(row["accepted"]),
+        issue_categories=issue_categories,
+        comment=row["comment"],
+        generation_snapshot=generation_snapshot,
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+    )
+
+
+def upsert_image_feedback(
+    *,
+    image_id: int,
+    image_index: int,
+    image_path: str,
+    user_id: int,
+    guild_id: int | None,
+    channel_id: int | None,
+    message_id: int | None,
+    accepted: bool,
+    issue_categories: Sequence[str],
+    comment: str | None,
+    generation_snapshot_json: str,
+) -> bool:
+    """Records one user's feedback for one image, replacing that user's
+    previous feedback for the same image if there is one (full replace, not
+    a merge - matches upsert_image_rating's semantics). Returns True only
+    when stored.
+
+    Validation (never raises - an invalid call is rejected and logged, the
+    same way an unknown rating is rejected by upsert_image_rating):
+    - every entry in issue_categories must be one of ALLOWED_ISSUE_CATEGORIES
+    - accepted feedback and problem-category feedback are mutually
+      exclusive - "採用" clears any categories, and any categories supplied
+      together with accepted=True is rejected outright rather than silently
+      dropped, so a caller bug is visible instead of quietly losing data
+    - at least one of accepted / issue_categories must be given - a row with
+      neither would record nothing meaningful
+
+    created_at keeps the first-feedback timestamp; updated_at moves every
+    time, including when only the comment or snapshot changes.
+    """
+    categories = list(dict.fromkeys(issue_categories))  # de-dup, preserve order
+    unknown = [category for category in categories if category not in ALLOWED_ISSUE_CATEGORIES]
+    if unknown:
+        logger.warning("Rejected unknown issue_categories value(s): %r image_id=%s user_id=%s", unknown, image_id, user_id)
+        return False
+    if accepted and categories:
+        logger.warning(
+            "Rejected feedback with both accepted=True and issue_categories: image_id=%s user_id=%s categories=%r",
+            image_id, user_id, categories,
+        )
+        return False
+    if not accepted and not categories:
+        logger.warning("Rejected feedback with neither accepted nor any issue_categories: image_id=%s user_id=%s", image_id, user_id)
+        return False
+
+    try:
+        now = _now_text()
+        with _connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO image_generation_feedback (
+                    image_id, image_index, image_path, user_id, guild_id, channel_id, message_id,
+                    accepted, issue_categories_json, comment, generation_snapshot_json,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(image_id, user_id) DO UPDATE SET
+                    image_index = excluded.image_index,
+                    image_path = excluded.image_path,
+                    guild_id = excluded.guild_id,
+                    channel_id = excluded.channel_id,
+                    message_id = excluded.message_id,
+                    accepted = excluded.accepted,
+                    issue_categories_json = excluded.issue_categories_json,
+                    comment = excluded.comment,
+                    generation_snapshot_json = excluded.generation_snapshot_json,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    image_id,
+                    image_index,
+                    image_path,
+                    user_id,
+                    guild_id,
+                    channel_id,
+                    message_id,
+                    1 if accepted else 0,
+                    json.dumps(categories, ensure_ascii=False),
+                    comment,
+                    generation_snapshot_json,
+                    now,
+                    now,
+                ),
+            )
+        return True
+    except Exception:
+        logger.exception("Failed to save image feedback: image_id=%s user_id=%s", image_id, user_id)
+        return False
+
+
+def get_feedback_for_generation(image_id: int) -> list[ImageFeedbackRecord]:
+    """Read-only: every user's feedback for one generation_images row, most
+    recently updated first. Never raises: a DB error is logged and reported
+    as an empty list.
+    """
+    try:
+        with _connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM image_generation_feedback WHERE image_id = ? ORDER BY updated_at DESC",
+                (image_id,),
+            ).fetchall()
+        return [_image_feedback_record_from_row(row) for row in rows]
+    except Exception:
+        logger.exception("Failed to read image feedback: image_id=%s", image_id)
+        return []
+
+
+def get_feedback_by_user_and_image(image_id: int, user_id: int) -> ImageFeedbackRecord | None:
+    """Read-only: one user's feedback for one image, or None if they have
+    not left any (or on DB error - same "never raises" convention as
+    get_generation_image)."""
+    try:
+        with _connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM image_generation_feedback WHERE image_id = ? AND user_id = ?",
+                (image_id, user_id),
+            ).fetchone()
+        return None if row is None else _image_feedback_record_from_row(row)
+    except Exception:
+        logger.exception("Failed to read image feedback: image_id=%s user_id=%s", image_id, user_id)
+        return None
+
+
+# Defensive cap on one aggregation pass over image_generation_feedback,
+# mirroring REQUEST_TEXT_SCAN_ROW_LIMIT above - a personal-bot-sized history
+# is expected to stay far under this, but an unbounded SELECT * must never be
+# possible from a stats command.
+FEEDBACK_SCAN_ROW_LIMIT = 5000
+
+
+def list_all_feedback_rows(limit: int = FEEDBACK_SCAN_ROW_LIMIT) -> list[ImageFeedbackRecord]:
+    """Read-only: up to `limit` most recently updated image_generation_feedback
+    rows, across every user - used by get_character_feedback_summary and
+    get_common_failure_categories, which aggregate across everyone's
+    feedback rather than one user's own (a character's quality is not
+    specific to who happened to press the button).
+
+    Never raises: a DB error is logged and reported as an empty list, so an
+    aggregation feature can never crash the bot.
+    """
+    try:
+        with _connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM image_generation_feedback ORDER BY updated_at DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [_image_feedback_record_from_row(row) for row in rows]
+    except Exception:
+        logger.exception("Failed to read image feedback rows for aggregation.")
+        return []
+
+
+def list_feedback_for_user(user_id: int, limit: int = 10) -> list[ImageFeedbackRecord]:
+    """Read-only: this user's own most recently updated feedback rows, for
+    /image_feedback_history. Never raises: a DB error is logged and reported
+    as an empty list.
+    """
+    try:
+        with _connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM image_generation_feedback WHERE user_id = ? ORDER BY updated_at DESC LIMIT ?",
+                (user_id, limit),
+            ).fetchall()
+        return [_image_feedback_record_from_row(row) for row in rows]
+    except Exception:
+        logger.exception("Failed to read image feedback for user: user_id=%s", user_id)
+        return []
 
 
 def _resolve_request_model_key(connection: sqlite3.Connection, row: sqlite3.Row) -> str:

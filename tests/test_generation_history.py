@@ -555,7 +555,7 @@ class SchemaMigrationTestCase(GenerationHistoryTestCase):
             row = connection.execute(
                 "SELECT request_text, positive, model_key FROM generation_requests WHERE request_text = 'v2の依頼'"
             ).fetchone()
-        self.assertEqual(version, 4)
+        self.assertEqual(version, SCHEMA_VERSION)
         self.assertIn("model_key", columns)
         self.assertEqual(row["request_text"], "v2の依頼")
         self.assertEqual(row["positive"], "1girl")

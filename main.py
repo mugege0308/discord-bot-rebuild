@@ -17,6 +17,7 @@ from commands import claude
 from commands import claude_remote
 from commands import dev_task
 from commands import image_analyze
+from commands import image_feedback
 from commands import memory
 from commands import prompt
 from commands import voice
@@ -102,6 +103,8 @@ REQUIRED_SLASH_COMMANDS = {
     "image_memory_rate",
     "image_memory_use",
     "image_memory_delete",
+    "image_feedback_history",
+    "image_feedback_stats",
     "claude_start",
     "claude_status",
     "claude_remote_start",
@@ -215,6 +218,7 @@ claude_remote.setup(client)
 dev_task.setup(client)
 character_generate.setup(client)
 image_analyze.setup(client)
+image_feedback.setup(client)
 memory.setup(client)
 prompt.setup(client)
 voice.setup(client)
