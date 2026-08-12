@@ -126,12 +126,17 @@ STATS_NO_RATINGS_NOTE = "まだあなた自身の評価がありません。生�
 STATS_LOW_SAMPLE_NOTE = "まだ評価数が少ないため、傾向判断には不十分です。"
 STATS_TOP_TAG_LIMIT = 3
 STATS_FAILED_MESSAGE = "評価統計の集計に失敗しました。時間をおいてもう一度試してね。"
+LAST_REFERENCE_MISSING_MESSAGE = "再利用できる参考画像がありません。先にreference_imageを添付して生成してください。"
 
 # In-process only (not persisted, not restored after a bot restart): guards
 # against double-clicking a regenerate button while its background task is
 # still running. Keyed by the parent generation_requests.id being
 # regenerated from.
 _active_regenerations: set[int] = set()
+
+# In-process only: the most recently supplied /generate_ai reference image,
+# isolated by Discord user ID. It intentionally resets when the bot restarts.
+_last_reference_images: dict[int, tuple[bytes, str]] = {}
 
 
 async def _disable_view_message_safely(
@@ -1406,6 +1411,7 @@ def setup(client: discord.Client) -> None:
         reference_id="任意。全タグを使う画像参考メモID",
         reference_image="任意。同じキャラの顔・髪・雰囲気を参照する画像1枚。",
         reference_strength="参考画像の強さ（0.0～1.0）。未指定時は0.5です。",
+        use_last_reference="直前に使用した参考画像を再利用します。reference_image指定時はそちらを優先します。",
     )
     async def slash_generate_ai(
         interaction: discord.Interaction,
@@ -1414,6 +1420,7 @@ def setup(client: discord.Client) -> None:
         reference_id: int | None = None,
         reference_image: discord.Attachment | None = None,
         reference_strength: float | None = None,
+        use_last_reference: bool = False,
     ) -> None:
         await interaction.response.defer(ephemeral=True)
         if not is_pc_control_allowed(interaction.user.id):
@@ -1421,7 +1428,21 @@ def setup(client: discord.Client) -> None:
             await _send_error(interaction, SD_DENIED_MESSAGE, label="generate_ai.denied")
             return
 
-        if reference_image is not None and not is_comfy_backend():
+        cached_reference = (
+            _last_reference_images.get(interaction.user.id)
+            if reference_image is None and use_last_reference
+            else None
+        )
+        if reference_image is None and use_last_reference and cached_reference is None:
+            await _send_error(
+                interaction,
+                LAST_REFERENCE_MISSING_MESSAGE,
+                label="generate_ai.last_reference_missing",
+            )
+            return
+
+        reference_used = reference_image is not None or cached_reference is not None
+        if reference_used and not is_comfy_backend():
             await _send_error(
                 interaction,
                 "reference_imageを指定できるのはComfyUIバックエンドだけです。",
@@ -1431,14 +1452,13 @@ def setup(client: discord.Client) -> None:
 
         try:
             resolved_reference_strength = resolve_reference_strength(
-                reference_image is not None, reference_strength
+                reference_used, reference_strength
             )
         except ValueError as exc:
             await _send_error(interaction, str(exc), label="generate_ai.reference_strength_invalid")
             return
 
-        reference_image_bytes = None
-        reference_image_content_type = None
+        reference_image_bytes, reference_image_content_type = cached_reference or (None, None)
         if reference_image is not None:
             if reference_image.size > MAX_IMAGE_BYTES:
                 await _send_error(
@@ -1464,6 +1484,10 @@ def setup(client: discord.Client) -> None:
                     label="generate_ai.reference_image_read_failed",
                 )
                 return
+            _last_reference_images[interaction.user.id] = (
+                reference_image_bytes,
+                reference_image_content_type,
+            )
 
         try:
             profile = get_image_generation_profile(model.value if model is not None else None)

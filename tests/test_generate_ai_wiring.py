@@ -35,7 +35,15 @@ class GenerateAiWiringTestCase(unittest.TestCase):
 
         self.assertEqual(
             arg_names,
-            ["interaction", "request", "model", "reference_id", "reference_image", "reference_strength"],
+            [
+                "interaction",
+                "request",
+                "model",
+                "reference_id",
+                "reference_image",
+                "reference_strength",
+                "use_last_reference",
+            ],
         )
 
     def test_generate_ai_forwards_reference_image_data_and_strength(self):
