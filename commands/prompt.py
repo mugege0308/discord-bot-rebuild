@@ -23,10 +23,12 @@ from services.generation_history import (
     upsert_image_rating,
 )
 from services.image_selection import (
+    ImageSelectionResult,
     get_selection_generate_count,
     is_image_selection_available,
     select_generated_images,
 )
+from services.image_analyzer import MAX_IMAGE_BYTES, detect_image_content_type, validate_image_bytes
 from services.image_generation_profiles import (
     DEFAULT_IMAGE_GENERATION_MODEL_KEY,
     get_image_generation_profile,
@@ -39,7 +41,9 @@ from services.sd_control import (
     generate_images,
     generate_images_with_metadata,
     get_negative_prompt,
+    get_reference_status_text,
     is_comfy_backend,
+    resolve_reference_strength,
 )
 from services.shogou_prompt_designer import (
     ShogouPromptResult,
@@ -529,9 +533,14 @@ def _build_generation_options(
     model_key: str | None = None,
     filename_prefix: str | None = None,
     model_selection_explicit: bool = False,
+    reference_image_bytes: bytes | None = None,
+    reference_image_content_type: str | None = None,
+    reference_strength: float | None = None,
 ) -> SdGenerationOptions:
     selection_available = is_image_selection_available()
-    count = get_selection_generate_count() if selection_available else 1
+    count = 1 if reference_image_bytes is not None else (
+        get_selection_generate_count() if selection_available else 1
+    )
     logger.info(
         "Prompt image generation count decided: count=%s selection_available=%s",
         count,
@@ -551,6 +560,9 @@ def _build_generation_options(
         cfg=7.0,
         sampler="Euler a",
         seed=-1,
+        reference_image_bytes=reference_image_bytes,
+        reference_image_content_type=reference_image_content_type,
+        reference_strength=reference_strength,
     )
 
 
@@ -610,12 +622,16 @@ def _build_shogou_generated_image_message(
     generated_count: int,
     *,
     model_key: str = DEFAULT_IMAGE_GENERATION_MODEL_KEY,
+    reference_used: bool = False,
+    reference_strength: float | None = None,
 ) -> str:
     profile = get_image_generation_profile(model_key)
     selection_text = _selection_message(selection, send_count, generated_count)
+    reference_text = get_reference_status_text(reference_used, reference_strength)
     message = (
         f"{selection_text}\n\n"
         f"Model: {profile.display_name}\n\n"
+        f"{reference_text}\n\n"
         "Summary:\n"
         f"{_truncate_prompt(result.summary, limit=SHOGOU_SUMMARY_LIMIT)}\n\n"
         "Assumptions:\n"
@@ -780,6 +796,9 @@ async def _generate_images_from_shogou_result(
     custom_instruction: str | None = None,
     model_key: str = DEFAULT_IMAGE_GENERATION_MODEL_KEY,
     model_selection_explicit: bool = False,
+    reference_image_bytes: bytes | None = None,
+    reference_image_content_type: str | None = None,
+    reference_strength: float | None = None,
 ) -> None:
     # Mirrors _generate_images_from_prompts' preserve_prompt_text=True path exactly,
     # but keeps its own message builder so /generate_raw's behavior stays untouched.
@@ -791,6 +810,9 @@ async def _generate_images_from_shogou_result(
         model_key=profile.model_key,
         filename_prefix=profile.filename_prefix,
         model_selection_explicit=model_selection_explicit,
+        reference_image_bytes=reference_image_bytes,
+        reference_image_content_type=reference_image_content_type,
+        reference_strength=reference_strength,
     )
     try:
         generated_images = await asyncio.to_thread(generate_images_with_metadata, options)
@@ -805,7 +827,10 @@ async def _generate_images_from_shogou_result(
         return
 
     paths = [image.path for image in generated_images]
-    selection = await asyncio.to_thread(select_generated_images, paths)
+    if reference_image_bytes is not None and len(paths) == 1:
+        selection = ImageSelectionResult(selected_paths=[], used_selection=False)
+    else:
+        selection = await asyncio.to_thread(select_generated_images, paths)
     send_paths = selection.selected_paths or paths
     message = _build_shogou_generated_image_message(
         result,
@@ -813,6 +838,8 @@ async def _generate_images_from_shogou_result(
         len(send_paths),
         len(paths),
         model_key=profile.model_key,
+        reference_used=reference_image_bytes is not None,
+        reference_strength=reference_strength,
     )
 
     saved = await _save_generation_history_safely(
@@ -1377,18 +1404,66 @@ def setup(client: discord.Client) -> None:
         request="作りたい画像の日本語要望。",
         model="画像生成モデル。未指定時はAnimagine XL 4.0 Clearを使います。",
         reference_id="任意。全タグを使う画像参考メモID",
+        reference_image="任意。同じキャラの顔・髪・雰囲気を参照する画像1枚。",
+        reference_strength="参考画像の強さ（0.0～1.0）。未指定時は0.5です。",
     )
     async def slash_generate_ai(
         interaction: discord.Interaction,
         request: str,
         model: app_commands.Choice[str] | None = None,
         reference_id: int | None = None,
+        reference_image: discord.Attachment | None = None,
+        reference_strength: float | None = None,
     ) -> None:
         await interaction.response.defer(ephemeral=True)
         if not is_pc_control_allowed(interaction.user.id):
             logger.warning("Denied /generate_ai by user_id=%s", interaction.user.id)
             await _send_error(interaction, SD_DENIED_MESSAGE, label="generate_ai.denied")
             return
+
+        if reference_image is not None and not is_comfy_backend():
+            await _send_error(
+                interaction,
+                "reference_imageを指定できるのはComfyUIバックエンドだけです。",
+                label="generate_ai.reference_backend_unsupported",
+            )
+            return
+
+        try:
+            resolved_reference_strength = resolve_reference_strength(
+                reference_image is not None, reference_strength
+            )
+        except ValueError as exc:
+            await _send_error(interaction, str(exc), label="generate_ai.reference_strength_invalid")
+            return
+
+        reference_image_bytes = None
+        reference_image_content_type = None
+        if reference_image is not None:
+            if reference_image.size > MAX_IMAGE_BYTES:
+                await _send_error(
+                    interaction,
+                    "参考画像は8MB以内のJPEG / PNG / WebPを指定してください。",
+                    label="generate_ai.reference_image_too_large",
+                )
+                return
+            try:
+                reference_image_bytes = await reference_image.read()
+                reference_image_content_type = detect_image_content_type(
+                    reference_image_bytes, reference_image.content_type
+                )
+                validate_image_bytes(reference_image_bytes, reference_image_content_type)
+            except PromptGeneratorError as exc:
+                await _send_error(interaction, str(exc), label="generate_ai.reference_image_invalid")
+                return
+            except Exception:
+                logger.exception("Failed to read /generate_ai reference image.")
+                await _send_error(
+                    interaction,
+                    "参考画像を読み込めませんでした。もう一度添付して試してください。",
+                    label="generate_ai.reference_image_read_failed",
+                )
+                return
 
         try:
             profile = get_image_generation_profile(model.value if model is not None else None)
@@ -1431,6 +1506,9 @@ def setup(client: discord.Client) -> None:
             reference_id=reference_id,
             model_key=profile.model_key,
             model_selection_explicit=model is not None,
+            reference_image_bytes=reference_image_bytes,
+            reference_image_content_type=reference_image_content_type,
+            reference_strength=resolved_reference_strength,
         )
 
     @client.tree.command(

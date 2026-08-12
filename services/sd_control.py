@@ -33,6 +33,13 @@ DEFAULT_NEGATIVE_PROMPT = (
     "bad hands, blurry, jpeg artifacts, watermark, text, logo"
 )
 DEFAULT_COMFY_WORKFLOW_FILE = Path("workflows") / "comfy_workflow.json"
+REFERENCE_COMFY_WORKFLOW_FILE = Path("workflows") / "comfy_workflow_ipadapter.json"
+DEFAULT_REFERENCE_STRENGTH = 0.5
+REFERENCE_IMAGE_EXTENSIONS = {
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/webp": ".webp",
+}
 COMFY_CHECKPOINTS = {
     "janku": "JANKUTrainedChenkinNoobai_v777.safetensors",
     "animagine": "animagineXL40Opt_clear.safetensors",
@@ -62,6 +69,9 @@ class SdGenerationOptions:
     cfg: float = 7.0
     sampler: str = "Euler a"
     seed: int = -1
+    reference_image_bytes: bytes | None = None
+    reference_image_content_type: str | None = None
+    reference_strength: float | None = None
 
 
 @dataclass(frozen=True)
@@ -178,6 +188,27 @@ def get_negative_prompt(value: str | None) -> str:
     return os.getenv("SD_DEFAULT_NEGATIVE_PROMPT", DEFAULT_NEGATIVE_PROMPT).strip() or DEFAULT_NEGATIVE_PROMPT
 
 
+def resolve_reference_strength(reference_used: bool, strength: float | None) -> float | None:
+    if not reference_used:
+        if strength is not None:
+            raise ValueError("reference_strengthを指定するにはreference_imageを添付してください。")
+        return None
+    resolved = DEFAULT_REFERENCE_STRENGTH if strength is None else strength
+    if isinstance(resolved, bool) or not isinstance(resolved, (int, float)):
+        raise ValueError("reference_strengthは0.0～1.0の数値で指定してください。")
+    resolved = float(resolved)
+    if not 0.0 <= resolved <= 1.0:
+        raise ValueError("reference_strengthは0.0～1.0の範囲で指定してください。")
+    return resolved
+
+
+def get_reference_status_text(reference_used: bool, strength: float | None) -> str:
+    resolved = resolve_reference_strength(reference_used, strength)
+    if resolved is None:
+        return "Reference image: Not used"
+    return f"Reference image: Used\nReference strength: {resolved:g}"
+
+
 def validate_options(options: SdGenerationOptions) -> SdGenerationOptions:
     max_count = _max_int("SD_MAX_COUNT", 10)
     max_width = _max_int("SD_MAX_WIDTH", 1024)
@@ -194,6 +225,16 @@ def validate_options(options: SdGenerationOptions) -> SdGenerationOptions:
     else:
         negative_prompt = get_negative_prompt(options.negative_prompt)
 
+    reference_used = options.reference_image_bytes is not None
+    reference_strength = resolve_reference_strength(reference_used, options.reference_strength)
+    reference_content_type = None
+    if reference_used:
+        if not isinstance(options.reference_image_bytes, bytes) or not options.reference_image_bytes:
+            raise ValueError("reference_imageの画像データが空です。")
+        reference_content_type = (options.reference_image_content_type or "").split(";", 1)[0].strip().lower()
+        if reference_content_type not in REFERENCE_IMAGE_EXTENSIONS:
+            raise ValueError("reference_imageはJPEG / PNG / WebPを指定してください。")
+
     return SdGenerationOptions(
         prompt=prompt,
         negative_prompt=negative_prompt,
@@ -208,6 +249,9 @@ def validate_options(options: SdGenerationOptions) -> SdGenerationOptions:
         cfg=_clamp_float(options.cfg, 1.0, max_cfg),
         sampler=options.sampler.strip() or "Euler a",
         seed=options.seed if options.seed is not None else -1,
+        reference_image_bytes=options.reference_image_bytes,
+        reference_image_content_type=reference_content_type,
+        reference_strength=reference_strength,
     )
 
 
@@ -359,7 +403,9 @@ def _decode_and_save_webui_images(images: list[Any]) -> list[Path]:
     return paths
 
 
-def _get_comfy_workflow_file() -> Path:
+def _get_comfy_workflow_file(reference_enabled: bool = False) -> Path:
+    if reference_enabled:
+        return REFERENCE_COMFY_WORKFLOW_FILE
     raw_value = os.getenv("COMFY_WORKFLOW_FILE", "").strip().strip('"')
     return Path(raw_value) if raw_value else DEFAULT_COMFY_WORKFLOW_FILE
 
@@ -368,8 +414,8 @@ def _get_node_id(name: str) -> str:
     return os.getenv(name, "").strip()
 
 
-def _load_comfy_workflow() -> dict[str, Any]:
-    workflow_file = _get_comfy_workflow_file()
+def _load_comfy_workflow(reference_enabled: bool = False) -> dict[str, Any]:
+    workflow_file = _get_comfy_workflow_file(reference_enabled)
     if not workflow_file.exists() or not workflow_file.is_file():
         raise RuntimeError(f"ComfyUI workflow file が見つからないよ: {workflow_file}")
 
@@ -661,7 +707,7 @@ def _find_checkpoint_loader_node_id(workflow: dict[str, Any]) -> str:
 
 
 def _apply_comfy_options(
-    workflow: dict[str, Any], options: SdGenerationOptions
+    workflow: dict[str, Any], options: SdGenerationOptions, reference_image_name: str | None = None
 ) -> tuple[dict[str, Any], str | None, str | None]:
     checkpoint_name = None
     checkpoint_node_id = None
@@ -698,6 +744,24 @@ def _apply_comfy_options(
     _set_node_input(workflow, positive_node_id, "text", options.prompt)
     _set_node_input(workflow, negative_node_id, "text", options.negative_prompt or "")
 
+    if options.reference_image_bytes is not None:
+        load_image_nodes = [
+            str(node_id)
+            for node_id, node in workflow.items()
+            if isinstance(node, dict) and str(node.get("class_type", "")) == "LoadImage"
+        ]
+        adapter_nodes = [
+            str(node_id)
+            for node_id, node in workflow.items()
+            if isinstance(node, dict) and str(node.get("class_type", "")) == "IPAdapterAdvanced"
+        ]
+        if len(load_image_nodes) != 1 or len(adapter_nodes) != 1:
+            raise RuntimeError("参考画像workflowにはLoadImageとIPAdapterAdvancedが各1個必要です。")
+        if not reference_image_name:
+            raise RuntimeError("ComfyUIへアップロードした参考画像名がありません。")
+        _set_node_input(workflow, load_image_nodes[0], "image", reference_image_name)
+        _set_node_input(workflow, adapter_nodes[0], "weight", options.reference_strength)
+
     env_seed_node_id = _get_node_id("COMFY_SEED_NODE_ID")
     seed_node_id, seed_key = _find_seed_input(workflow)
     if env_seed_node_id:
@@ -728,6 +792,27 @@ def _queue_comfy_prompt(workflow: dict[str, Any], client_id: str) -> str:
     if not isinstance(prompt_id, str) or not prompt_id:
         raise RuntimeError("ComfyUI APIから prompt_id が返らなかったよ。")
     return prompt_id
+
+
+def _upload_comfy_reference_image(image_bytes: bytes, content_type: str) -> str:
+    extension = REFERENCE_IMAGE_EXTENSIONS[content_type]
+    filename = f"discord_reference_{hashlib.sha256(image_bytes).hexdigest()[:20]}{extension}"
+    try:
+        response = requests.post(
+            _api_url("/upload/image"),
+            files={"image": (filename, image_bytes, content_type)},
+            data={"type": "input", "overwrite": "true"},
+            timeout=30,
+        )
+        response.raise_for_status()
+        data = response.json()
+    except (requests.RequestException, ValueError) as exc:
+        logger.exception("Failed to upload reference image to ComfyUI.")
+        raise RuntimeError("参考画像をComfyUIへアップロードできませんでした。") from exc
+    uploaded_name = data.get("name")
+    if not isinstance(uploaded_name, str) or not uploaded_name:
+        raise RuntimeError("ComfyUIの参考画像アップロード結果にファイル名がありません。")
+    return uploaded_name
 
 
 def _short_error_text(text: str) -> str:
@@ -860,14 +945,24 @@ def _generate_webui_images(options: SdGenerationOptions) -> list[Path]:
 
 
 def _generate_comfy_images_with_metadata(options: SdGenerationOptions) -> list[GeneratedImage]:
-    workflow_file = _get_comfy_workflow_file()
+    reference_enabled = options.reference_image_bytes is not None
+    workflow_file = _get_comfy_workflow_file(reference_enabled)
     workflow_file_text = str(workflow_file)
     workflow_hash = _safe_workflow_file_hash(workflow_file)
+
+    reference_image_name = None
+    if reference_enabled:
+        reference_image_name = _upload_comfy_reference_image(
+            options.reference_image_bytes or b"",
+            options.reference_image_content_type or "image/png",
+        )
 
     images: list[GeneratedImage] = []
     client_id = str(uuid.uuid4())
     for batch_index in range(1, options.count + 1):
-        workflow, seed_node_id, seed_key = _apply_comfy_options(_load_comfy_workflow(), options)
+        workflow, seed_node_id, seed_key = _apply_comfy_options(
+            _load_comfy_workflow(reference_enabled), options, reference_image_name
+        )
 
         seed_value: int | None = None
         if seed_node_id and seed_key:
@@ -941,6 +1036,8 @@ def generate_images_with_metadata(options: SdGenerationOptions) -> list[Generate
         backend = _backend()
         if backend != "comfy" and safe_options.model_key is not None and safe_options.model_selection_explicit:
             raise RuntimeError("モデルを明示選択できるのはComfyUIバックエンドだけです。SD_BACKEND=comfyを指定してください。")
+        if backend != "comfy" and safe_options.reference_image_bytes is not None:
+            raise RuntimeError("reference_imageを指定できるのはComfyUIバックエンドだけです。SD_BACKEND=comfyを指定してください。")
         if backend == "comfy":
             images = _generate_comfy_images_with_metadata(safe_options)
         elif backend == "webui":

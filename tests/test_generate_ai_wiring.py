@@ -33,7 +33,19 @@ class GenerateAiWiringTestCase(unittest.TestCase):
         function = _find_function(self.tree, "slash_generate_ai")
         arg_names = [arg.arg for arg in function.args.args]
 
-        self.assertEqual(arg_names, ["interaction", "request", "model", "reference_id"])
+        self.assertEqual(
+            arg_names,
+            ["interaction", "request", "model", "reference_id", "reference_image", "reference_strength"],
+        )
+
+    def test_generate_ai_forwards_reference_image_data_and_strength(self):
+        function = _find_function(self.tree, "slash_generate_ai")
+        call = _find_calls(function, "_generate_images_from_shogou_result")[0]
+        keyword_names = {keyword.arg for keyword in call.keywords}
+
+        self.assertIn("reference_image_bytes", keyword_names)
+        self.assertIn("reference_image_content_type", keyword_names)
+        self.assertIn("reference_strength", keyword_names)
 
     def test_generate_ai_model_choices_are_exactly_animagine_and_janku(self):
         self.assertEqual(

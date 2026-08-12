@@ -1,0 +1,84 @@
+{
+  "4": {
+    "inputs": {"ckpt_name": "animagineXL40Opt_clear.safetensors"},
+    "class_type": "CheckpointLoaderSimple",
+    "_meta": {"title": "Load Checkpoint"}
+  },
+  "5": {
+    "inputs": {"width": 1024, "height": 1024, "batch_size": 1},
+    "class_type": "EmptyLatentImage",
+    "_meta": {"title": "Empty Latent Image"}
+  },
+  "6": {
+    "inputs": {"text": "1girl", "clip": ["4", 1]},
+    "class_type": "CLIPTextEncode",
+    "_meta": {"title": "Positive Prompt"}
+  },
+  "7": {
+    "inputs": {"text": "low quality", "clip": ["4", 1]},
+    "class_type": "CLIPTextEncode",
+    "_meta": {"title": "Negative Prompt"}
+  },
+  "10": {
+    "inputs": {
+      "seed": 0,
+      "steps": 20,
+      "cfg": 5.0,
+      "sampler_name": "euler_ancestral",
+      "scheduler": "normal",
+      "denoise": 1,
+      "model": ["24", 0],
+      "positive": ["6", 0],
+      "negative": ["7", 0],
+      "latent_image": ["5", 0]
+    },
+    "class_type": "KSampler",
+    "_meta": {"title": "KSampler with IP-Adapter"}
+  },
+  "17": {
+    "inputs": {"samples": ["10", 0], "vae": ["4", 2]},
+    "class_type": "VAEDecode",
+    "_meta": {"title": "VAE Decode"}
+  },
+  "19": {
+    "inputs": {"filename_prefix": "Shogou_Reference", "images": ["17", 0]},
+    "class_type": "SaveImage",
+    "_meta": {"title": "Save Image"}
+  },
+  "21": {
+    "inputs": {"image": "example.png"},
+    "class_type": "LoadImage",
+    "_meta": {"title": "Reference Image"}
+  },
+  "22": {
+    "inputs": {
+      "image": ["21", 0],
+      "upscale_method": "lanczos",
+      "width": 1024,
+      "height": 1024,
+      "crop": "center"
+    },
+    "class_type": "ImageScale",
+    "_meta": {"title": "Reference Resize"}
+  },
+  "23": {
+    "inputs": {"model": ["4", 0], "preset": "PLUS (high strength)"},
+    "class_type": "IPAdapterUnifiedLoader",
+    "_meta": {"title": "IPAdapter Unified Loader"}
+  },
+  "24": {
+    "inputs": {
+      "model": ["23", 0],
+      "ipadapter": ["23", 1],
+      "image": ["22", 0],
+      "weight": 0.5,
+      "weight_type": "linear",
+      "combine_embeds": "concat",
+      "start_at": 0.0,
+      "end_at": 0.8,
+      "embeds_scaling": "V only"
+    },
+    "class_type": "IPAdapterAdvanced",
+    "_meta": {"title": "IPAdapter Character Reference"}
+  }
+}
