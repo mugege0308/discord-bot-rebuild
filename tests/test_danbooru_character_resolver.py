@@ -10,11 +10,16 @@ from services.character_appearance_filter import (
     filter_unrequested_character_appearance,
 )
 from services.danbooru_character_resolver import (
+    _build_character_span_attempts,
+    _has_character_tail_boundary,
     apply_danbooru_character_resolution,
     DanbooruCharacterResolution,
     apply_danbooru_character_resolution,
     extract_character_context_aliases,
+    extract_work_character_context,
     extract_possible_character_names,
+    lookup_copyright_aliases,
+    lookup_copyright_query_hints,
     resolve_danbooru_character_tags,
     should_search_character_tags,
 )
@@ -49,6 +54,8 @@ class DanbooruCharacterResolverTestCase(unittest.TestCase):
                 {"id": 6, "name": "kochiya_sanae", "category": 4, "post_count": 36072},
                 {"id": 7, "name": "koei_takeru", "category": 4, "post_count": 4},
                 {"id": 8, "name": "touhou", "category": 3, "post_count": 911841},
+                {"id": 9, "name": "asta_(honkai_star_rail)", "category": 4, "post_count": 8200},
+                {"id": 10, "name": "honkai_star_rail", "category": 3, "post_count": 120000},
             ],
             [
                 {
@@ -277,6 +284,195 @@ class DanbooruCharacterResolverTestCase(unittest.TestCase):
         self.assertIn(
             "東方",
             extract_character_context_aliases("東方の東風谷早苗", "東風谷早苗"),
+        )
+
+    def test_work_of_character_is_split_before_character_search(self):
+        context = extract_work_character_context("崩壊スターレイルのアスター")
+        self.assertEqual(context.work_name, "崩壊スターレイル")
+        self.assertEqual(context.character_name, "アスター")
+        self.assertEqual(
+            extract_possible_character_names("崩壊スターレイルのアスター"),
+            ("アスター",),
+        )
+        self.assertNotIn("崩壊スターレイル", extract_possible_character_names("崩壊スターレイルのアスター"))
+
+    def test_copyright_aliases_are_query_only_until_character_confirmation(self):
+        self.assertIn("honkai star rail", lookup_copyright_query_hints("崩壊：スターレイル"))
+        self.assertIn("スタレ", lookup_copyright_aliases("崩壊スターレイル"))
+        self.assertFalse(should_search_character_tags("崩壊スターレイル", db_path=self.db_path))
+
+    def test_work_context_filters_character_candidates_and_keeps_trace(self):
+        def planner(_system, user, _response_format, _max_tokens):
+            payload = json.loads(user)
+            self.assertEqual(payload["input"], "アスター")
+            self.assertEqual(payload["candidate_names"], ["アスター"])
+            self.assertIn("崩壊スターレイル", payload["extracted_work_name"])
+            return json.dumps(
+                {
+                    "characters": [
+                        {
+                            "input_name": "アスター",
+                            "queries": ["asta"],
+                            "work_queries": ["honkai star rail"],
+                        }
+                    ],
+                    "unresolved": [],
+                },
+                ensure_ascii=False,
+            )
+
+        result = resolve_danbooru_character_tags(
+            "崩壊スターレイルのアスター",
+            store=self.store,
+            llm_json=planner,
+        )
+
+        self.assertEqual(result.extracted_work_name, "崩壊スターレイル")
+        self.assertEqual(result.extracted_character_name, "アスター")
+        self.assertTrue(result.work_alias_hit)
+        self.assertEqual(result.selected_character_tag, "asta_(honkai_star_rail)")
+        self.assertEqual(result.selected_copyright_tag, "honkai_star_rail")
+        self.assertTrue(result.confirmation_required)
+        self.assertEqual(
+            {candidate.name for candidate in result.candidate_character_tags},
+            {"asta_(honkai_star_rail)"},
+        )
+        trace = result.to_trace_dict()
+        self.assertEqual(trace["extracted_work_name"], "崩壊スターレイル")
+        self.assertEqual(trace["extracted_character_name"], "アスター")
+        self.assertTrue(trace["copyright_candidates"])
+
+    def test_wrong_llm_spelling_uses_copyright_scoped_romanized_fallback(self):
+        def planner(_system, _user, _response_format, _max_tokens):
+            # Reproduce the production miss: the model hears アスター as an
+            # English-looking ``aster`` family and never emits ``asta``.
+            return json.dumps(
+                {
+                    "characters": [
+                        {
+                            "input_name": "アスター",
+                            "queries": ["aster", "asterra", "asterran", "astera"],
+                            "work_queries": ["honkai star rail"],
+                        }
+                    ],
+                    "unresolved": [],
+                },
+                ensure_ascii=False,
+            )
+
+        result = resolve_danbooru_character_tags(
+            "崩壊スターレイルのアスター 後ろで手を組んで前かがみ",
+            store=self.store,
+            llm_json=planner,
+        )
+
+        self.assertEqual(result.input_character_name, "アスター")
+        self.assertEqual(result.remaining_prompt_text, "後ろで手を組んで前かがみ")
+        self.assertEqual(result.deterministic_romanization, "asutaa")
+        self.assertTrue(result.fallback_used)
+        self.assertGreaterEqual(result.copyright_scoped_candidate_count, 1)
+        self.assertEqual(result.selected_character_tag, "asta_(honkai_star_rail)")
+        self.assertTrue(result.confirmation_required)
+        self.assertTrue(result.fuzzy_candidate_scores)
+        self.assertEqual(
+            result.to_trace_dict()["llm_character_queries"],
+            ["aster", "asterra", "asterran", "astera"],
+        )
+
+    def test_action_text_after_character_is_remaining_prompt(self):
+        def planner(_system, user, _response_format, _max_tokens):
+            payload = json.loads(user)
+            self.assertEqual(payload["candidate_names"], ["アスター"])
+            return json.dumps(
+                {
+                    "characters": [
+                        {
+                            "input_name": "アスター",
+                            "queries": ["asta"],
+                            "work_queries": ["honkai star rail"],
+                        }
+                    ],
+                    "unresolved": [],
+                },
+                ensure_ascii=False,
+            )
+
+        result = resolve_danbooru_character_tags(
+            "崩壊スターレイルのアスター 後ろで手を組んで前かがみ",
+            store=self.store,
+            llm_json=planner,
+        )
+
+        self.assertEqual(result.extracted_work_name, "崩壊スターレイル")
+        self.assertEqual(result.raw_character_span, "アスター 後ろで手を組んで前かがみ")
+        self.assertEqual(result.extracted_character_name, "アスター")
+        self.assertEqual(result.input_character_name, "アスター")
+        self.assertEqual(result.remaining_prompt_text, "後ろで手を組んで前かがみ")
+        self.assertEqual(result.selected_character_tag, "asta_(honkai_star_rail)")
+        self.assertEqual(result.character_candidate_attempts[-1]["status"], "matched")
+        self.assertEqual(
+            result.character_candidate_attempts[0]["status"],
+            "syntax_action_tail",
+        )
+
+    def test_particles_and_compound_character_names_keep_the_correct_span(self):
+        cases = (
+            ("崩壊スターレイルのアスターが笑っている", "アスター", "笑っている"),
+            ("崩壊スターレイルのアスターを下から見る", "アスター", "下から見る"),
+            ("東方Projectのアリス・マーガトロイドが座っている", "アリス・マーガトロイド", "座っている"),
+            ("東方Projectの東風谷早苗 振り返って笑う", "東風谷早苗", "振り返って笑う"),
+            ("崩壊スターレイルのMarch 7thが笑っている", "March 7th", "笑っている"),
+            ("崩壊スターレイルのSilver Wolfが座っている", "Silver Wolf", "座っている"),
+        )
+        for text, expected_name, expected_remaining in cases:
+            with self.subTest(text=text):
+                context = extract_work_character_context(text)
+                self.assertEqual(context.work_name, text.split("の", 1)[0])
+                self.assertEqual(extract_possible_character_names(text), (expected_name,))
+                attempts = _build_character_span_attempts(context)
+                usable = [
+                    (name, remaining)
+                    for name, remaining in attempts
+                    if not _has_character_tail_boundary(name)
+                ]
+                self.assertEqual(usable[0], (expected_name, expected_remaining))
+
+    def test_work_only_and_ordinary_scene_do_not_trigger_character_search(self):
+        self.assertFalse(should_search_character_tags("崩壊スターレイル", db_path=self.db_path))
+        self.assertFalse(should_search_character_tags("教室の女の子が笑っている", db_path=self.db_path))
+        self.assertEqual(extract_possible_character_names("教室の女の子が笑っている"), ())
+
+    def test_explicit_work_context_is_saved_for_short_alias_reuse(self):
+        result = resolve_danbooru_character_tags(
+            "崩壊スターレイルのアスター",
+            store=self.store,
+            llm_json=lambda *_args: json.dumps(
+                {
+                    "characters": [
+                        {
+                            "input_name": "アスター",
+                            "queries": ["asta"],
+                            "work_queries": ["honkai star rail"],
+                        }
+                    ],
+                    "unresolved": [],
+                },
+                ensure_ascii=False,
+            ),
+        )
+        self.assertIn("崩壊スターレイル", result.context_aliases)
+        self.assertIn("スタレ", result.context_aliases)
+        registry = VerifiedCharacterRegistry(Path(self.tempdir.name) / "registry.sqlite3")
+        registry.register_verified_candidate(
+            result.candidate_character_tags[0],
+            input_alias="アスター",
+            copyright_tag=result.selected_copyright_tag,
+            context_aliases=result.context_aliases,
+            store=self.store,
+        )
+        self.assertEqual(
+            registry.lookup("スタレのアスター")[0].character.canonical_danbooru_tag,
+            "asta_(honkai_star_rail)",
         )
 
     def test_generate_ai_path_inserts_only_db_character_tag(self):

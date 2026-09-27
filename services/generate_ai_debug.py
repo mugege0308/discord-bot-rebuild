@@ -50,6 +50,15 @@ class GenerateAiStageDetail:
     character_name: str | None = None
     added_tags: tuple[str, ...] = ()
     appearance_removed_tags: tuple[str, ...] = ()
+    raw_llm_positive: str | None = None
+    raw_summary: str | None = None
+    final_summary: str | None = None
+    raw_assumptions: tuple[str, ...] = ()
+    final_assumptions: tuple[str, ...] = ()
+    semantic_grounding_result: tuple[str, ...] = ()
+    user_grounded_tags: tuple[str, ...] = ()
+    removed_unrequested_semantic_tags: tuple[str, ...] = ()
+    pose_normalizations: tuple[str, ...] = ()
     cleanup_removed_tags: tuple[str, ...] = ()
 
 
@@ -359,6 +368,15 @@ def store_generate_ai_stage_detail(
     character_name: str | None = None,
     added_tags: tuple[str, ...] | list[str] = (),
     appearance_removed_tags: tuple[str, ...] | list[str] = (),
+    raw_llm_positive: str | None = None,
+    raw_summary: str | None = None,
+    final_summary: str | None = None,
+    raw_assumptions: tuple[str, ...] | list[str] = (),
+    final_assumptions: tuple[str, ...] | list[str] = (),
+    semantic_grounding_result: tuple[str, ...] | list[str] = (),
+    user_grounded_tags: tuple[str, ...] | list[str] = (),
+    removed_unrequested_semantic_tags: tuple[str, ...] | list[str] = (),
+    pose_normalizations: tuple[str, ...] | list[str] = (),
     cleanup_removed_tags: tuple[str, ...] | list[str] = (),
 ) -> None:
     """Stores only bounded parsed prompt fields needed by the Discord detail view."""
@@ -379,6 +397,12 @@ def store_generate_ai_stage_detail(
         for tag in cleanup_removed_tags
         if isinstance(tag, str) and tag.strip()
     )
+    def clean_values(values: tuple[str, ...] | list[str]) -> tuple[str, ...]:
+        return tuple(
+            tag.strip()[:500]
+            for tag in values
+            if isinstance(tag, str) and tag.strip()
+        )
     detail = GenerateAiStageDetail(
         positive=_bounded_detail_text(positive),
         negative=_bounded_detail_text(negative),
@@ -386,6 +410,15 @@ def store_generate_ai_stage_detail(
         character_name=character_name.strip() if character_name else None,
         added_tags=clean_added,
         appearance_removed_tags=clean_appearance_removed,
+        raw_llm_positive=_bounded_detail_text(raw_llm_positive),
+        raw_summary=_bounded_detail_text(raw_summary),
+        final_summary=_bounded_detail_text(final_summary),
+        raw_assumptions=clean_values(raw_assumptions),
+        final_assumptions=clean_values(final_assumptions),
+        semantic_grounding_result=clean_values(semantic_grounding_result),
+        user_grounded_tags=clean_values(user_grounded_tags),
+        removed_unrequested_semantic_tags=clean_values(removed_unrequested_semantic_tags),
+        pose_normalizations=clean_values(pose_normalizations),
         cleanup_removed_tags=clean_cleanup_removed,
     )
     with _lock:
@@ -685,6 +718,24 @@ def _detail_stage_fields(detail: GenerateAiStageDetail, stage: str) -> list[tupl
         fields.append(("Rating", detail.rating))
     if stage == "06_rating" and detail.appearance_removed_tags:
         fields.append(("Appearance removed", ", ".join(detail.appearance_removed_tags)))
+    if stage == "06_rating" and detail.raw_llm_positive:
+        fields.append(("Raw LLM Positive", detail.raw_llm_positive))
+    if stage == "06_rating" and detail.raw_summary:
+        fields.append(("Raw Summary", detail.raw_summary))
+    if stage == "06_rating" and detail.final_summary:
+        fields.append(("Final Summary", detail.final_summary))
+    if stage == "06_rating" and detail.raw_assumptions:
+        fields.append(("Raw Assumptions", ", ".join(detail.raw_assumptions)))
+    if stage == "06_rating" and detail.final_assumptions:
+        fields.append(("Final Assumptions", ", ".join(detail.final_assumptions)))
+    if stage == "06_rating" and detail.semantic_grounding_result:
+        fields.append(("Semantic grounding", " | ".join(detail.semantic_grounding_result)))
+    if stage == "06_rating" and detail.user_grounded_tags:
+        fields.append(("User-grounded tags", ", ".join(detail.user_grounded_tags)))
+    if stage == "06_rating" and detail.removed_unrequested_semantic_tags:
+        fields.append(("Unrequested semantic removed", ", ".join(detail.removed_unrequested_semantic_tags)))
+    if stage == "06_rating" and detail.pose_normalizations:
+        fields.append(("Pose normalizations", " | ".join(detail.pose_normalizations)))
     if stage == "06_rating" and detail.cleanup_removed_tags:
         fields.append(("Cleanup removed", ", ".join(detail.cleanup_removed_tags)))
     if stage == "08_character":

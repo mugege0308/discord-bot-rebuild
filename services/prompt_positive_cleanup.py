@@ -15,6 +15,7 @@ from typing import Iterable
 
 
 _STANDALONE_NUMBER_RE = re.compile(r"^[+-]?(?:\d+(?:\.\d+)?|\.\d+)$")
+_SPACED_COUNT_TAG_RE = re.compile(r"^(?P<count>\d+)\s+(?P<kind>girls?|boys?|others?)$")
 _TAG_SEPARATOR_RE = re.compile(r"[_\-]+")
 
 # These are deliberately only high-confidence equivalences.  The canonical
@@ -56,6 +57,15 @@ def _explicit_canonical_aliases(user_input: str) -> set[str]:
     return set()
 
 
+def _canonicalize_structural_token(token: str) -> str:
+    """Normalize common count tags without changing their meaning."""
+
+    match = _SPACED_COUNT_TAG_RE.fullmatch(token.strip())
+    if match is None:
+        return token.strip()
+    return f"{match.group('count')}{match.group('kind').casefold()}"
+
+
 def cleanup_positive_prompt(
     positive: str,
     *,
@@ -95,18 +105,19 @@ def cleanup_positive_prompt(
     seen: set[str] = set()
     explicit_canonical_keys = _explicit_canonical_aliases(user_input)
     for raw_token in str(positive or "").split(","):
-        token = raw_token.strip()
+        original_token = raw_token.strip()
+        token = _canonicalize_structural_token(original_token)
         if not token:
             continue
         key = normalize_prompt_tag_key(token)
         if _STANDALONE_NUMBER_RE.fullmatch(key):
-            removed.append(token)
-            reasons.append((token, "invalid_standalone_number"))
+            removed.append(original_token)
+            reasons.append((original_token, "invalid_standalone_number"))
             continue
         if key in alias_to_canonical:
             canonical = alias_to_canonical[key]
-            removed.append(token)
-            reasons.append((token, f"duplicate_alias_of:{canonical}"))
+            removed.append(original_token)
+            reasons.append((original_token, f"duplicate_alias_of:{canonical}"))
             if canonical not in seen and (
                 canonical in explicit_canonical_keys
                 or canonical in canonical_resolved_keys
@@ -115,8 +126,8 @@ def cleanup_positive_prompt(
                 seen.add(canonical)
             continue
         if key in seen:
-            removed.append(token)
-            reasons.append((token, "duplicate_normalized_tag"))
+            removed.append(original_token)
+            reasons.append((original_token, "duplicate_normalized_tag"))
             continue
         kept.append(token)
         seen.add(key)

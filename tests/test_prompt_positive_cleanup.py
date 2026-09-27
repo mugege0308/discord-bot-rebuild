@@ -4,6 +4,12 @@ from services.prompt_positive_cleanup import cleanup_positive_prompt
 
 
 class PromptPositiveCleanupTestCase(unittest.TestCase):
+    def test_spaced_subject_count_is_canonicalized(self):
+        result = cleanup_positive_prompt("safe, 1 girl, masterpiece")
+
+        self.assertEqual(result.positive, "safe, 1girl, masterpiece")
+        self.assertEqual(result.removed_tags, ())
+
     def test_removes_numbers_and_prefers_canonical_expression_and_gesture(self):
         result = cleanup_positive_prompt(
             "1girl, kochiya sanae, 2, safe, smile, long_hair, "
