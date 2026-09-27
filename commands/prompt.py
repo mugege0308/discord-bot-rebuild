@@ -1,4 +1,5 @@
 import asyncio
+from dataclasses import replace
 import logging
 from pathlib import Path
 
@@ -33,6 +34,8 @@ from services.image_generation_profiles import (
     DEFAULT_IMAGE_GENERATION_MODEL_KEY,
     get_image_generation_profile,
 )
+from services.danbooru_character_resolver import DanbooruCharacterResolution
+from services.verified_character_registry import VerifiedCharacterRegistry
 from services.pc_control import is_pc_control_allowed
 from services.prompt_generator import PromptGeneratorError, PromptGeneratorTimeout, generate_sd_prompt_result
 from services.sd_control import (
@@ -891,6 +894,7 @@ async def _build_shogou_prompt_result(
             interaction.user.id,
             reference_id,
             model_key,
+            enable_generic_danbooru=(label_prefix == "generate_ai"),
         )
         logger.info(
             "%s result received: positive_length=%s negative_length=%s blocked=%s",
@@ -1212,6 +1216,118 @@ def _build_generation_stats_embed(stats: GenerationStats) -> discord.Embed:
     return embed
 
 
+class GenerateAiDanbooruCharacterConfirmationView(discord.ui.View):
+    """Requester-only first-use confirmation for an unregistered character."""
+
+    def __init__(self, owner_id: int, resolution: DanbooruCharacterResolution, continue_generation) -> None:
+        super().__init__(timeout=900)
+        self.owner_id = owner_id
+        self.resolution = resolution
+        self.registry = VerifiedCharacterRegistry()
+        self.continue_generation = continue_generation
+        candidate = resolution.candidate_character_tags[0] if resolution.candidate_character_tags else None
+        if candidate is None:
+            raise ValueError("character confirmation requires a Danbooru candidate")
+        self.candidate = candidate
+        self.add_item(discord.ui.Button(label="このキャラで登録", style=discord.ButtonStyle.success, custom_id="genai_char_confirm"))
+        self.add_item(discord.ui.Button(label="登録しない", style=discord.ButtonStyle.secondary, custom_id="genai_char_cancel"))
+        self.children[0].callback = self._confirm
+        self.children[1].callback = self._cancel
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("この確認画面を操作できるのは依頼者だけです。", ephemeral=True)
+            return False
+        return True
+
+    def message_text(self) -> str:
+        return (
+            "未登録のキャラクター候補が見つかりました。画像生成はまだ開始していません。\n"
+            f"入力: `{self.resolution.input_character_name}`\n"
+            f"Danbooru候補: `{self.candidate.name}`\n"
+            f"Prompt tag: `{self.candidate.prompt_tag}`\n\n"
+            "正しい候補なら「このキャラで登録」を押してください。"
+        )
+
+    async def _confirm(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
+        try:
+            saved = await asyncio.to_thread(
+                self.registry.register_verified_candidate,
+                self.candidate,
+                input_alias=self.resolution.input_character_name,
+                copyright_tag=self.resolution.selected_copyright_tag,
+                context_aliases=self.resolution.generated_work_queries,
+                display_name=self.resolution.input_character_name,
+            )
+            confirmed = self.resolution.with_registry_confirmation(
+                character=saved,
+                saved_alias=self.resolution.input_character_name,
+            )
+            await interaction.edit_original_response(
+                content=f"`{saved.prompt_tag}` を確認済み登録しました。生成を続行します。",
+                view=None,
+            )
+            await self.continue_generation(confirmed)
+        except Exception:
+            logger.exception("Failed to register Danbooru character candidate")
+            await interaction.edit_original_response(
+                content="キャラクター登録に失敗しました。画像生成は開始していません。",
+                view=None,
+            )
+
+    async def _cancel(self, interaction: discord.Interaction) -> None:
+        await interaction.response.edit_message(
+            content="キャラクター登録をキャンセルしました。画像生成は開始していません。",
+            view=None,
+        )
+
+    async def on_timeout(self) -> None:
+        for child in self.children:
+            child.disabled = True
+
+
+async def _resume_generate_ai_after_character_confirmation(
+    interaction: discord.Interaction,
+    result: ShogouPromptResult,
+    confirmed_resolution: DanbooruCharacterResolution,
+    *,
+    request: str,
+    reference_id: int | None,
+    profile,
+    model,
+    reference_image_bytes: bytes | None,
+    reference_image_content_type: str | None,
+    resolved_reference_strength: float | None,
+) -> None:
+    confirmed_result = replace(
+        result,
+        danbooru_character_resolution=confirmed_resolution,
+        danbooru_character_resolved_tag_ids=confirmed_resolution.selected_tag_ids,
+        danbooru_character_resolved_tags=confirmed_resolution.selected_prompt_tags,
+        character_confirmation_required=False,
+        character_unresolved_reason="",
+    )
+    await _safe_followup_send(
+        interaction,
+        label="generate_ai.started_after_character_confirmation",
+        content=GENERATING_MESSAGE,
+        ephemeral=True,
+    )
+    await _generate_images_from_shogou_result(
+        interaction,
+        confirmed_result,
+        label_prefix="generate_ai",
+        request_text=request,
+        reference_id=reference_id,
+        model_key=profile.model_key,
+        model_selection_explicit=model is not None,
+        reference_image_bytes=reference_image_bytes,
+        reference_image_content_type=reference_image_content_type,
+        reference_strength=resolved_reference_strength,
+    )
+
+
 class PromptImageGenerateView(discord.ui.View):
     def __init__(self, owner_id: int, positive_prompt: str, negative_prompt: str) -> None:
         super().__init__(timeout=900)
@@ -1510,6 +1626,35 @@ def setup(client: discord.Client) -> None:
             model_key=profile.model_key,
         )
         if result is None:
+            return
+
+        if result.character_confirmation_required and result.danbooru_character_resolution is not None:
+            async def continue_after_character_confirmation(confirmed_resolution: DanbooruCharacterResolution) -> None:
+                await _resume_generate_ai_after_character_confirmation(
+                    interaction,
+                    result,
+                    confirmed_resolution,
+                    request=request,
+                    reference_id=reference_id,
+                    profile=profile,
+                    model=model,
+                    reference_image_bytes=reference_image_bytes,
+                    reference_image_content_type=reference_image_content_type,
+                    resolved_reference_strength=resolved_reference_strength,
+                )
+
+            confirmation_view = GenerateAiDanbooruCharacterConfirmationView(
+                interaction.user.id,
+                result.danbooru_character_resolution,
+                continue_after_character_confirmation,
+            )
+            await _safe_followup_send(
+                interaction,
+                label="generate_ai.character_confirmation",
+                content=confirmation_view.message_text(),
+                view=confirmation_view,
+                ephemeral=True,
+            )
             return
 
         if result.blocked:

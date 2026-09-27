@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Animagine XL prompt tag dictionary",
+  "type": "object",
+  "required": ["version", "profile", "entries"],
+  "properties": {
+    "version": {"type": "string", "minLength": 1},
+    "profile": {"type": "string", "const": "animagine_xl_4"},
+    "entries": {
+      "type": "array",
+      "minItems": 30,
+      "items": {
+        "type": "object",
+        "required": [
+          "id", "category", "danbooru_tag", "prompt_tag", "ja_aliases",
+          "excludes", "status", "profile"
+        ],
+        "properties": {
+          "id": {"type": "string", "minLength": 1},
+          "category": {"type": "string", "minLength": 1},
+          "danbooru_tag": {"type": "string", "pattern": "^[a-z0-9][a-z0-9_'\\-]*$"},
+          "prompt_tag": {"type": "string", "minLength": 1},
+          "ja_aliases": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
+          "exclusive_group": {"type": "string"},
+          "excludes": {"type": "array", "items": {"type": "string", "minLength": 1}},
+          "output_aliases": {"type": "array", "items": {"type": "string", "minLength": 1}},
+          "status": {"enum": ["verified", "candidate", "deprecated"]},
+          "profile": {"type": "string", "const": "animagine_xl_4"}
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

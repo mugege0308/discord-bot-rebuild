@@ -1,9 +1,10 @@
+import hashlib
 import json
 import logging
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 from services.character_tag_dictionary import CharacterTagResolution, resolve_all_character_tags
 from services.image_memory import build_image_memory_prompt_context
@@ -16,12 +17,45 @@ from services.prompt_generator import (
     PromptGeneratorError,
     _post_chat_completion,
 )
+from services.prompt_tag_resolver import (
+    PromptTagResolution,
+    apply_prompt_tag_resolution,
+    build_prompt_tag_instruction,
+    resolve_prompt_tags,
+)
+from services.danbooru_tag_resolver import (
+    DanbooruTagResolution,
+    apply_danbooru_tag_resolution,
+    build_danbooru_tag_instruction,
+    resolve_danbooru_tags,
+    should_search_generic_tags,
+)
+from services.danbooru_character_resolver import (
+    DanbooruCharacterResolution,
+    apply_danbooru_character_resolution,
+    build_danbooru_character_instruction,
+    resolve_danbooru_character_tags,
+    should_search_character_tags,
+)
+from services.character_appearance_filter import filter_unrequested_character_appearance
+from services.prompt_positive_cleanup import cleanup_positive_prompt
+from services.verified_character_registry import VerifiedCharacterRegistry
+from services.generate_ai_debug import (
+    complete_generate_ai_debug,
+    mark_generate_ai_stage,
+    start_generate_ai_debug,
+    store_generate_ai_character_resolution,
+    store_generate_ai_danbooru_tag_resolution,
+    store_generate_ai_prompt_tag_resolution,
+    store_generate_ai_stage_detail,
+)
 
 
 logger = logging.getLogger("secretary-bot.shogou_prompt_designer")
 
 INSTRUCTION_FILE = Path("shogou_chan_prompt_designer_instruction.md")
 REQUIRED_KEYS = ("positive", "negative", "summary", "assumptions")
+SHOGOU_RESPONSE_FORMAT = {"type": "json_schema", "json_schema": {"name": "shogou_prompt_result", "schema": {"type": "object"}}}
 
 
 @dataclass(frozen=True)
@@ -31,6 +65,21 @@ class ShogouPromptResult:
     summary: str = ""
     assumptions: tuple[str, ...] = field(default_factory=tuple)
     blocked_reason: str = ""
+    prompt_tag_dictionary_version: str = ""
+    resolved_tag_ids: tuple[str, ...] = field(default_factory=tuple)
+    resolved_prompt_tags: tuple[str, ...] = field(default_factory=tuple)
+    unresolved_japanese_phrases: tuple[str, ...] = field(default_factory=tuple)
+    danbooru_tag_db_version: str = ""
+    danbooru_resolved_tag_ids: tuple[str, ...] = field(default_factory=tuple)
+    danbooru_resolved_prompt_tags: tuple[str, ...] = field(default_factory=tuple)
+    danbooru_character_tag_db_version: str = ""
+    danbooru_character_resolved_tag_ids: tuple[str, ...] = field(default_factory=tuple)
+    danbooru_character_resolved_tags: tuple[str, ...] = field(default_factory=tuple)
+    danbooru_character_resolution: DanbooruCharacterResolution | None = None
+    character_appearance_suppressed_tags: tuple[str, ...] = field(default_factory=tuple)
+    positive_cleanup_removed_tags: tuple[str, ...] = field(default_factory=tuple)
+    character_confirmation_required: bool = False
+    character_unresolved_reason: str = ""
 
     @property
     def blocked(self) -> bool:
@@ -166,12 +215,126 @@ def generate_shogou_prompt_result(
     user_id: int | None = None,
     reference_id: int | None = None,
     model_key: str = DEFAULT_IMAGE_GENERATION_MODEL_KEY,
+    requested_rating: str = "auto",
+    *,
+    enable_generic_danbooru: bool = False,
 ) -> ShogouPromptResult:
     text = user_input.strip()
     if not text:
         raise PromptGeneratorError("内容を入力してください。例: `/generate_ai request:雨の日の小さな喫茶店`")
     if len(text) > 1000:
         raise PromptGeneratorError("少し長すぎます。1000文字以内にしてください。")
+
+    profile = get_image_generation_profile(model_key)
+    trace_id = hashlib.sha256(
+        f"{user_id}|{profile.model_key}|{text}".encode("utf-8", errors="replace")
+    ).hexdigest()[:16]
+    if user_id is not None:
+        start_generate_ai_debug(
+            user_id,
+            trace_id,
+            model_key=profile.model_key,
+            model_name=profile.display_name,
+            requested_rating="auto",
+        )
+        mark_generate_ai_stage(trace_id, "01_request")
+
+    prompt_resolution: PromptTagResolution | None = None
+    generic_resolution: DanbooruTagResolution | None = None
+    character_resolution: DanbooruCharacterResolution | None = None
+    manual_characters = resolve_all_character_tags(text)
+
+    if profile.model_key == DEFAULT_IMAGE_GENERATION_MODEL_KEY:
+        prompt_resolution = resolve_prompt_tags(text)
+        if user_id is not None:
+            store_generate_ai_prompt_tag_resolution(
+                trace_id,
+                dictionary_version=prompt_resolution.dictionary_version,
+                resolved_tag_ids=prompt_resolution.resolved_tag_ids,
+                resolved_prompt_tags=prompt_resolution.resolved_prompt_tags,
+                unresolved_japanese_phrases=prompt_resolution.unresolved_japanese_phrases,
+            )
+        if enable_generic_danbooru:
+            def _call_danbooru_llm_json(
+                _system_prompt: str,
+                user_prompt: str,
+                _response_format: Mapping[str, Any],
+                _max_tokens: int,
+            ) -> str:
+                # The resolver owns the allowlist; the LLM is only a query/
+                # candidate-comparison helper, so plain JSON text is enough.
+                try:
+                    return _post_chat_completion(
+                        _system_prompt,
+                        user_prompt,
+                        temperature=0.20,
+                        response_format=_response_format,
+                        max_tokens=_max_tokens,
+                    )
+                except TypeError:
+                    # Keep compatibility with the older direct LM helper.
+                    return _post_chat_completion(
+                        _system_prompt,
+                        user_prompt,
+                        temperature=0.20,
+                    )
+
+            if not manual_characters:
+                registry_matches = VerifiedCharacterRegistry().lookup(text, context_text=text)
+                if len(registry_matches) == 1:
+                    matched = registry_matches[0]
+                    character_resolution = DanbooruCharacterResolution.from_verified_registry(
+                        input_character_name=matched.matched_alias,
+                        character=matched.character,
+                        matched_alias=matched.matched_alias,
+                    )
+                elif len(registry_matches) > 1:
+                    character_resolution = DanbooruCharacterResolution(
+                        input_character_name=text[:160],
+                        normalized_character_name=text.casefold().strip(),
+                        unresolved_reason="ambiguous_verified_registry",
+                        abstained=True,
+                    )
+                elif should_search_character_tags(text):
+                    character_resolution = resolve_danbooru_character_tags(
+                        text,
+                        llm_json=_call_danbooru_llm_json,
+                    )
+
+            if character_resolution is not None and user_id is not None:
+                store_generate_ai_character_resolution(
+                    trace_id,
+                    character_resolution.to_trace_dict(),
+                )
+            if character_resolution is not None and (
+                character_resolution.confirmation_required
+                or character_resolution.unresolved_reason
+            ):
+                if user_id is not None:
+                    complete_generate_ai_debug(trace_id)
+                return ShogouPromptResult(
+                    summary="キャラクター確認待ち",
+                    danbooru_character_tag_db_version=character_resolution.snapshot_version,
+                    danbooru_character_resolved_tag_ids=tuple(
+                        str(tag_id) for tag_id in character_resolution.selected_tag_ids
+                    ),
+                    danbooru_character_resolved_tags=character_resolution.selected_prompt_tags,
+                    danbooru_character_resolution=character_resolution,
+                    character_confirmation_required=character_resolution.confirmation_required,
+                    character_unresolved_reason=character_resolution.unresolved_reason,
+                )
+
+            if should_search_generic_tags(text):
+                generic_resolution = resolve_danbooru_tags(
+                    text,
+                    core_entries=prompt_resolution.entries if prompt_resolution is not None else (),
+                    llm_json=_call_danbooru_llm_json,
+                )
+                if user_id is not None:
+                    store_generate_ai_danbooru_tag_resolution(
+                        trace_id,
+                        generic_resolution.to_trace_dict(),
+                    )
 
     logger.info("Shogou system prompt generation start: user_id=%s input_length=%s", user_id, len(text))
     system_prompt = append_memory_to_system_prompt(load_shogou_instruction(model_key), user_id, text, mode="prompt")
@@ -183,11 +346,84 @@ def generate_shogou_prompt_result(
         if reference_context:
             system_prompt += "\n\n" + reference_context
     system_prompt = _append_known_character_context(system_prompt, text)
-    logger.info("Shogou system prompt generation complete: user_id=%s length=%s", user_id, len(system_prompt))
+    if prompt_resolution is not None:
+        system_prompt += "\n\n" + build_prompt_tag_instruction(prompt_resolution)
+    if generic_resolution is not None:
+        system_prompt += "\n\n" + build_danbooru_tag_instruction(generic_resolution)
+    if character_resolution is not None:
+        system_prompt += "\n\n" + build_danbooru_character_instruction(character_resolution)
+    if user_id is not None:
+        mark_generate_ai_stage(trace_id, "02_prompt_build")
 
-    raw_content = _post_chat_completion(system_prompt, text, temperature=0.35)
-    logger.info("Shogou postprocess start: raw_content_length=%s", len(raw_content))
+    try:
+        raw_content = _post_chat_completion(
+            system_prompt,
+            text,
+            temperature=0.35,
+            response_format=SHOGOU_RESPONSE_FORMAT,
+            max_tokens=1200,
+        )
+    except TypeError:
+        raw_content = _post_chat_completion(system_prompt, text, temperature=0.35)
+    if user_id is not None:
+        mark_generate_ai_stage(trace_id, "03_lm_studio")
+        store_generate_ai_stage_detail(trace_id, "03_lm_studio", positive=raw_content)
     result = parse_shogou_prompt_response(raw_content)
+    if result.blocked:
+        if user_id is not None:
+            complete_generate_ai_debug(trace_id)
+        return result
+
+    verified_prompt_tags = (
+        tuple(prompt_resolution.resolved_prompt_tags) if prompt_resolution is not None else ()
+    ) + (
+        tuple(generic_resolution.selected_prompt_tags) if generic_resolution is not None else ()
+    )
+    appearance = filter_unrequested_character_appearance(
+        result.positive,
+        user_input=text,
+        character_resolution=character_resolution,
+        verified_prompt_tags=verified_prompt_tags,
+    )
+    final_positive = appearance.positive
+    if prompt_resolution is not None:
+        final_positive = apply_prompt_tag_resolution(final_positive, prompt_resolution)
+    if generic_resolution is not None:
+        final_positive = apply_danbooru_tag_resolution(final_positive, generic_resolution)
+    if character_resolution is not None:
+        final_positive = apply_danbooru_character_resolution(final_positive, character_resolution)
+    cleanup = cleanup_positive_prompt(
+        final_positive,
+        canonical_prompt_tags=verified_prompt_tags,
+        user_input=text,
+    )
+    result = replace(
+        result,
+        positive=cleanup.positive,
+        prompt_tag_dictionary_version=prompt_resolution.dictionary_version if prompt_resolution else "",
+        resolved_tag_ids=prompt_resolution.resolved_tag_ids if prompt_resolution else (),
+        resolved_prompt_tags=prompt_resolution.resolved_prompt_tags if prompt_resolution else (),
+        unresolved_japanese_phrases=prompt_resolution.unresolved_japanese_phrases if prompt_resolution else (),
+        danbooru_tag_db_version=generic_resolution.snapshot_version if generic_resolution else "",
+        danbooru_resolved_tag_ids=tuple(str(tag_id) for tag_id in generic_resolution.selected_tag_ids) if generic_resolution else (),
+        danbooru_resolved_prompt_tags=generic_resolution.selected_prompt_tags if generic_resolution else (),
+        danbooru_character_tag_db_version=character_resolution.snapshot_version if character_resolution else "",
+        danbooru_character_resolved_tag_ids=tuple(str(tag_id) for tag_id in character_resolution.selected_tag_ids) if character_resolution else (),
+        danbooru_character_resolved_tags=character_resolution.selected_prompt_tags if character_resolution else (),
+        danbooru_character_resolution=character_resolution,
+        character_appearance_suppressed_tags=appearance.removed_tags,
+        positive_cleanup_removed_tags=cleanup.removed_tags,
+    )
+    if user_id is not None:
+        store_generate_ai_stage_detail(
+            trace_id,
+            "06_rating",
+            positive=result.positive,
+            appearance_removed_tags=appearance.removed_tags,
+            cleanup_removed_tags=cleanup.removed_tags,
+        )
+        mark_generate_ai_stage(trace_id, "06_rating", final_positive_tags=len(result.positive.split(",")))
+        complete_generate_ai_debug(trace_id)
     logger.info(
         "Shogou postprocess complete: positive_length=%s negative_length=%s blocked=%s",
         len(result.positive),
@@ -195,7 +431,6 @@ def generate_shogou_prompt_result(
         result.blocked,
     )
     return result
-
 
 def _build_composition_variation_instruction(
     parent_request_text: str,

@@ -9,6 +9,9 @@ data/weather_state.json
 data/pc_shutdown_state.json
 data/daily_log.db
 data/generation_history.db
+data/danbooru/tags.sqlite3
+data/danbooru/tags.*.sqlite3
+data/danbooru/character_registry.sqlite3
 data/logs/
 data/image_memory/
 data/sd_outputs/
