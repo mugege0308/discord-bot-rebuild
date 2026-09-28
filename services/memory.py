@@ -33,11 +33,16 @@ IMAGE_RELATED_WORDS = (
 )
 
 ALWAYS_MEMORY_TAG_RULES: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
-    (("可愛い", "かわいい", "cute"), ("cute", "soft expression")),
+    # Keep the mood hint, but do not turn it into an additional facial or
+    # lighting decision.  The current request (and the LM's explicit
+    # expression, if any) owns those details.
+    (("可愛い", "かわいい", "cute"), ("cute",)),
     (("人物品質", "顔をきれい", "顔品質", "綺麗な顔"), ("detailed face", "beautiful face")),
     (("自然な目", "目を自然", "目が自然", "綺麗な目"), ("detailed eyes", "expressive eyes")),
     (("暖色", "あたたかい色", "温かい色", "オレンジ"), ("warm lighting", "orange tones")),
-    (("寒色", "青系", "青っぽい", "クール"), ("cool colors", "blue tones", "soft lighting")),
+    # Color preference may carry a restrained palette hint.  Lighting is a
+    # separate visual decision and must not be pulled in by a color memory.
+    (("寒色", "青系", "青っぽい", "クール"), ("cool colors", "blue tones")),
     (("淡い", "淡色", "パステル", "柔らかい光", "やわらかい光", "soft light"), ("pastel colors", "soft colors", "gentle lighting")),
     (("暗め", "ダーク"), ("low light", "moody lighting")),
     (("眠たげ", "眠そう"), ("sleepy expression", "half-closed eyes", "soft expression")),
@@ -123,6 +128,41 @@ MEMORY_STYLE_COLOR_TAGS = {
     "moody lighting",
 }
 
+MEMORY_COLOR_TAGS = {
+    "cool colors",
+    "blue tones",
+    "orange tones",
+    "pastel colors",
+    "soft colors",
+}
+
+MEMORY_LIGHTING_TAGS = {
+    "warm lighting",
+    "golden hour",
+    "soft lighting",
+    "gentle lighting",
+    "night",
+    "low light",
+    "moody lighting",
+}
+
+MEMORY_MOOD_TAGS = {
+    "cute",
+    "sleepy expression",
+    "half-closed eyes",
+    "soft expression",
+    "fragile atmosphere",
+}
+
+MEMORY_APPEARANCE_TAGS = {
+    "pale skin",
+    "silver hair",
+    "red eyes",
+    "blue eyes",
+    "short hair",
+    "long hair",
+}
+
 MEMORY_CLOTHING_TAGS = {
     "kimono",
     "obi",
@@ -164,6 +204,127 @@ MEMORY_TAGS_SUPPRESSED_BY_EXPLICIT_BACKGROUND = {
     "shrine",
     "torii",
     "stone pathway",
+}
+
+_PROMPT_MEMORY_CATEGORY_CUES: dict[str, tuple[str, ...]] = {
+    "color": (
+        "色",
+        "配色",
+        "色味",
+        "色合い",
+        "カラー",
+        "寒色",
+        "暖色",
+        "青系",
+        "赤系",
+        "オレンジ",
+        "パステル",
+        "カラフル",
+        "color",
+        "palette",
+        "tone",
+    ),
+    "lighting": (
+        "光",
+        "明かり",
+        "照明",
+        "ライティング",
+        "日差し",
+        "夕日",
+        "夕焼け",
+        "月明かり",
+        "夜",
+        "lighting",
+        "light",
+        "sunlight",
+        "moonlight",
+    ),
+    "mood": (
+        "表情",
+        "雰囲気",
+        "ムード",
+        "かわいい",
+        "可愛い",
+        "かっこいい",
+        "クール",
+        "笑顔",
+        "cute",
+        "mood",
+        "atmosphere",
+        "expression",
+    ),
+    "background": (
+        "背景",
+        "場所",
+        "舞台",
+        "風景",
+        "神社",
+        "鳥居",
+        "室内",
+        "屋外",
+        "カフェ",
+        "学校",
+        "海",
+        "森",
+        "background",
+        "location",
+        "scene",
+        "indoor",
+        "outdoor",
+    ),
+    "clothing": (
+        "服",
+        "服装",
+        "衣装",
+        "着物",
+        "和服",
+        "制服",
+        "メイド",
+        "ドレス",
+        "パーカー",
+        "outfit",
+        "clothing",
+        "kimono",
+        "dress",
+    ),
+    "appearance": (
+        "髪",
+        "髪型",
+        "目",
+        "瞳",
+        "顔",
+        "肌",
+        "外見",
+        "hair",
+        "eyes",
+        "face",
+        "skin",
+        "appearance",
+    ),
+}
+
+_PROMPT_MEMORY_EXPLICIT_USE_CUES: dict[str, tuple[str, ...]] = {
+    "color": ("いつもの色味", "いつもの色", "好みの色味", "好みの色"),
+    "lighting": ("いつもの光", "好みの光", "いつもの照明", "好みの照明"),
+    "mood": ("いつもの雰囲気", "好みの雰囲気", "いつもの感じ"),
+    "background": ("いつもの背景", "好みの背景", "いつもの場所", "好みの場所"),
+    "clothing": ("いつもの服", "好みの服", "いつもの衣装", "好みの衣装"),
+    "all": ("メモリを使って", "メモリを反映", "好みを反映", "好みで生成"),
+}
+
+_PROMPT_MEMORY_SPECIFIC_TAG_CUES: dict[str, tuple[str, ...]] = {
+    "cool colors": ("寒色", "クール", "cool"),
+    "blue tones": ("寒色", "青系", "青み", "青い", "クール", "blue"),
+    "orange tones": ("暖色", "オレンジ", "orange", "warm color"),
+    "pastel colors": ("淡色", "パステル", "pastel"),
+    "soft colors": ("淡色", "柔らかい色", "soft color"),
+    "warm lighting": ("暖色の光", "暖かい光", "暖かな光", "warm light"),
+    "golden hour": ("夕日", "夕焼け", "夕暮れ", "golden hour"),
+    "soft lighting": ("柔らかい光", "柔らかな光", "ソフトな光", "soft light"),
+    "gentle lighting": ("柔らかい光", "柔らかな光", "gentle lighting"),
+    "night": ("夜", "夜景", "night"),
+    "low light": ("暗め", "暗い", "low light"),
+    "moody lighting": ("暗め", "ダーク", "moody"),
 }
 
 
@@ -297,13 +458,103 @@ def _tag_priority(tag: str) -> int:
     return 4
 
 
+def _prompt_memory_tag_category(tag: str) -> str | None:
+    normalized = tag.lower().strip()
+    if normalized in MEMORY_COLOR_TAGS:
+        return "color"
+    if normalized in MEMORY_LIGHTING_TAGS:
+        return "lighting"
+    if normalized in MEMORY_MOOD_TAGS:
+        return "mood"
+    if normalized in MEMORY_BACKGROUND_TAGS:
+        return "background"
+    if normalized in MEMORY_CLOTHING_TAGS:
+        return "clothing"
+    if normalized in MEMORY_APPEARANCE_TAGS:
+        return "appearance"
+    return None
+
+
+def _prompt_memory_categories_for_query(query: str) -> set[str]:
+    lower_query = query.lower()
+    categories = {
+        category
+        for category, cues in _PROMPT_MEMORY_CATEGORY_CUES.items()
+        if any(cue.lower() in lower_query for cue in cues)
+    }
+    for category, cues in _PROMPT_MEMORY_EXPLICIT_USE_CUES.items():
+        if any(cue.lower() in lower_query for cue in cues):
+            categories.add(category)
+    if "all" in categories:
+        categories.update(_PROMPT_MEMORY_CATEGORY_CUES)
+    return categories
+
+
+def _prompt_memory_tag_allowed(tag: str, query: str, categories: set[str] | None = None) -> bool:
+    category = _prompt_memory_tag_category(tag)
+    if category is None:
+        return True
+    allowed_categories = categories if categories is not None else _prompt_memory_categories_for_query(query)
+    if category not in allowed_categories:
+        return False
+
+    # A specific request such as "寒色系" should not reopen every tag in the
+    # broad color category.  Generic category wording such as "色味" still
+    # permits all memories in that category.
+    lower_query = query.lower()
+    category_specific_cues = tuple(
+        cue.lower()
+        for known_tag, cues in _PROMPT_MEMORY_SPECIFIC_TAG_CUES.items()
+        if _prompt_memory_tag_category(known_tag) == category
+        for cue in cues
+    )
+    if not any(cue in lower_query for cue in category_specific_cues):
+        return True
+    tag_cues = _PROMPT_MEMORY_SPECIFIC_TAG_CUES.get(tag.lower(), ())
+    return any(cue.lower() in lower_query for cue in tag_cues)
+
+
+def _prompt_memory_text_allowed(text: str, query: str, categories: set[str]) -> bool:
+    """Keep raw preference text only when every known visual category in it is relevant.
+
+    A memory such as "暖色、神社、和服が好き" must not be passed as raw prose
+    merely because the request mentions one of those categories.  The
+    category-specific converted tags are filtered separately below.
+    """
+
+    tags = memory_text_to_tags(text)
+    visual_categories = {
+        category
+        for tag in tags
+        if (category := _prompt_memory_tag_category(tag)) is not None
+    }
+    lower_text = text.lower()
+    visual_categories.update(
+        category
+        for category, cues in _PROMPT_MEMORY_CATEGORY_CUES.items()
+        if any(cue.lower() in lower_text for cue in cues)
+    )
+    return not visual_categories or visual_categories.issubset(categories)
+
+
 def _select_prompt_memory_tags(query: str, tags: list[str]) -> list[str]:
     deduped_tags = _dedupe(tags)
+    filtered_visual_tags, visual_conflicts = filter_conflicting_weak_visual_hints(deduped_tags, query)
+    allowed_categories = _prompt_memory_categories_for_query(query)
+    category_suppressed = [
+        tag
+        for tag in filtered_visual_tags
+        if not _prompt_memory_tag_allowed(tag, query, allowed_categories)
+    ]
+    filtered_visual_tags = [
+        tag for tag in filtered_visual_tags
+        if _prompt_memory_tag_allowed(tag, query, allowed_categories)
+    ]
     has_explicit_background = _query_has_explicit_different_background(query)
     lower_query = query.lower()
 
     filtered_tags: list[str] = []
-    for tag in deduped_tags:
+    for tag in filtered_visual_tags:
         lower_tag = tag.lower()
         explicitly_requested = lower_tag in lower_query
         if (
@@ -322,7 +573,11 @@ def _select_prompt_memory_tags(query: str, tags: list[str]) -> list[str]:
         len(query),
         has_explicit_background,
         selected_tags,
-        [tag for tag in deduped_tags if tag not in selected_tags],
+        _dedupe(
+            visual_conflicts
+            + category_suppressed
+            + [tag for tag in deduped_tags if tag not in selected_tags]
+        ),
     )
     return selected_tags
 
@@ -331,13 +586,18 @@ def _collect_prompt_memory_tags(query: str, memories: list[dict[str, object]]) -
     always_tags: list[str] = []
     conditional_adopted_tags: list[str] = []
     excluded_tags: list[str] = []
+    allowed_categories = _prompt_memory_categories_for_query(query)
     for item in memories:
         text = _memory_text(item)
         if not text:
             continue
         always_tags.extend(_always_memory_tags(text))
         conditional_adopted, conditional_excluded = _conditional_memory_tag_decisions(text, query)
-        conditional_adopted_tags.extend(conditional_adopted)
+        conditional_adopted_tags.extend(
+            tag
+            for tag in conditional_adopted
+            if _prompt_memory_tag_allowed(tag, query, allowed_categories)
+        )
         excluded_tags.extend(conditional_excluded)
 
     conditional_selected = _dedupe(conditional_adopted_tags)
@@ -488,9 +748,12 @@ def build_memory_summary(user_id: int, query: str, mode: str = "generic") -> str
     image_items: list[str] = []
     other_items: list[str] = []
     skipped_conditional_memory_count = 0
+    skipped_visual_memory_count = 0
     converted_tags: list[str] = []
     excluded_tags: list[str] = []
+    allowed_categories: set[str] = set()
     if mode == "prompt":
+        allowed_categories = _prompt_memory_categories_for_query(query)
         converted_tags, excluded_tags = _collect_prompt_memory_tags(query, memories)
 
     for item in memories:
@@ -498,6 +761,9 @@ def build_memory_summary(user_id: int, query: str, mode: str = "generic") -> str
         if not text:
             continue
         tags = memory_text_to_tags(text)
+        if mode == "prompt" and not _prompt_memory_text_allowed(text, query, allowed_categories):
+            skipped_visual_memory_count += 1
+            continue
         if mode == "prompt" and _prompt_text_has_unrelated_conditional_memory(text, query):
             skipped_conditional_memory_count += 1
             continue
@@ -540,6 +806,16 @@ def build_memory_summary(user_id: int, query: str, mode: str = "generic") -> str
             skipped_conditional_memory_count,
             len(query),
             excluded_tags,
+        )
+    if mode == "prompt":
+        logger.info(
+            "Prompt memory category filter: user_id=%s query_length=%s allowed_categories=%s "
+            "skipped_visual_texts=%s resolved_tags=%s",
+            user_id,
+            len(query),
+            sorted(allowed_categories),
+            skipped_visual_memory_count,
+            converted_tags,
         )
 
     summary = "\n".join(lines)
