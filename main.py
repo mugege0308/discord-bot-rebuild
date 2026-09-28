@@ -33,7 +33,13 @@ from services.double_translate import (
     start_double_translate,
     stop_double_translate,
 )
-from services.bot_control import launch_bot_start_file
+from services.bot_control import (
+    BotAlreadyRunningError,
+    acquire_bot_instance_lock,
+    claim_restart_request,
+    launch_bot_restart,
+    release_restart_request,
+)
 from services.claude_remote import claude_remote_manager
 from services.dev_task_store import mark_running_tasks_failed_on_startup
 from services.jockie import (
@@ -616,23 +622,49 @@ async def slash_pc_shutdown_cancel(interaction: discord.Interaction) -> None:
 
 @client.tree.command(name="bot_restart", description="許可ユーザーだけがBot自身を再起動できます。")
 async def slash_bot_restart(interaction: discord.Interaction) -> None:
+    logger.info(
+        "DIAG slash_callback_start command=/bot_restart user_id=%s guild_id=%s channel_id=%s",
+        interaction.user.id,
+        interaction.guild_id,
+        interaction.channel_id,
+    )
+    try:
+        logger.info("DIAG interaction_defer_start command=/bot_restart user_id=%s", interaction.user.id)
+        await interaction.response.defer(ephemeral=True)
+        logger.info("DIAG interaction_defer_complete command=/bot_restart user_id=%s", interaction.user.id)
+    except Exception:
+        logger.exception("DIAG interaction_defer_failed command=/bot_restart user_id=%s", interaction.user.id)
+        return
+
     if not is_pc_control_allowed(interaction.user.id):
         logger.warning("Denied /bot_restart by user_id=%s", interaction.user.id)
-        await interaction.response.send_message(PC_CONTROL_DENIED_MESSAGE, ephemeral=True)
+        await interaction.followup.send(PC_CONTROL_DENIED_MESSAGE, ephemeral=True)
+        return
+
+    if not claim_restart_request():
+        logger.warning("Ignored duplicate /bot_restart request by user_id=%s", interaction.user.id)
+        await interaction.followup.send("Bot再起動はすでに受付済みです。", ephemeral=True)
         return
 
     try:
-        start_file = await asyncio.to_thread(launch_bot_start_file)
+        restart_launch = await asyncio.to_thread(launch_bot_restart, wait_for_pid=os.getpid())
     except Exception as exc:
+        release_restart_request()
         logger.exception("Failed to launch bot restart file by user_id=%s", interaction.user.id)
-        await interaction.response.send_message(
+        await interaction.followup.send(
             f"Bot再起動用ファイルの起動に失敗しました: {str(exc)[:300]}",
             ephemeral=True,
         )
         return
 
-    logger.warning("Bot restart requested by user_id=%s start_file=%s", interaction.user.id, start_file)
-    await interaction.response.send_message("Botを再起動します。", ephemeral=True)
+    logger.warning(
+        "Bot restart requested by user_id=%s start_file=%s monitor_pid=%s restart_log=%s",
+        interaction.user.id,
+        restart_launch.start_file,
+        restart_launch.monitor_pid,
+        restart_launch.restart_log,
+    )
+    await interaction.followup.send("Botを再起動します。", ephemeral=True)
     await asyncio.sleep(1)
     try:
         await client.close()
@@ -897,7 +929,15 @@ def main() -> None:
     if not token:
         raise RuntimeError("DISCORD_BOT_TOKEN is not set. Create .env and set your bot token.")
 
-    client.run(token)
+    try:
+        instance_lock = acquire_bot_instance_lock()
+    except BotAlreadyRunningError:
+        logger.warning("Another Shogou-chan Bot instance is already running; exiting without connecting to Discord.")
+        return
+    try:
+        client.run(token)
+    finally:
+        instance_lock.release()
 
 
 if __name__ == "__main__":
