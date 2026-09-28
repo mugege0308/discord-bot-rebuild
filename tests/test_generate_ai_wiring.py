@@ -46,6 +46,25 @@ class GenerateAiWiringTestCase(unittest.TestCase):
             ],
         )
 
+    def test_generate_ai_discord_schema_stays_within_option_limit_and_keeps_input_modes(self):
+        import main
+
+        command = next(command for command in main.client.tree.get_commands() if command.name == "generate_ai")
+        options = command.to_dict(main.client.tree).get("options", [])
+
+        self.assertEqual(25, len(options))
+        self.assertNotIn("use_last_reference", {option["name"] for option in options})
+
+        input_mode = next(option for option in options if option["name"] == "input_mode")
+        self.assertEqual(
+            [(choice["name"], choice["value"]) for choice in input_mode["choices"]],
+            [
+                ("日本語・AI変換", "ja_ai"),
+                ("英語・直接入力", "en_direct"),
+                ("外部Promptを整えて使う", "prompt_import"),
+            ],
+        )
+
     def test_generate_ai_forwards_reference_image_data_and_strength(self):
         function = _find_function(self.tree, "slash_generate_ai")
         call = _find_calls(function, "_generate_images_from_shogou_result")[0]

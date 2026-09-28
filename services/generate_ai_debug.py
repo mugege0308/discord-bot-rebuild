@@ -46,6 +46,16 @@ STAGE_LABELS = {
 class GenerateAiStageDetail:
     positive: str | None = None
     negative: str | None = None
+    raw_imported_positive: str | None = None
+    raw_imported_negative: str | None = None
+    parsed_imported_tags: tuple[str, ...] = ()
+    canonicalized_tags: tuple[str, ...] = ()
+    imported_prompt_tags: tuple[str, ...] = ()
+    conflict_removed_tags: tuple[str, ...] = ()
+    character_resolution: tuple[str, ...] = ()
+    framing_resolution: tuple[str, ...] = ()
+    llm_added_tags: tuple[str, ...] = ()
+    removed_llm_only_tags: tuple[str, ...] = ()
     rating: str | None = None
     character_name: str | None = None
     added_tags: tuple[str, ...] = ()
@@ -364,6 +374,16 @@ def store_generate_ai_stage_detail(
     *,
     positive: str | None = None,
     negative: str | None = None,
+    raw_imported_positive: str | None = None,
+    raw_imported_negative: str | None = None,
+    parsed_imported_tags: tuple[str, ...] | list[str] = (),
+    canonicalized_tags: tuple[str, ...] | list[str] = (),
+    imported_prompt_tags: tuple[str, ...] | list[str] = (),
+    conflict_removed_tags: tuple[str, ...] | list[str] = (),
+    character_resolution: tuple[str, ...] | list[str] = (),
+    framing_resolution: tuple[str, ...] | list[str] = (),
+    llm_added_tags: tuple[str, ...] | list[str] = (),
+    removed_llm_only_tags: tuple[str, ...] | list[str] = (),
     rating: str | None = None,
     character_name: str | None = None,
     added_tags: tuple[str, ...] | list[str] = (),
@@ -406,6 +426,16 @@ def store_generate_ai_stage_detail(
     detail = GenerateAiStageDetail(
         positive=_bounded_detail_text(positive),
         negative=_bounded_detail_text(negative),
+        raw_imported_positive=_bounded_detail_text(raw_imported_positive),
+        raw_imported_negative=_bounded_detail_text(raw_imported_negative),
+        parsed_imported_tags=clean_values(parsed_imported_tags),
+        canonicalized_tags=clean_values(canonicalized_tags),
+        imported_prompt_tags=clean_values(imported_prompt_tags),
+        conflict_removed_tags=clean_values(conflict_removed_tags),
+        character_resolution=clean_values(character_resolution),
+        framing_resolution=clean_values(framing_resolution),
+        llm_added_tags=clean_values(llm_added_tags),
+        removed_llm_only_tags=clean_values(removed_llm_only_tags),
         rating=rating.strip() if rating else None,
         character_name=character_name.strip() if character_name else None,
         added_tags=clean_added,
@@ -714,6 +744,32 @@ def _split_detail_value(value: str, max_chars: int) -> list[str]:
 
 def _detail_stage_fields(detail: GenerateAiStageDetail, stage: str) -> list[tuple[str, str]]:
     fields: list[tuple[str, str]] = []
+    if stage == "04_json_parse":
+        if detail.raw_imported_positive:
+            fields.append(("Raw imported Positive", detail.raw_imported_positive))
+        if detail.raw_imported_negative:
+            fields.append(("Raw imported Negative", detail.raw_imported_negative))
+        if detail.parsed_imported_tags:
+            fields.append(("Parsed imported tags", ", ".join(detail.parsed_imported_tags)))
+        if detail.canonicalized_tags:
+            fields.append(("Canonicalized tags", " | ".join(detail.canonicalized_tags)))
+        if detail.imported_prompt_tags:
+            fields.append(("Imported prompt tags", ", ".join(detail.imported_prompt_tags)))
+        if detail.conflict_removed_tags:
+            fields.append(("Conflict removed", ", ".join(detail.conflict_removed_tags)))
+        if detail.character_resolution:
+            fields.append(("Character resolution", " | ".join(detail.character_resolution)))
+        if detail.framing_resolution:
+            fields.append(("Framing resolution", " | ".join(detail.framing_resolution)))
+        if detail.tag_provenance:
+            fields.append(("Tag provenance", " | ".join(detail.tag_provenance)))
+        fields.append(("LLM-added tags", ", ".join(detail.llm_added_tags) if detail.llm_added_tags else "None"))
+        fields.append(
+            (
+                "LLM-only removed",
+                ", ".join(detail.removed_llm_only_tags) if detail.removed_llm_only_tags else "None",
+            )
+        )
     if stage == "06_rating" and detail.rating:
         fields.append(("Rating", detail.rating))
     if stage == "06_rating" and detail.appearance_removed_tags:

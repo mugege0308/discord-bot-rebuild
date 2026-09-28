@@ -7,6 +7,15 @@ import discord
 from discord import app_commands
 
 from sd_prompt_template_generator import build_discord_prompt_message
+from services.direct_prompt_parser import (
+    ENGLISH_DIRECT_INPUT_MODE,
+    INPUT_MODE_LABELS,
+    JAPANESE_AI_INPUT_MODE,
+    PROMPT_IMPORT_INPUT_MODE,
+    DirectPromptResult,
+    parse_direct_prompt,
+)
+from services.prompt_import import PromptImportResult, resolve_prompt_import
 from services.generation_history import (
     MIN_GROUP_SIZE_FOR_TAG_COMPARISON,
     MIN_RATED_FOR_TREND,
@@ -69,6 +78,11 @@ SHOGOU_MESSAGE_LIMIT = 1900
 GENERATE_AI_MODEL_CHOICES = [
     app_commands.Choice(name="Animagine XL 4.0 Clear", value="animagine"),
     app_commands.Choice(name="JANKU v7.77", value="janku"),
+]
+GENERATE_AI_INPUT_MODE_CHOICES = [
+    app_commands.Choice(name=INPUT_MODE_LABELS[JAPANESE_AI_INPUT_MODE], value=JAPANESE_AI_INPUT_MODE),
+    app_commands.Choice(name=INPUT_MODE_LABELS[ENGLISH_DIRECT_INPUT_MODE], value=ENGLISH_DIRECT_INPUT_MODE),
+    app_commands.Choice(name=INPUT_MODE_LABELS[PROMPT_IMPORT_INPUT_MODE], value=PROMPT_IMPORT_INPUT_MODE),
 ]
 
 
