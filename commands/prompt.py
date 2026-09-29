@@ -4,7 +4,7 @@ import hashlib
 import inspect
 import logging
 from pathlib import Path
-from typing import Awaitable, Callable
+from typing import Awaitable, Callable, Sequence
 
 import discord
 from discord import app_commands
@@ -1128,15 +1128,23 @@ def _build_generation_options(
     pose_reference_width: int | None = None,
     pose_reference_height: int | None = None,
     pose_strength: float | None = None,
+    selection_enabled: bool = GENERATE_AI_DEFAULT_SELECTION_AI,
+    selection_generate_count: int | None = None,
 ) -> SdGenerationOptions:
-    selection_available = is_image_selection_available()
-    count = 1 if (reference_image_bytes is not None or pose_reference_bytes is not None) else (
-        get_selection_generate_count() if selection_available else 1
-    )
+    selection_available = selection_enabled and is_image_selection_available()
+    has_reference_image = reference_image_bytes is not None or pose_reference_bytes is not None
+    if has_reference_image or not selection_available:
+        count = 1
+    else:
+        count = selection_generate_count or get_selection_generate_count()
     logger.info(
-        "Prompt image generation count decided: count=%s selection_available=%s",
+        "Prompt image generation count decided: count=%s selection_enabled=%s "
+        "selection_available=%s configured_count=%s has_reference_image=%s",
         count,
+        selection_enabled,
         selection_available,
+        selection_generate_count,
+        has_reference_image,
     )
     return SdGenerationOptions(
         prompt=positive_prompt,
@@ -1166,6 +1174,113 @@ def _build_generation_options(
         pose_reference_height=pose_reference_height,
         pose_strength=0.7 if pose_strength is None else pose_strength,
     )
+
+
+def _file_sha256(path: Path) -> str | None:
+    try:
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+    except OSError:
+        return None
+
+
+def _match_generated_path(
+    candidate: Path,
+    generated_paths: Sequence[Path],
+    used_indexes: set[int],
+    digest_cache: dict[Path, str | None],
+) -> int | None:
+    try:
+        candidate_resolved = Path(candidate).resolve()
+    except OSError:
+        candidate_resolved = Path(candidate).absolute()
+    for index, raw_path in enumerate(generated_paths):
+        if index in used_indexes:
+            continue
+        path = Path(raw_path)
+        try:
+            if path.resolve() == candidate_resolved:
+                return index
+        except OSError:
+            if path.absolute() == candidate_resolved:
+                return index
+
+    candidate_path = Path(candidate)
+    digest_cache.setdefault(candidate_path, _file_sha256(candidate_path))
+    candidate_digest = digest_cache[candidate_path]
+    if candidate_digest is None:
+        return None
+    for index, raw_path in enumerate(generated_paths):
+        if index in used_indexes:
+            continue
+        path = Path(raw_path)
+        if digest_cache.setdefault(path, _file_sha256(path)) == candidate_digest:
+            return index
+    return None
+
+
+def build_selection_delivery_paths(
+    generated_paths: Sequence[Path],
+    selection: ImageSelectionResult,
+) -> list[Path]:
+    """Return the selected winner first, then all successful candidates.
+
+    Selection AI may return a copied file, so path matching falls back to
+    content identity.  Score data is advisory and only orders the candidates;
+    absent or malformed score data preserves generation order.
+    """
+
+    generated = [Path(path) for path in generated_paths]
+    if not selection.used_selection or not generated:
+        return generated
+
+    selected = list(selection.selected_paths)
+    used_indexes: set[int] = set()
+    digest_cache: dict[Path, str | None] = {}
+    primary_index: int | None = None
+    primary_output: Path | None = None
+    for selected_path in selected:
+        primary_index = _match_generated_path(
+            Path(selected_path), generated, used_indexes, digest_cache
+        )
+        if primary_index is not None:
+            primary_output = Path(selected_path)
+            break
+    if primary_index is None:
+        primary_index = 0
+    used_indexes.add(primary_index)
+    primary = primary_output or generated[primary_index]
+
+    score_by_path: dict[Path, float] = {}
+    for raw_path, raw_score in selection.candidate_scores.items():
+        try:
+            score_by_path[Path(raw_path).resolve()] = float(raw_score)
+        except (OSError, TypeError, ValueError):
+            continue
+
+    ranked: list[tuple[int, Path, float]] = []
+    unranked: list[tuple[int, Path]] = []
+    for index, path in enumerate(generated):
+        if index in used_indexes:
+            continue
+        score = score_by_path.get(path.resolve())
+        if score is None:
+            unranked.append((index, path))
+        else:
+            ranked.append((index, path, score))
+    ranked.sort(key=lambda item: (-item[2], item[0]))
+    candidates = [path for _, path, _ in ranked] + [path for _, path in unranked]
+    logger.info(
+        "Selection delivery prepared: generated_count=%s primary=%s candidate_count=%s ranked_candidates=%s",
+        len(generated),
+        primary,
+        len(candidates),
+        len(ranked),
+    )
+    return [primary, *candidates]
 
 
 async def _generate_images_from_prompts(
@@ -1413,6 +1528,8 @@ async def _generate_images_from_shogou_result(
     pose_reference_width: int | None = None,
     pose_reference_height: int | None = None,
     pose_strength: float | None = None,
+    selection_enabled: bool = GENERATE_AI_DEFAULT_SELECTION_AI,
+    selection_generate_count: int | None = None,
 ) -> None:
     # Mirrors _generate_images_from_prompts' preserve_prompt_text=True path exactly,
     # but keeps its own message builder so /generate_raw's behavior stays untouched.
@@ -1440,6 +1557,8 @@ async def _generate_images_from_shogou_result(
         pose_reference_width=pose_reference_width,
         pose_reference_height=pose_reference_height,
         pose_strength=pose_strength,
+        selection_enabled=selection_enabled,
+        selection_generate_count=selection_generate_count,
     )
     try:
         generated_images = await asyncio.to_thread(generate_images_with_metadata, options)
@@ -1454,11 +1573,26 @@ async def _generate_images_from_shogou_result(
         return
 
     paths = [image.path for image in generated_images]
-    if (reference_image_bytes is not None or pose_reference_bytes is not None) and len(paths) == 1:
+    has_reference_image = reference_image_bytes is not None or pose_reference_bytes is not None
+    if not selection_enabled:
+        selection = ImageSelectionResult(
+            selected_paths=list(paths),
+            used_selection=False,
+            message="画像選別AIは設定で無効です。",
+        )
+    elif has_reference_image:
         selection = ImageSelectionResult(selected_paths=[], used_selection=False)
     else:
-        selection = await asyncio.to_thread(select_generated_images, paths)
-    send_paths = selection.selected_paths or paths
+        try:
+            selection = await asyncio.to_thread(select_generated_images, paths)
+        except Exception:
+            logger.exception("Image selection raised unexpectedly: label=%s", label_prefix)
+            selection = ImageSelectionResult(
+                selected_paths=list(paths),
+                used_selection=False,
+                error="画像選別AIの実行に失敗しました。",
+            )
+    send_paths = build_selection_delivery_paths(paths, selection)
     message = _build_shogou_generated_image_message(
         effective_result,
         selection,
@@ -1944,6 +2078,8 @@ async def _resume_generate_ai_after_character_confirmation(
     loras: tuple[LoraSelection, ...],
     seed: int | None,
     last_settings: GenerateAiLastSettings,
+    selection_enabled: bool,
+    selection_generate_count: int | None,
 ) -> None:
     confirmed_result = replace(
         result,
@@ -1981,6 +2117,8 @@ async def _resume_generate_ai_after_character_confirmation(
         pose_reference_width=pose_reference_width,
         pose_reference_height=pose_reference_height,
         pose_strength=pose_strength,
+        selection_enabled=selection_enabled,
+        selection_generate_count=selection_generate_count,
     )
 
 
@@ -2390,6 +2528,8 @@ def setup(client: discord.Client) -> None:
                     loras=resolved_settings.loras,
                     seed=seed,
                     last_settings=last_settings,
+                    selection_enabled=resolved_settings.selection_ai,
+                    selection_generate_count=resolved_settings.candidate_count,
                 )
 
             confirmation_view = GenerateAiDanbooruCharacterConfirmationView(
@@ -2438,6 +2578,8 @@ def setup(client: discord.Client) -> None:
             pose_reference_width=None,
             pose_reference_height=None,
             pose_strength=pose_strength,
+            selection_enabled=resolved_settings.selection_ai,
+            selection_generate_count=resolved_settings.candidate_count,
         )
 
     @client.tree.command(

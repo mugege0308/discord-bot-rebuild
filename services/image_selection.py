@@ -1,10 +1,11 @@
+import csv
 import logging
 import os
 import shutil
 import subprocess
 import sys
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
@@ -27,6 +28,10 @@ class ImageSelectionResult:
     used_selection: bool
     message: str = ""
     error: str = ""
+    # Best-effort scores produced by the external selector.  The selection
+    # algorithm remains owned by that tool; this data only lets delivery keep
+    # the remaining generated candidates in ranking order.
+    candidate_scores: dict[Path, float] = field(default_factory=dict)
 
 
 def _local_ai_project_dir() -> Path | None:
@@ -109,6 +114,35 @@ def _load_selected_paths(project_dir: Path) -> list[Path]:
         for path in target_dir.iterdir()
         if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
     )[: get_selection_return_count()]
+
+
+def _read_candidate_scores(project_dir: Path, source_paths: list[Path]) -> dict[Path, float]:
+    """Read the selector's existing scores.csv without making it required."""
+
+    try:
+        csv_path = _latest_top5_dir(project_dir) / "scores.csv"
+        if not csv_path.exists():
+            return {}
+        with csv_path.open("r", encoding="utf-8", newline="") as handle:
+            rows_by_filename = {
+                row["filename"]: row
+                for row in csv.DictReader(handle)
+                if "filename" in row
+            }
+    except Exception:
+        logger.warning("Could not read selection score data; continuing without it.", exc_info=True)
+        return {}
+
+    scores: dict[Path, float] = {}
+    for index, source_path in enumerate(source_paths, start=1):
+        row = rows_by_filename.get(f"{index:02d}_{source_path.name}")
+        if row is None:
+            continue
+        try:
+            scores[source_path] = float(row["score"])
+        except (KeyError, TypeError, ValueError):
+            continue
+    return scores
 
 
 def select_generated_images(paths: list[Path]) -> ImageSelectionResult:
@@ -197,8 +231,10 @@ def select_generated_images(paths: list[Path]) -> ImageSelectionResult:
             error="画像選別AIは完了しましたが、上位画像が見つかりませんでした。",
         )
 
+    candidate_scores = _read_candidate_scores(project_dir, source_paths)
     return ImageSelectionResult(
         selected_paths,
         True,
         message=f"画像選別AIで上位{len(selected_paths)}枚を選びました。",
+        candidate_scores=candidate_scores,
     )

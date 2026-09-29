@@ -2006,58 +2006,81 @@ def _generate_comfy_images_with_metadata(options: SdGenerationOptions) -> list[G
         )
 
     images: list[GeneratedImage] = []
+    candidate_failures: list[Exception] = []
     for batch_index in range(1, options.count + 1):
-        workflow, seed_node_id, seed_key = _apply_comfy_options(
-            _load_comfy_workflow(reference_enabled, loras),
-            options,
-            reference_image_name,
-            pose_reference_name=pose_reference_name,
-            pose_control_image_name=pose_control_image_name,
-            pose_backend=pose_backend,
-        )
-
-        seed_value: int | None = None
-        if seed_node_id and seed_key:
-            seed_inputs = _node_inputs(workflow, seed_node_id) or {}
-            raw_seed = seed_inputs.get(seed_key)
-            seed_value = raw_seed if isinstance(raw_seed, int) else None
-
-        checkpoint_name = _extract_checkpoint_name(workflow)
-        sampler_node_id = _find_sampler_node(workflow)
-        steps, cfg, sampler_name, scheduler = _extract_sampler_settings(workflow, sampler_node_id)
-        width, height = _extract_latent_dimensions(workflow)
-
-        prompt_id = _queue_comfy_prompt_with_logging(workflow, client_id)
-        history = _wait_comfy_history(prompt_id)
-        paths = _download_comfy_images(history, batch_index)
-
-        for path in paths:
-            images.append(
-                GeneratedImage(
-                    path=path,
-                    batch_index=batch_index,
-                    seed=seed_value,
-                    checkpoint_name=checkpoint_name,
-                    sampler_name=sampler_name,
-                    scheduler=scheduler,
-                    steps=steps,
-                    cfg=cfg,
-                    width=width,
-                    height=height,
-                    workflow_file=workflow_file_text,
-                    workflow_hash=workflow_hash,
-                    pose_backend=pose_backend,
-                    pose_reference_profile=(
-                        None if pose_result is None else pose_result.get("profile")
-                    ),
-                    pose_profile_reason=(
-                        None if pose_result is None else pose_result.get("profile_reason")
-                    ),
-                    pose_reference_debug_path=(
-                        None if pose_result is None else pose_result.get("skeleton_path")
-                    ),
-                )
+        try:
+            workflow, seed_node_id, seed_key = _apply_comfy_options(
+                _load_comfy_workflow(reference_enabled, loras),
+                options,
+                reference_image_name,
+                pose_reference_name=pose_reference_name,
+                pose_control_image_name=pose_control_image_name,
+                pose_backend=pose_backend,
             )
+
+            seed_value: int | None = None
+            if seed_node_id and seed_key:
+                seed_inputs = _node_inputs(workflow, seed_node_id) or {}
+                raw_seed = seed_inputs.get(seed_key)
+                seed_value = raw_seed if isinstance(raw_seed, int) else None
+
+            checkpoint_name = _extract_checkpoint_name(workflow)
+            sampler_node_id = _find_sampler_node(workflow)
+            steps, cfg, sampler_name, scheduler = _extract_sampler_settings(workflow, sampler_node_id)
+            width, height = _extract_latent_dimensions(workflow)
+
+            prompt_id = _queue_comfy_prompt_with_logging(workflow, client_id)
+            history = _wait_comfy_history(prompt_id)
+            paths = _download_comfy_images(history, batch_index)
+
+            for path in paths:
+                images.append(
+                    GeneratedImage(
+                        path=path,
+                        batch_index=batch_index,
+                        seed=seed_value,
+                        checkpoint_name=checkpoint_name,
+                        sampler_name=sampler_name,
+                        scheduler=scheduler,
+                        steps=steps,
+                        cfg=cfg,
+                        width=width,
+                        height=height,
+                        workflow_file=workflow_file_text,
+                        workflow_hash=workflow_hash,
+                        pose_backend=pose_backend,
+                        pose_reference_profile=(
+                            None if pose_result is None else pose_result.get("profile")
+                        ),
+                        pose_profile_reason=(
+                            None if pose_result is None else pose_result.get("profile_reason")
+                        ),
+                        pose_reference_debug_path=(
+                            None if pose_result is None else pose_result.get("skeleton_path")
+                        ),
+                    )
+                )
+        except Exception as exc:
+            # Candidate failures must not discard successful siblings. Preserve
+            # the historical single-image behavior by re-raising immediately
+            # when there is no candidate fan-out.
+            if options.count <= 1:
+                raise
+            candidate_failures.append(exc)
+            logger.exception(
+                "ComfyUI candidate failed; continuing with remaining candidates: batch_index=%s/%s",
+                batch_index,
+                options.count,
+            )
+
+    if not images and candidate_failures:
+        raise RuntimeError("すべての候補画像の生成に失敗しました。") from candidate_failures[-1]
+    if candidate_failures:
+        logger.warning(
+            "ComfyUI generation completed with partial candidate failures: failed=%s succeeded=%s",
+            len(candidate_failures),
+            len(images),
+        )
     return images
 
 
