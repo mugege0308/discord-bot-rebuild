@@ -58,6 +58,7 @@ from services.sd_control import (
     resolve_reference_strength,
 )
 from services.shogou_prompt_designer import (
+    PROMPT_RATING_AUTO,
     ShogouPromptResult,
     generate_shogou_composition_variation,
     generate_shogou_custom_instruction_variation,
@@ -78,6 +79,13 @@ SHOGOU_MESSAGE_LIMIT = 1900
 GENERATE_AI_MODEL_CHOICES = [
     app_commands.Choice(name="Animagine XL 4.0 Clear", value="animagine"),
     app_commands.Choice(name="JANKU v7.77", value="janku"),
+]
+GENERATE_AI_PROMPT_RATING_CHOICES = [
+    app_commands.Choice(name="Auto", value=PROMPT_RATING_AUTO),
+    app_commands.Choice(name="Safe", value="safe"),
+    app_commands.Choice(name="Sensitive", value="sensitive"),
+    app_commands.Choice(name="NSFW", value="nsfw"),
+    app_commands.Choice(name="Explicit", value="explicit"),
 ]
 GENERATE_AI_INPUT_MODE_CHOICES = [
     app_commands.Choice(name=INPUT_MODE_LABELS[JAPANESE_AI_INPUT_MODE], value=JAPANESE_AI_INPUT_MODE),
