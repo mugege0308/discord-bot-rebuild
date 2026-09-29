@@ -39,6 +39,7 @@ from services.image_selection import (
     select_generated_images,
 )
 from services.image_analyzer import MAX_IMAGE_BYTES, detect_image_content_type, validate_image_bytes
+from services.image_composition import DEFAULT_COMPOSITION_PRESET, DEFAULT_SIZE_KEY
 from services.image_generation_profiles import (
     DEFAULT_IMAGE_GENERATION_MODEL_KEY,
     get_image_generation_profile,
@@ -76,6 +77,8 @@ SHOGOU_MAX_ASSUMPTIONS_DISPLAY = 5
 SHOGOU_ASSUMPTION_ITEM_LIMIT = 200
 SHOGOU_SUMMARY_LIMIT = 300
 SHOGOU_MESSAGE_LIMIT = 1900
+REFERENCE_MODE_NONE = "none"
+GENERATE_AI_DEFAULT_SELECTION_AI = True
 GENERATE_AI_MODEL_CHOICES = [
     app_commands.Choice(name="Animagine XL 4.0 Clear", value="animagine"),
     app_commands.Choice(name="JANKU v7.77", value="janku"),
