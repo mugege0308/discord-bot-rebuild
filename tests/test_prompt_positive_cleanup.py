@@ -1,6 +1,6 @@
 import unittest
 
-from services.prompt_positive_cleanup import cleanup_positive_prompt
+from services.prompt_positive_cleanup import cleanup_positive_prompt, normalize_negative_prompt
 
 
 class PromptPositiveCleanupTestCase(unittest.TestCase):
@@ -60,6 +60,12 @@ class PromptPositiveCleanupTestCase(unittest.TestCase):
             "kochiya sanae, safe, from below, looking back, smile",
         )
         self.assertEqual(result.removed_tags, ())
+
+    def test_negative_signature_watermark_is_serialized_as_two_tags(self):
+        self.assertEqual(
+            normalize_negative_prompt("lowres, signature watermark, bad anatomy"),
+            "lowres, signature, watermark, bad anatomy",
+        )
 
 
 if __name__ == "__main__":

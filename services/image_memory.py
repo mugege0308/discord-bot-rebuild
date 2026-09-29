@@ -6,6 +6,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from services.prompt_context_conflicts import filter_conflicting_weak_visual_hints
+
 
 logger = logging.getLogger("secretary-bot.image_memory")
 
@@ -436,6 +438,14 @@ def select_image_memory_tags(
 
 def build_image_memory_prompt_context(user_id: int, query: str, reference_id: int | None = None) -> str:
     reference_ids, tags = select_image_memory_tags(user_id, query, reference_id)
+    tags, excluded_tags = filter_conflicting_weak_visual_hints(tags, query)
+    if excluded_tags:
+        logger.info(
+            "Image memory tags excluded by explicit visual request: user_id=%s reference_ids=%s excluded=%s",
+            user_id,
+            reference_ids,
+            excluded_tags,
+        )
     if not tags:
         return ""
     mode = "明示指定のため全タグ" if reference_id is not None else f"関連タグのみ最大{MAX_NORMAL_REFERENCE_TAGS}個"

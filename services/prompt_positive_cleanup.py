@@ -18,6 +18,13 @@ _STANDALONE_NUMBER_RE = re.compile(r"^[+-]?(?:\d+(?:\.\d+)?|\.\d+)$")
 _SPACED_COUNT_TAG_RE = re.compile(r"^(?P<count>\d+)\s+(?P<kind>girls?|boys?|others?)$")
 _TAG_SEPARATOR_RE = re.compile(r"[_\-]+")
 
+# A small, explicit repair for a common LM serialization mistake.  Do not
+# split arbitrary whitespace-separated English: many Danbooru tags contain
+# spaces.  This list is intentionally high-confidence and easy to extend.
+_NEGATIVE_COMPOUND_SPLITS: dict[str, tuple[str, ...]] = {
+    "signature watermark": ("signature", "watermark"),
+}
+
 # These are deliberately only high-confidence equivalences.  The canonical
 # side is the prompt spelling used by the core/general resolver, not a free
 # form LLM output.
@@ -32,6 +39,82 @@ class PositivePromptCleanupResult:
     positive: str
     removed_tags: tuple[str, ...] = ()
     removed_reasons: tuple[tuple[str, str], ...] = ()
+
+
+def normalize_negative_prompt(negative: str) -> str:
+    """Normalize only known compound negative tags and duplicate separators."""
+
+    output: list[str] = []
+    seen: set[str] = set()
+    for raw_token in str(negative or "").split(","):
+        token = " ".join(raw_token.strip().split())
+        if not token:
+            continue
+        replacements = _NEGATIVE_COMPOUND_SPLITS.get(normalize_prompt_tag_key(token))
+        for replacement in replacements or (token,):
+            replacement = replacement.strip()
+            key = normalize_prompt_tag_key(replacement)
+            if not key or key in seen:
+                continue
+            output.append(replacement)
+            seen.add(key)
+    return ", ".join(output)
+
+
+def enforce_atomic_prompt_tags(
+    positive: str,
+    atomic_tags: Iterable[str],
+) -> str:
+    """Keep confirmed identity tags intact through the final prompt merge."""
+
+    atomic = tuple(
+        str(tag).strip()
+        for tag in atomic_tags
+        if str(tag or "").strip()
+    )
+    if not atomic:
+        return str(positive or "").strip()
+
+    atomic_keys = {normalize_prompt_tag_key(tag) for tag in atomic}
+    component_keys: set[str] = set(atomic_keys)
+    base_keys: set[str] = set()
+    for tag in atomic:
+        if "(" in tag and tag.endswith(")"):
+            base, context = tag[:-1].split("(", 1)
+            base_key = normalize_prompt_tag_key(base)
+            if base_key:
+                base_keys.add(base_key)
+                component_keys.add(base_key)
+            context_key = normalize_prompt_tag_key(context)
+            if context_key:
+                component_keys.add(context_key)
+
+    kept: list[str] = []
+    seen: set[str] = set()
+    for raw_token in str(positive or "").split(","):
+        token = raw_token.strip()
+        if not token:
+            continue
+        key = normalize_prompt_tag_key(token)
+        if key in component_keys and key not in atomic_keys:
+            continue
+        if any(base_key and key.startswith(f"{base_key} (") for base_key in base_keys):
+            continue
+        if key in seen:
+            continue
+        kept.append(token)
+        seen.add(key)
+
+    for tag in atomic:
+        key = normalize_prompt_tag_key(tag)
+        if key in seen:
+            continue
+        insert_at = 0
+        if kept and re.fullmatch(r"\d+(?:girl|girls|boy|boys|other)", kept[0].casefold()):
+            insert_at = 1
+        kept[insert_at:insert_at] = [tag]
+        seen.add(key)
+    return ", ".join(kept)
 
 
 def normalize_prompt_tag_key(value: str) -> str:

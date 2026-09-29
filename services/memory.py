@@ -4,6 +4,10 @@ import re
 from datetime import datetime
 from pathlib import Path
 
+from services.prompt_context_conflicts import (
+    filter_conflicting_weak_visual_hints,
+    weak_visual_hint_conflicts_with_request,
+)
 from services.weather import JST
 
 
@@ -735,12 +739,34 @@ def search_memories(user_id: int, query: str, limit: int = 7) -> list[dict[str, 
     return result
 
 
-def build_memory_summary(user_id: int, query: str, mode: str = "generic") -> str:
+def build_memory_summary(
+    user_id: int,
+    query: str,
+    mode: str = "generic",
+    *,
+    compact: bool = False,
+) -> str:
     memories = search_memories(user_id, query)
     if mode == "prompt":
         # Image reference memories are selected from data/image_memory with their
         # own relevance and tag-limit rules. Never feed their copied free text to the LLM.
         memories = [item for item in memories if not _memory_text(item).startswith("画像参考メモ")]
+        conflicting_memory_ids = [
+            _memory_id(item)
+            for item in memories
+            if weak_visual_hint_conflicts_with_request(_memory_text(item), query)
+        ]
+        if conflicting_memory_ids:
+            memories = [
+                item
+                for item in memories
+                if not weak_visual_hint_conflicts_with_request(_memory_text(item), query)
+            ]
+            logger.info(
+                "Prompt memory items excluded by explicit visual request: query_length=%s memory_ids=%s",
+                len(query),
+                conflicting_memory_ids,
+            )
     if not memories:
         return ""
 
@@ -774,27 +800,33 @@ def build_memory_summary(user_id: int, query: str, mode: str = "generic") -> str
         else:
             other_items.append(text)
 
-    lines = [
+    lines = [] if compact else [
         "このユーザーの好み・前提として、以下を優先的に反映してください。",
         "今回の依頼に明示された人物・服装・背景・場所・色・構図を最優先してください。",
         "今回の依頼と矛盾する保存済みメモリは使わないでください。",
     ]
     if preference_items:
-        lines.append("特に優先する好み: " + " / ".join(preference_items[:4]))
+        label = "Memory preference: " if compact else "特に優先する好み: "
+        lines.append(label + " / ".join(preference_items[:4]))
     if mode == "prompt" or _query_is_image_related(query):
         if image_items:
-            lines.append("画像生成・プロンプト関連で優先する情報: " + " / ".join(image_items[:5]))
+            label = "Memory image hints: " if compact else "画像生成・プロンプト関連で優先する情報: "
+            lines.append(label + " / ".join(image_items[:5]))
         if converted_tags:
-            lines.append(
-                "初号ちゃんがメモリからルールベースで変換したタグ。"
-                "今回の依頼に合う場合だけ、補助的に最大5個まで反映してください: "
-                + ", ".join(converted_tags)
-            )
+            if compact:
+                lines.append("Memory tags (use only when relevant, max 5): " + ", ".join(converted_tags))
+            else:
+                lines.append(
+                    "初号ちゃんがメモリからルールベースで変換したタグ。"
+                    "今回の依頼に合う場合だけ、補助的に最大5個まで反映してください: "
+                    + ", ".join(converted_tags)
+                )
     if other_items:
-        lines.append("その他の参考情報: " + " / ".join(other_items[:4]))
+        label = "Memory notes: " if compact else "その他の参考情報: "
+        lines.append(label + " / ".join(other_items[:4]))
     if mode == "chat":
         lines.append("回答では、可能なら上記の保存済みメモを自然に引用または活用してください。")
-    if mode == "prompt":
+    if mode == "prompt" and not compact:
         lines.append(
             "プロンプト生成では、背景系メモリより人物・画風・色味のメモリを優先してください。"
             "入力文にカフェ・街・学校・部屋など別背景がある場合、神社・鳥居・和服などの背景寄りメモリは混ぜないでください。"
@@ -818,6 +850,8 @@ def build_memory_summary(user_id: int, query: str, mode: str = "generic") -> str
             converted_tags,
         )
 
+    if compact and lines:
+        lines.insert(0, "Memory hints (weak; current request wins; ignore conflicts):")
     summary = "\n".join(lines)
     if len(summary) > MAX_CONTEXT_CHARS:
         summary = summary[: MAX_CONTEXT_CHARS - 20] + "\n...(truncated)"
@@ -825,11 +859,18 @@ def build_memory_summary(user_id: int, query: str, mode: str = "generic") -> str
     return summary
 
 
-def append_memory_to_system_prompt(system_prompt: str, user_id: int | None, query: str, mode: str = "generic") -> str:
+def append_memory_to_system_prompt(
+    system_prompt: str,
+    user_id: int | None,
+    query: str,
+    mode: str = "generic",
+    *,
+    compact: bool = False,
+) -> str:
     if user_id is None:
         return system_prompt
 
-    memory_summary = build_memory_summary(user_id, query, mode=mode)
+    memory_summary = build_memory_summary(user_id, query, mode=mode, compact=compact)
     if not memory_summary:
         return system_prompt
     return f"{system_prompt.rstrip()}\n\n{memory_summary}"

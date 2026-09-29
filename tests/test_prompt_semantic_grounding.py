@@ -3,7 +3,9 @@ import unittest
 from unittest import mock
 
 from services.prompt_semantic_grounding import ground_prompt_semantics
-from services.shogou_prompt_designer import generate_shogou_prompt_result
+from services.shogou_prompt_designer import (
+    generate_shogou_prompt_result,
+)
 
 
 class PromptSemanticGroundingTestCase(unittest.TestCase):
@@ -99,6 +101,112 @@ class PromptSemanticGroundingTestCase(unittest.TestCase):
 
         self.assertIn("anime style", result.positive)
 
+    def test_unrequested_color_palette_is_removed_even_if_resolver_authorized_it(self):
+        result = ground_prompt_semantics(
+            "1girl, hu tao, genshin impact, safe, arms crossed, cool colors, "
+            "blue tones, from below, masterpiece, high score, great score, absurdres",
+            user_input="原神の胡桃が腕を組んで少し下から",
+            authoritative_prompt_tags=("cool colors", "blue tones", "arms crossed"),
+            assumptions=(
+                "暖かな照明で寒色系の服と調和させた",
+                "背景はシンプルな室内",
+            ),
+        )
+
+        self.assertIn("arms crossed", result.positive)
+        self.assertIn("from below", result.positive)
+        self.assertNotIn("cool colors", result.positive)
+        self.assertNotIn("blue tones", result.positive)
+        self.assertEqual(result.assumptions, ())
+        self.assertEqual(
+            result.removed_assumptions,
+            (
+                "暖かな照明で寒色系の服と調和させた",
+                "背景はシンプルな室内",
+            ),
+        )
+
+    def test_explicit_color_palette_is_preserved(self):
+        result = ground_prompt_semantics(
+            "1girl, hu tao, blue tones, masterpiece",
+            user_input="原神の胡桃が青系の色調で笑っている",
+            assumptions=("青系の色調",),
+        )
+
+        self.assertIn("blue tones", result.positive)
+        self.assertEqual(result.assumptions, ("青系の色調",))
+
+    def test_strict_provenance_drops_ungrounded_llm_semantics(self):
+        result = ground_prompt_semantics(
+            "1girl, hu tao, genshin impact, hu tao (genshin impact), safe, arms crossed, partial body, "
+            "orange tones, from below, dramatic lighting, stylish outfit, "
+            "masterpiece, high score, great score, absurdres",
+            user_input="原神の胡桃が腕を組んで少し下から",
+            authoritative_prompt_tags=(
+                "hu tao (genshin impact)",
+                "arms crossed",
+                "from below",
+            ),
+            authoritative_tag_sources={
+                "hu tao (genshin impact)": "confirmed_character",
+                "arms crossed": "general_resolver",
+                "from below": "core_resolver",
+            },
+            strict_unknown=True,
+        )
+
+        self.assertIn("1girl", result.positive)
+        self.assertIn("safe", result.positive)
+        self.assertIn("masterpiece", result.positive)
+        self.assertIn("hu tao (genshin impact)", result.positive)
+        final_tokens = {token.strip() for token in result.positive.split(",")}
+        for unwanted in (
+            "hu tao",
+            "genshin impact",
+            "partial body",
+            "orange tones",
+            "dramatic lighting",
+            "stylish outfit",
+        ):
+            self.assertNotIn(unwanted, final_tokens)
+        for removed in (
+            "hu tao",
+            "genshin impact",
+            "partial body",
+            "orange tones",
+            "dramatic lighting",
+            "stylish outfit",
+        ):
+            self.assertIn(removed, result.removed_ungrounded_tags)
+        self.assertIn(
+            ("hu tao (genshin impact)", "confirmed_character"),
+            result.tag_provenance,
+        )
+
+    def test_strict_provenance_keeps_explicit_orange_palette(self):
+        result = ground_prompt_semantics(
+            "1girl, hu tao (genshin impact), safe, arms crossed, orange tones, "
+            "from below, masterpiece",
+            user_input="原神の胡桃がオレンジ系の色調で腕を組んで少し下から",
+            authoritative_prompt_tags=(
+                "hu tao (genshin impact)",
+                "arms crossed",
+                "from below",
+            ),
+            authoritative_tag_sources={
+                "hu tao (genshin impact)": "confirmed_character",
+                "arms crossed": "general_resolver",
+                "from below": "core_resolver",
+            },
+            strict_unknown=True,
+        )
+
+        self.assertIn("orange tones", result.positive)
+        self.assertEqual(
+            dict(result.tag_provenance)["orange tones"],
+            "user_explicit",
+        )
+
     def test_prompt_designer_result_exposes_grounding_trace(self):
         text = "崩壊スターレイルのアスター 後ろで手を組んで前かがみ"
         raw = json.dumps(
@@ -108,7 +216,7 @@ class PromptSemanticGroundingTestCase(unittest.TestCase):
                     "hands behind back, slouched posture, school uniform, "
                     "classroom background, natural lighting, masterpiece"
                 ),
-                "negative": "lowres",
+                "negative": "signature watermark",
                 "summary": "test",
                 "assumptions": ["school uniform", "classroom setting"],
             },
@@ -138,6 +246,7 @@ class PromptSemanticGroundingTestCase(unittest.TestCase):
         self.assertIn("leaning forward", result.pose_normalizations[0])
         self.assertNotIn("school uniform", result.positive)
         self.assertEqual(result.assumptions, ())
+        self.assertEqual(result.negative, "signature, watermark")
 
     def test_prompt_designer_rechecks_late_additions_and_rebuilds_summary(self):
         text = "崩壊スターレイルのアスター 後ろで手を組んで前かがみ"
@@ -184,7 +293,10 @@ class PromptSemanticGroundingTestCase(unittest.TestCase):
                 requested_rating="safe",
             )
 
-        self.assertIn("asta (honkai: star rail)", result.positive)
+        # The raw LLM character spelling is not authoritative when no
+        # character resolver/registry result was supplied.  Provenance
+        # grounding must not allow it to become a final identity tag.
+        self.assertNotIn("asta (honkai: star rail)", result.positive)
         self.assertIn("1girl", result.positive)
         self.assertIn("hands behind back", result.positive)
         self.assertIn("leaning forward", result.positive)
@@ -204,6 +316,7 @@ class PromptSemanticGroundingTestCase(unittest.TestCase):
         self.assertNotIn("blue tones", result.summary)
         self.assertNotIn("slouched posture", result.summary)
         self.assertTrue(result.semantic_grounding_result)
+        self.assertIn("asta (honkai: star rail)", result.removed_ungrounded_tags)
 
 
 if __name__ == "__main__":

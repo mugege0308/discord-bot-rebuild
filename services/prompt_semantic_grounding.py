@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import unicodedata
 from dataclasses import dataclass
-from typing import Iterable
+from typing import Iterable, Mapping
 
 from services.prompt_positive_cleanup import normalize_prompt_tag_key
 
@@ -26,6 +26,11 @@ class PromptSemanticGroundingResult:
     pose_normalizations: tuple[str, ...] = ()
     assumptions: tuple[str, ...] = ()
     removed_assumptions: tuple[str, ...] = ()
+    candidate_final_tags: tuple[str, ...] = ()
+    tag_provenance: tuple[tuple[str, str], ...] = ()
+    grounded_tags: tuple[str, ...] = ()
+    llm_only_tags: tuple[str, ...] = ()
+    removed_ungrounded_tags: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -81,6 +86,16 @@ _RULES: tuple[_SemanticRule, ...] = (
         ("前かがみ", "前屈み", "前にかが", "身を乗り出", "leaning forward"),
     ),
     _SemanticRule(
+        "arms crossed",
+        "pose.arms_crossed",
+        ("腕を組", "腕組み", "arms crossed"),
+    ),
+    _SemanticRule(
+        "partial body",
+        "framing.partial_body",
+        ("部分的な体", "部分的な身体", "partial body"),
+    ),
+    _SemanticRule(
         "slouched posture",
         "pose.slouched",
         ("猫背", "だらっとした姿勢", "姿勢が悪", "slouched posture"),
@@ -100,12 +115,57 @@ _RULES: tuple[_SemanticRule, ...] = (
     _SemanticRule("soft lighting", "lighting.soft", ("柔らかい光", "柔らかな光", "ソフトな光", "soft lighting")),
     _SemanticRule("warm lighting", "lighting.warm", ("暖かい光", "暖かな光", "暖色の光", "warm lighting")),
     _SemanticRule("sunlight", "lighting.sunlight", ("日光", "陽光", "sunlight")),
-    _SemanticRule("balanced color palette", "color_palette.balanced", ("balanced color palette",)),
+    _SemanticRule(
+        "cool colors",
+        "color_palette.cool",
+        ("寒色系", "寒色", "cool colors", "cool tones", "cool color palette"),
+    ),
+    _SemanticRule(
+        "warm colors",
+        "color_palette.warm",
+        ("暖色系", "暖色", "warm colors", "warm tones", "warm color palette"),
+    ),
     _SemanticRule(
         "blue tones",
         "color_palette.blue",
         ("青系", "青み", "青い色", "blue tones", "blue tone"),
     ),
+    _SemanticRule(
+        "red tones",
+        "color_palette.red",
+        ("赤系", "赤み", "赤い色", "red tones", "red tone"),
+    ),
+    _SemanticRule(
+        "orange tones",
+        "color_palette.orange",
+        ("オレンジ系", "オレンジ色", "orange tones", "orange tone", "orange color"),
+    ),
+    _SemanticRule(
+        "pastel colors",
+        "color_palette.pastel",
+        ("パステル", "pastel colors", "pastel tones"),
+    ),
+    _SemanticRule(
+        "monochrome",
+        "color_palette.monochrome",
+        ("モノクロ", "monochrome", "monochromatic"),
+    ),
+    _SemanticRule(
+        "colorful",
+        "color_palette.colorful",
+        ("カラフル", "colorful"),
+    ),
+    _SemanticRule(
+        "muted colors",
+        "color_palette.muted",
+        ("くすんだ色", "落ち着いた色", "muted colors", "muted tones"),
+    ),
+    _SemanticRule(
+        "vibrant colors",
+        "color_palette.vibrant",
+        ("鮮やかな色", "鮮やか", "vibrant colors", "vibrant tones"),
+    ),
+    _SemanticRule("balanced color palette", "color_palette.balanced", ("balanced color palette",)),
     _SemanticRule(
         "stylish outfit",
         "clothing.style",
@@ -149,6 +209,10 @@ _QUALITY_OR_STRUCTURE = frozenset(
         "2girls",
         "2boys",
         "solo",
+        "1 girl",
+        "1 boy",
+        "2 girls",
+        "2 boys",
     }
 )
 _QUALITY_SUFFIX = frozenset(
@@ -173,6 +237,57 @@ _KNOWN_POSE_WORDS = frozenset({"standing", "sitting", "kneeling", "squatting", "
 _KNOWN_EXPRESSION_WORDS = frozenset({"cute", "smile", "smiling", "smiley face", "grin", "serious", "surprised", "blush", "closed eyes", "eyes closed"})
 _KNOWN_GAZE_WORDS = frozenset({"looking at viewer", "facing viewer", "looking away", "looking back", "looking to the side", "front view"})
 _KNOWN_PROP_WORDS = frozenset({"umbrella", "book", "sword", "bag", "microphone", "flower", "phone", "weapon"})
+
+_COLOR_PALETTE_CATEGORY_PREFIX = "color_palette."
+_ASSUMPTION_COLOR_CUES = (
+    "色調",
+    "配色",
+    "色合い",
+    "寒色",
+    "暖色",
+    "青系",
+    "青み",
+    "赤系",
+    "赤み",
+    "パステル",
+    "モノクロ",
+    "カラフル",
+    "くすんだ色",
+    "落ち着いた色",
+    "鮮やかな色",
+    "color palette",
+    "color tones",
+    "cool tones",
+    "warm tones",
+    "blue tones",
+    "red tones",
+)
+_ASSUMPTION_LIGHTING_CUES = (
+    "照明",
+    "ライティング",
+    "光",
+    "lighting",
+    "light",
+)
+_ASSUMPTION_BACKGROUND_CUES = (
+    "背景",
+    "室内",
+    "屋内",
+    "教室",
+    "屋外",
+    "background",
+    "indoor",
+    "outdoor",
+)
+_ASSUMPTION_CLOTHING_CUES = (
+    "服",
+    "衣装",
+    "制服",
+    "上着",
+    "衣類",
+    "outfit",
+    "clothing",
+)
 
 
 def _normalized_text(value: str) -> str:
@@ -235,7 +350,25 @@ def _tag_categories(tag: str) -> frozenset[str]:
         categories.add("gaze.generic")
     if key in _KNOWN_PROP_WORDS:
         categories.add("prop.generic")
+    if any(marker in key for marker in ("color palette", "colors", "color tone", "color tones", "palette")):
+        categories.add("color_palette.generic")
     return frozenset(categories)
+
+
+def _assumption_categories(text: str) -> set[str]:
+    """Classify natural-language assumptions without requiring tag equality."""
+
+    normalized = _normalized_text(text)
+    categories: set[str] = set()
+    if any(cue.casefold() in normalized for cue in _ASSUMPTION_COLOR_CUES):
+        categories.add("color_palette.generic")
+    if any(cue.casefold() in normalized for cue in _ASSUMPTION_LIGHTING_CUES):
+        categories.add("lighting.generic")
+    if any(cue.casefold() in normalized for cue in _ASSUMPTION_BACKGROUND_CUES):
+        categories.add("background.generic")
+    if any(cue.casefold() in normalized for cue in _ASSUMPTION_CLOTHING_CUES):
+        categories.add("clothing.generic")
+    return categories
 
 
 def _insert_before_quality(tags: list[str], additions: Iterable[str]) -> list[str]:
@@ -260,7 +393,14 @@ def _filter_assumptions(
     assumptions: Iterable[str],
     *,
     explicit_categories: set[str],
+    strict_unknown: bool = False,
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    def grounded_by_explicit_category(category: str) -> bool:
+        if category in explicit_categories:
+            return True
+        family = category.split(".", 1)[0]
+        return any(item.startswith(f"{family}.") for item in explicit_categories)
+
     kept: list[str] = []
     removed: list[str] = []
     for assumption in assumptions:
@@ -273,7 +413,14 @@ def _filter_assumptions(
             if _rule_hits(_normalized_text(text), rule):
                 categories.add(rule.category)
         categories.update(_tag_categories(key))
-        if categories and not categories.issubset(explicit_categories):
+        categories.update(_assumption_categories(text))
+        if strict_unknown and (
+            not categories
+            or not all(grounded_by_explicit_category(category) for category in categories)
+        ):
+            removed.append(text)
+            continue
+        if categories and not all(grounded_by_explicit_category(category) for category in categories):
             removed.append(text)
             continue
         kept.append(text)
@@ -287,12 +434,16 @@ def ground_prompt_semantics(
     authoritative_prompt_tags: Iterable[str] = (),
     assumptions: Iterable[str] = (),
     defer_character_appearance: bool = False,
+    authoritative_tag_sources: Mapping[str, str] | None = None,
+    strict_unknown: bool = False,
 ) -> PromptSemanticGroundingResult:
     """Filter known unrequested semantic tags from an Animagine LLM positive.
 
-    Unknown tags are intentionally preserved.  The function is a guardrail for
-    common semantic families, not a replacement for the core or Danbooru
-    resolvers.  Authoritative resolver tags always win over this filter.
+    In strict mode, every non-system tag must be grounded by the user,
+    deterministic normalization, or an authoritative resolver.  This is the
+    Japanese Animagine route's default policy; the non-strict default keeps
+    this helper backwards-compatible for callers that use it as a narrow
+    compatibility filter.
     """
 
     rules = _explicit_rules(user_input)
@@ -302,6 +453,13 @@ def ground_prompt_semantics(
         str(tag).strip() for tag in authoritative_prompt_tags if str(tag or "").strip()
     )
     authoritative_keys = {normalize_prompt_tag_key(tag) for tag in authoritative}
+    source_by_key = {
+        normalize_prompt_tag_key(tag): str(source).strip() or "resolver_authoritative"
+        for tag, source in (authoritative_tag_sources or {}).items()
+        if str(tag or "").strip()
+    }
+    for tag in authoritative:
+        source_by_key.setdefault(normalize_prompt_tag_key(tag), "resolver_authoritative")
     grounded: list[str] = []
     for tag in (*authoritative, *explicit_canonicals):
         if normalize_prompt_tag_key(tag) not in {normalize_prompt_tag_key(item) for item in grounded}:
@@ -310,6 +468,9 @@ def ground_prompt_semantics(
     kept: list[str] = []
     removed: list[str] = []
     reasons: list[tuple[str, str]] = []
+    provenance: dict[str, tuple[str, str]] = {}
+    llm_only: list[str] = []
+    removed_ungrounded: list[str] = []
     seen: set[str] = set()
     for raw_token in str(positive or "").split(","):
         token = raw_token.strip()
@@ -318,8 +479,14 @@ def ground_prompt_semantics(
         key = normalize_prompt_tag_key(token)
         if not key or key in seen:
             continue
-        categories = _tag_categories(token)
+        raw_categories = _tag_categories(token)
+        categories = raw_categories
+        deferred_character_appearance = False
         if defer_character_appearance:
+            deferred_character_appearance = bool(raw_categories) and all(
+                category.startswith("appearance.") or category.startswith("accessory.")
+                for category in raw_categories
+            )
             categories = frozenset(
                 category
                 for category in categories
@@ -328,13 +495,59 @@ def ground_prompt_semantics(
                     or category.startswith("accessory.")
                 )
             )
-        authorized = key in authoritative_keys or bool(categories) and categories.issubset(explicit_categories)
+        palette_categories = {
+            category
+            for category in categories
+            if category.startswith(_COLOR_PALETTE_CATEGORY_PREFIX)
+        }
+        palette_explicit = any(
+            category.startswith(_COLOR_PALETTE_CATEGORY_PREFIX)
+            for category in explicit_categories
+        )
+        # A generic resolver or character context may have supplied a palette
+        # tag, but colour direction is still semantic content.  It is only
+        # authoritative when the user explicitly requested a palette.
+        palette_authorized = not palette_categories or palette_explicit
+        # Keep the original categories for explicit-user authorization.  The
+        # deferred appearance path only removes categories from this narrow
+        # grounding pass so the dedicated character appearance filter can
+        # record and suppress unrequested identity features later.
+        explicit_authorized = bool(raw_categories) and raw_categories.issubset(
+            explicit_categories
+        )
+        source = source_by_key.get(key)
+        if key in _QUALITY_OR_STRUCTURE:
+            source = "system_quality"
+        elif explicit_authorized:
+            source = "user_explicit"
+        authorized = bool(source) and (palette_authorized or source == "system_quality")
+        if strict_unknown and not authorized and deferred_character_appearance:
+            # Character identity appearance remains the responsibility of
+            # character_appearance_filter.py.  Preserve it long enough for
+            # that filter to produce its dedicated suppression trace; an
+            # explicitly requested appearance or resolver-authoritative tag
+            # is still handled by `authorized` above.
+            kept.append(token)
+            seen.add(key)
+            provenance[key] = (token, "llm_only_deferred_character_appearance")
+            llm_only.append(token)
+            continue
+        if strict_unknown and not authorized:
+            source = "llm_only"
+            llm_only.append(token)
+            removed_ungrounded.append(token)
+            removed.append(token)
+            reasons.append((token, "llm_only_ungrounded"))
+            continue
         if categories and not authorized:
             removed.append(token)
             reasons.append((token, "unrequested_semantic:" + "+".join(sorted(categories))))
             continue
         kept.append(token)
         seen.add(key)
+        provenance[key] = (token, source or "llm_only")
+        if source == "llm_only":
+            llm_only.append(token)
 
     pose_normalizations: list[str] = []
     canonical_pose_additions: list[str] = []
@@ -344,15 +557,26 @@ def ground_prompt_semantics(
     if any(rule.category == "pose.hands_behind_back" for rule in rules):
         canonical_pose_additions.append("hands behind back")
         pose_normalizations.append("後ろで手を組む -> hands behind back")
+    if any(rule.category == "pose.hand_gesture" for rule in rules):
+        canonical_pose_additions.append("peace sign")
+        pose_normalizations.append("ピース -> peace sign")
     kept = _insert_before_quality(kept, canonical_pose_additions)
     for tag in canonical_pose_additions:
         if normalize_prompt_tag_key(tag) not in {normalize_prompt_tag_key(item) for item in grounded}:
             grounded.append(tag)
+        provenance[normalize_prompt_tag_key(tag)] = (tag, "explicit_normalization")
 
     filtered_assumptions, removed_assumptions = _filter_assumptions(
         assumptions,
         explicit_categories=explicit_categories,
+        strict_unknown=strict_unknown,
     )
+    candidate_final_tags = tuple(
+        token.strip()
+        for token in ",".join(kept).split(",")
+        if token.strip()
+    )
+    grounded_tags = tuple(dict.fromkeys(tag for tag, _source in provenance.values()))
     return PromptSemanticGroundingResult(
         positive=", ".join(kept),
         user_grounded_tags=tuple(grounded),
@@ -361,4 +585,9 @@ def ground_prompt_semantics(
         pose_normalizations=tuple(pose_normalizations),
         assumptions=filtered_assumptions,
         removed_assumptions=removed_assumptions,
+        candidate_final_tags=candidate_final_tags,
+        tag_provenance=tuple(provenance.values()),
+        grounded_tags=grounded_tags,
+        llm_only_tags=tuple(dict.fromkeys(llm_only)),
+        removed_ungrounded_tags=tuple(dict.fromkeys(removed_ungrounded)),
     )

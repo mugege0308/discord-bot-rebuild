@@ -38,7 +38,12 @@ from services.danbooru_character_resolver import (
     should_search_character_tags,
 )
 from services.character_appearance_filter import filter_unrequested_character_appearance
-from services.prompt_positive_cleanup import cleanup_positive_prompt, normalize_prompt_tag_key
+from services.prompt_positive_cleanup import (
+    cleanup_positive_prompt,
+    enforce_atomic_prompt_tags,
+    normalize_negative_prompt,
+    normalize_prompt_tag_key,
+)
 from services.prompt_semantic_grounding import ground_prompt_semantics
 from services.verified_character_registry import VerifiedCharacterRegistry
 from services.generate_ai_debug import (
@@ -88,6 +93,11 @@ class ShogouPromptResult:
     semantic_grounding_removed_assumptions: tuple[str, ...] = field(default_factory=tuple)
     pose_normalizations: tuple[str, ...] = field(default_factory=tuple)
     positive_cleanup_removed_tags: tuple[str, ...] = field(default_factory=tuple)
+    candidate_final_tags: tuple[str, ...] = field(default_factory=tuple)
+    tag_provenance: tuple[tuple[str, str], ...] = field(default_factory=tuple)
+    grounded_tags: tuple[str, ...] = field(default_factory=tuple)
+    llm_only_tags: tuple[str, ...] = field(default_factory=tuple)
+    removed_ungrounded_tags: tuple[str, ...] = field(default_factory=tuple)
     character_confirmation_required: bool = False
     character_unresolved_reason: str = ""
 
@@ -379,7 +389,9 @@ def generate_shogou_prompt_result(
                     )
 
     logger.info("Shogou system prompt generation start: user_id=%s input_length=%s", user_id, len(text))
-    system_prompt = append_memory_to_system_prompt(load_shogou_instruction(model_key), user_id, text, mode="prompt")
+    system_prompt = append_memory_to_system_prompt(
+        load_shogou_instruction(model_key), user_id, text, mode="prompt"
+    )
     if user_id is not None:
         try:
             reference_context = build_image_memory_prompt_context(user_id, text, reference_id)
@@ -394,6 +406,7 @@ def generate_shogou_prompt_result(
         system_prompt += "\n\n" + build_danbooru_tag_instruction(generic_resolution)
     if character_resolution is not None:
         system_prompt += "\n\n" + build_danbooru_character_instruction(character_resolution)
+    system_prompt = system_prompt.rstrip()
     if user_id is not None:
         mark_generate_ai_stage(trace_id, "02_prompt_build")
 
@@ -426,16 +439,31 @@ def generate_shogou_prompt_result(
         if character_resolution is not None
         else ()
     )
+    authoritative_tag_sources: dict[str, str] = {
+        tag: "core_resolver"
+        for tag in (tuple(prompt_resolution.resolved_prompt_tags) if prompt_resolution else ())
+    }
+    authoritative_tag_sources.update(
+        {
+            tag: "general_resolver"
+            for tag in (tuple(generic_resolution.selected_prompt_tags) if generic_resolution else ())
+        }
+    )
+    authoritative_tag_sources.update(
+        {tag: "confirmed_character" for tag in character_prompt_tags}
+    )
     semantic_grounding = (
         ground_prompt_semantics(
             result.positive,
             user_input=text,
             authoritative_prompt_tags=verified_prompt_tags + character_prompt_tags,
+            authoritative_tag_sources=authoritative_tag_sources,
             assumptions=result.assumptions,
             defer_character_appearance=(
                 character_resolution is not None
                 and character_resolution.has_selected_tag
             ),
+            strict_unknown=True,
         )
         if prompt_resolution is not None
         else None
@@ -458,11 +486,13 @@ def generate_shogou_prompt_result(
         final_positive = apply_danbooru_tag_resolution(final_positive, generic_resolution)
     if character_resolution is not None:
         final_positive = apply_danbooru_character_resolution(final_positive, character_resolution)
+    final_positive = enforce_atomic_prompt_tags(final_positive, character_prompt_tags)
     final_semantic_grounding = (
         ground_prompt_semantics(
             final_positive,
             user_input=text,
             authoritative_prompt_tags=verified_prompt_tags + character_prompt_tags,
+            authoritative_tag_sources=authoritative_tag_sources,
             assumptions=(
                 semantic_grounding.assumptions
                 if semantic_grounding is not None
@@ -472,12 +502,14 @@ def generate_shogou_prompt_result(
                 character_resolution is not None
                 and character_resolution.has_selected_tag
             ),
+            strict_unknown=True,
         )
         if semantic_grounding is not None
         else None
     )
     if final_semantic_grounding is not None:
         final_positive = final_semantic_grounding.positive
+    final_positive = enforce_atomic_prompt_tags(final_positive, character_prompt_tags)
     cleanup = cleanup_positive_prompt(
         final_positive,
         canonical_prompt_tags=verified_prompt_tags + character_prompt_tags,
@@ -486,6 +518,7 @@ def generate_shogou_prompt_result(
     result = replace(
         result,
         positive=cleanup.positive,
+        negative=normalize_negative_prompt(result.negative),
         raw_llm_positive=result.positive,
         raw_summary=result.summary,
         raw_assumptions=result.assumptions,
@@ -564,9 +597,36 @@ def generate_shogou_prompt_result(
         or cleanup.removed_tags
     )
     final_summary = (
-        _build_grounded_summary(result.positive)
+        _build_grounded_summary(cleanup.positive)
         if summary_was_rebuilt
         else result.summary
+    )
+    semantic_tag_provenance = tuple(
+        dict.fromkeys(
+            f"{tag} -> {source}"
+            for grounding in semantic_passes
+            for tag, source in grounding.tag_provenance
+        )
+    )
+    semantic_grounded_tags = tuple(
+        dict.fromkeys(
+            tag for grounding in semantic_passes for tag in grounding.grounded_tags
+        )
+    )
+    semantic_llm_only_tags = tuple(
+        dict.fromkeys(
+            tag for grounding in semantic_passes for tag in grounding.llm_only_tags
+        )
+    )
+    semantic_removed_ungrounded_tags = tuple(
+        dict.fromkeys(
+            tag for grounding in semantic_passes for tag in grounding.removed_ungrounded_tags
+        )
+    )
+    semantic_candidate_final_tags = tuple(
+        dict.fromkeys(
+            tag for grounding in semantic_passes for tag in grounding.candidate_final_tags
+        )
     )
     result = replace(
         result,
@@ -577,6 +637,11 @@ def generate_shogou_prompt_result(
         semantic_grounding_result=semantic_grounding_result,
         semantic_grounding_removed_assumptions=semantic_removed_assumptions,
         pose_normalizations=semantic_pose_normalizations,
+        candidate_final_tags=semantic_candidate_final_tags,
+        tag_provenance=semantic_tag_provenance,
+        grounded_tags=semantic_grounded_tags,
+        llm_only_tags=semantic_llm_only_tags,
+        removed_ungrounded_tags=semantic_removed_ungrounded_tags,
         assumptions=final_assumptions,
     )
     if user_id is not None:
