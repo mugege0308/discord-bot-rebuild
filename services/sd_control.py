@@ -18,6 +18,7 @@ from typing import Any, Sequence
 from urllib.parse import urljoin
 
 import requests
+from PIL import Image
 
 from services.pc_control import get_shutdown_delay_seconds, is_windows, schedule_shutdown
 from services.lora_catalog import (
@@ -35,6 +36,37 @@ from services.lora_training import (
     LORA_TYPE_LABELS,
     LORA_TYPE_STYLE,
 )
+from services.pose_reference import (
+    DEFAULT_POSE_END_PERCENT,
+    DEFAULT_POSE_FIT_MODE,
+    DEFAULT_POSE_START_PERCENT,
+    DEFAULT_POSE_STRENGTH,
+    POSE_ANIMEPOSE_CONFIDENCE,
+    POSE_ANIMEPOSE_MASK_GATE,
+    POSE_ANIMEPOSE_MASK_TOLERANCE,
+    POSE_ANIMEPOSE_MIN_COMPLETED_CHAINS,
+    POSE_ANIMEPOSE_MIN_VALID_BODY_KEYPOINTS,
+    POSE_BBOX_DETECTOR_NAME,
+    POSE_CONTROLNET_NAME,
+    POSE_PREPROCESSOR_NAME,
+    POSE_REFERENCE_PROFILE_FULL_BODY,
+    POSE_REFERENCE_PROFILE_UNKNOWN,
+    POSE_REFERENCE_PROFILE_UPPER_BODY,
+    POSE_SDPOSE_CHECKPOINT_NAME,
+    POSE_SDPOSE_DRAW_THRESHOLD,
+    POSE_SDPOSE_MIN_COMPLETED_CHAINS,
+    POSE_SDPOSE_MIN_DRAWN_BODY_KEYPOINTS,
+    REFERENCE_MODE_POSE,
+    animepose_keypoint_summary,
+    build_animepose_preflight_workflow,
+    build_dwpose_preflight_workflow,
+    build_sdpose_preflight_workflow,
+    classify_pose_reference_profile,
+    evaluate_pose_quality,
+    extract_json_candidates,
+    pose_fit_plan,
+    sdpose_keypoint_summary,
+)
 from services.weather import JST
 
 
@@ -42,6 +74,7 @@ logger = logging.getLogger("secretary-bot.sd_control")
 
 DATA_DIR = Path("data")
 OUTPUT_DIR = DATA_DIR / "sd_outputs"
+POSE_DEBUG_DIR = DATA_DIR / "pose_debug"
 FAVORITES_DIR = DATA_DIR / "sd_favorites"
 LATEST_FILE = DATA_DIR / "sd_latest.json"
 
@@ -74,6 +107,53 @@ COMFY_ERROR_TEXT_LIMIT = 800
 
 _generate_lock = threading.Lock()
 _shutdown_after_done = False
+
+
+# Compatibility names for the pose helpers that were historically kept in
+# sd_control.py. The implementation now lives in services.pose_reference so
+# the generation backend remains the only consumer of the quality policy.
+_pose_fit_plan = pose_fit_plan
+_sdpose_keypoint_summary = sdpose_keypoint_summary
+_animepose_keypoint_summary = animepose_keypoint_summary
+_classify_pose_reference_profile = classify_pose_reference_profile
+
+
+def _build_pose_preflight_workflow(image_name: str, options: object):
+    return build_dwpose_preflight_workflow(
+        image_name,
+        detect_hand=bool(getattr(options, "pose_detect_hand", True)),
+        detect_face=bool(getattr(options, "pose_detect_face", True)),
+    )
+
+
+def _build_sdpose_preflight_workflow(image_name: str, filename_prefix: str):
+    return build_sdpose_preflight_workflow(image_name, filename_prefix)
+
+
+def _build_animepose_preflight_workflow(image_name: str):
+    return build_animepose_preflight_workflow(image_name)
+
+
+def _sdpose_detection_is_valid(
+    summary: dict[str, Any] | None,
+    skeleton_stats: dict[str, int | float | bool] | None,
+) -> bool:
+    return bool(
+        evaluate_pose_quality(summary, skeleton_stats, backend="sdpose").get(
+            "pose_quality_pass", False
+        )
+    )
+
+
+def _animepose_detection_is_valid(
+    summary: dict[str, Any] | None,
+    skeleton_stats: dict[str, int | float | bool] | None,
+) -> bool:
+    return bool(
+        evaluate_pose_quality(summary, skeleton_stats, backend="animepose").get(
+            "pose_quality_pass", False
+        )
+    )
 
 
 @dataclass(frozen=True)
@@ -111,6 +191,18 @@ class SdGenerationOptions:
     reference_image_bytes: bytes | None = None
     reference_image_content_type: str | None = None
     reference_strength: float | None = None
+    reference_mode: str = "none"
+    pose_reference_bytes: bytes | None = None
+    pose_reference_content_type: str | None = None
+    pose_reference_width: int | None = None
+    pose_reference_height: int | None = None
+    pose_strength: float = DEFAULT_POSE_STRENGTH
+    pose_start_percent: float = DEFAULT_POSE_START_PERCENT
+    pose_end_percent: float = DEFAULT_POSE_END_PERCENT
+    pose_fit_mode: str = DEFAULT_POSE_FIT_MODE
+    pose_detect_hand: bool = True
+    pose_detect_face: bool = True
+    pose_debug_enabled: bool = True
 
 
 @dataclass(frozen=True)
@@ -134,6 +226,10 @@ class GeneratedImage:
     height: int | None = None
     workflow_file: str | None = None
     workflow_hash: str | None = None
+    pose_backend: str | None = None
+    pose_reference_profile: str | None = None
+    pose_profile_reason: str | None = None
+    pose_reference_debug_path: Path | None = None
 
 
 def _now_text() -> str:
@@ -546,6 +642,33 @@ def validate_options(options: SdGenerationOptions) -> SdGenerationOptions:
         if reference_content_type not in REFERENCE_IMAGE_EXTENSIONS:
             raise ValueError("reference_imageはJPEG / PNG / WebPを指定してください。")
 
+    reference_mode = str(options.reference_mode or "none").strip().casefold()
+    if reference_mode not in {"none", "composition", REFERENCE_MODE_POSE}:
+        raise ValueError("reference_modeはnone / composition / poseのいずれかで指定してください。")
+    pose_used = options.pose_reference_bytes is not None
+    if reference_mode == REFERENCE_MODE_POSE and not pose_used:
+        raise ValueError("pose reference画像が指定されていません。")
+    if reference_mode != REFERENCE_MODE_POSE and pose_used:
+        raise ValueError("pose reference画像はposeモードでのみ指定できます。")
+    pose_content_type = None
+    if pose_used:
+        if not isinstance(options.pose_reference_bytes, bytes) or not options.pose_reference_bytes:
+            raise ValueError("pose referenceの画像データが空です。")
+        pose_content_type = (options.pose_reference_content_type or "").split(";", 1)[0].strip().lower()
+        if pose_content_type not in REFERENCE_IMAGE_EXTENSIONS:
+            raise ValueError("pose referenceはJPEG / PNG / WebPを指定してください。")
+        if isinstance(options.pose_strength, bool) or not isinstance(options.pose_strength, (int, float)):
+            raise ValueError("pose_strengthは0.0～1.0の数値で指定してください。")
+        if not math.isfinite(float(options.pose_strength)) or not 0.0 <= float(options.pose_strength) <= 1.0:
+            raise ValueError("pose_strengthは0.0～1.0の範囲で指定してください。")
+        for name, value in (("pose_start_percent", options.pose_start_percent), ("pose_end_percent", options.pose_end_percent)):
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)) or not 0.0 <= float(value) <= 1.0:
+                raise ValueError(f"{name}は0.0～1.0の数値で指定してください。")
+        if options.pose_start_percent > options.pose_end_percent:
+            raise ValueError("pose_start_percentはpose_end_percent以下にしてください。")
+        if options.pose_fit_mode not in {"contain", "cover", "stretch"}:
+            raise ValueError("pose_fit_modeはcontain / cover / stretchのいずれかで指定してください。")
+
     return SdGenerationOptions(
         prompt=prompt,
         negative_prompt=negative_prompt,
@@ -567,6 +690,18 @@ def validate_options(options: SdGenerationOptions) -> SdGenerationOptions:
         reference_image_bytes=options.reference_image_bytes,
         reference_image_content_type=reference_content_type,
         reference_strength=reference_strength,
+        reference_mode=reference_mode,
+        pose_reference_bytes=options.pose_reference_bytes,
+        pose_reference_content_type=pose_content_type,
+        pose_reference_width=options.pose_reference_width,
+        pose_reference_height=options.pose_reference_height,
+        pose_strength=float(options.pose_strength),
+        pose_start_percent=float(options.pose_start_percent),
+        pose_end_percent=float(options.pose_end_percent),
+        pose_fit_mode=options.pose_fit_mode,
+        pose_detect_hand=bool(options.pose_detect_hand),
+        pose_detect_face=bool(options.pose_detect_face),
+        pose_debug_enabled=bool(options.pose_debug_enabled),
     )
 
 
@@ -1153,8 +1288,140 @@ def _configure_lora_loaders(
         )
 
 
+def _image_dimensions_from_bytes(image_bytes: bytes) -> tuple[int, int] | None:
+    try:
+        from io import BytesIO
+
+        with Image.open(BytesIO(image_bytes)) as image:
+            return int(image.width), int(image.height)
+    except (OSError, ValueError, SyntaxError):
+        return None
+
+
+def _configure_pose_controlnet(
+    workflow: dict[str, Any],
+    options: SdGenerationOptions,
+    *,
+    pose_reference_name: str,
+    pose_control_image_name: str | None,
+    pose_backend: str,
+    positive_node_id: str,
+    negative_node_id: str,
+) -> dict[str, str]:
+    """Attach the existing fit -> OpenPose ControlNet graph in memory only."""
+
+    sampler_node_id = _find_sampler_node(workflow)
+    if sampler_node_id is None:
+        raise RuntimeError("ポーズ参照workflowにSamplerノードが見つかりません。")
+    sampler_inputs = _node_inputs(workflow, sampler_node_id)
+    if sampler_inputs is None:
+        raise RuntimeError("ポーズ参照workflowのSampler入力が不正です。")
+    target_width, target_height = _extract_latent_dimensions(workflow)
+    if target_width is None or target_height is None:
+        raise RuntimeError("pose ControlNetへ渡す生成canvasの幅・高さを取得できませんでした。")
+    source_dimensions = _image_dimensions_from_bytes(options.pose_reference_bytes or b"")
+    if source_dimensions is None:
+        source_dimensions = (
+            options.pose_reference_width or target_width,
+            options.pose_reference_height or target_height,
+        )
+    fit = pose_fit_plan(
+        source_dimensions[0],
+        source_dimensions[1],
+        target_width,
+        target_height,
+        options.pose_fit_mode,
+    )
+
+    def new_id() -> str:
+        return _new_workflow_node_id(workflow)
+
+    load_id = new_id()
+    workflow[load_id] = {
+        "inputs": {"image": pose_control_image_name or pose_reference_name},
+        "class_type": "LoadImage",
+        "_meta": {"title": f"{pose_backend} pose skeleton input"},
+    }
+    resize_id = new_id()
+    workflow[resize_id] = {
+        "inputs": {
+            "image": [load_id, 0], "upscale_method": "lanczos",
+            "width": int(fit["resize_width"]), "height": int(fit["resize_height"]),
+            "crop": "disabled",
+        },
+        "class_type": "ImageScale",
+        "_meta": {"title": f"Fit {pose_backend} to generation canvas"},
+    }
+    control_image_id = resize_id
+    canvas_id = ""
+    composite_id = ""
+    crop_id = ""
+    if options.pose_fit_mode == "contain":
+        canvas_id = new_id()
+        workflow[canvas_id] = {
+            "inputs": {"width": target_width, "height": target_height, "batch_size": 1, "color": 0},
+            "class_type": "EmptyImage",
+            "_meta": {"title": "Black pose ControlNet canvas"},
+        }
+        composite_id = new_id()
+        workflow[composite_id] = {
+            "inputs": {
+                "destination": [canvas_id, 0], "source": [resize_id, 0],
+                "x": int(fit["left"]), "y": int(fit["top"]), "resize_source": False,
+            },
+            "class_type": "ImageCompositeMasked",
+            "_meta": {"title": f"Pad {pose_backend} with black"},
+        }
+        control_image_id = composite_id
+    elif options.pose_fit_mode == "cover":
+        crop_id = new_id()
+        workflow[crop_id] = {
+            "inputs": {
+                "image": [resize_id, 0], "upscale_method": "lanczos",
+                "width": target_width, "height": target_height, "crop": "center",
+            },
+            "class_type": "ImageScale",
+            "_meta": {"title": "Center crop pose to generation canvas"},
+        }
+        control_image_id = crop_id
+
+    loader_id = new_id()
+    workflow[loader_id] = {
+        "inputs": {"control_net_name": POSE_CONTROLNET_NAME},
+        "class_type": "ControlNetLoader",
+        "_meta": {"title": "SDXL OpenPose ControlNet"},
+    }
+    apply_id = new_id()
+    workflow[apply_id] = {
+        "inputs": {
+            "positive": [positive_node_id, 0], "negative": [negative_node_id, 0],
+            "control_net": [loader_id, 0], "image": [control_image_id, 0],
+            "strength": options.pose_strength,
+            "start_percent": options.pose_start_percent,
+            "end_percent": options.pose_end_percent,
+        },
+        "class_type": "ControlNetApplyAdvanced",
+        "_meta": {"title": "Apply OpenPose ControlNet"},
+    }
+    sampler_inputs["positive"] = [apply_id, 0]
+    sampler_inputs["negative"] = [apply_id, 1]
+    return {
+        "load_node_id": load_id, "resize_node_id": resize_id,
+        "canvas_node_id": canvas_id, "composite_node_id": composite_id,
+        "crop_node_id": crop_id, "control_image_node_id": control_image_id,
+        "control_loader_node_id": loader_id, "apply_node_id": apply_id,
+        "sampler_node_id": sampler_node_id,
+    }
+
+
 def _apply_comfy_options(
-    workflow: dict[str, Any], options: SdGenerationOptions, reference_image_name: str | None = None
+    workflow: dict[str, Any],
+    options: SdGenerationOptions,
+    reference_image_name: str | None = None,
+    *,
+    pose_reference_name: str | None = None,
+    pose_control_image_name: str | None = None,
+    pose_backend: str | None = None,
 ) -> tuple[dict[str, Any], str | None, str | None]:
     loras = effective_lora_selections(options)
     checkpoint_name = None
@@ -1223,6 +1490,19 @@ def _apply_comfy_options(
             raise RuntimeError("ComfyUIへアップロードした参考画像名がありません。")
         _set_node_input(workflow, load_image_nodes[0], "image", reference_image_name)
         _set_node_input(workflow, adapter_nodes[0], "weight", options.reference_strength)
+
+    if options.pose_reference_bytes is not None:
+        if not pose_reference_name:
+            raise RuntimeError("ComfyUIへアップロードしたpose reference名がありません。")
+        _configure_pose_controlnet(
+            workflow,
+            options,
+            pose_reference_name=pose_reference_name,
+            pose_control_image_name=pose_control_image_name,
+            pose_backend=pose_backend or "dwpose",
+            positive_node_id=positive_node_id,
+            negative_node_id=negative_node_id,
+        )
 
     env_seed_node_id = _get_node_id("COMFY_SEED_NODE_ID")
     seed_node_id, seed_key = _find_seed_input(workflow)
@@ -1341,6 +1621,285 @@ def _wait_comfy_history(prompt_id: str) -> dict[str, Any]:
     raise RuntimeError("ComfyUIの生成完了待ちがタイムアウトしたよ。")
 
 
+def _pose_history_execution_error(history: dict[str, Any]) -> str | None:
+    """Return a concise ComfyUI execution error, including node context."""
+
+    status = history.get("status") if isinstance(history, dict) else None
+    status_str = status.get("status_str") if isinstance(status, dict) else None
+    messages = status.get("messages") if isinstance(status, dict) else None
+    if isinstance(status_str, str) and status_str.casefold() in {
+        "error", "execution_error", "execution_interrupted"
+    }:
+        details: list[str] = [f"status={status_str}"]
+        if isinstance(messages, list):
+            for item in messages:
+                if not isinstance(item, (list, tuple)) or not item:
+                    continue
+                kind = str(item[0])
+                payload = item[1] if len(item) > 1 else {}
+                if not isinstance(payload, dict):
+                    details.append(kind)
+                    continue
+                node_id = payload.get("node_id") or payload.get("node") or "?"
+                node_type = payload.get("node_type") or payload.get("class_type") or "?"
+                message = payload.get("exception_message") or payload.get("message") or "?"
+                trace = payload.get("traceback")
+                details.append(f"{kind} node_id={node_id} node_type={node_type} message={message}")
+                if trace:
+                    details.append(f"traceback={trace}")
+        return "ComfyUI pose execution error: " + " | ".join(details)[:1200]
+
+    if isinstance(messages, list):
+        for item in messages:
+            if not isinstance(item, (list, tuple)) or not item:
+                continue
+            kind = str(item[0]).casefold()
+            if kind not in {"execution_error", "execution_interrupted"}:
+                continue
+            payload = item[1] if len(item) > 1 and isinstance(item[1], dict) else {}
+            node_id = payload.get("node_id") or payload.get("node") or "?"
+            node_type = payload.get("node_type") or payload.get("class_type") or "?"
+            message = payload.get("exception_message") or payload.get("message") or "?"
+            return (
+                f"ComfyUI pose execution error: kind={kind} node_id={node_id} "
+                f"node_type={node_type} message={message}"
+            )
+    return None
+
+
+def _image_pixel_stats_from_bytes(image_bytes: bytes) -> dict[str, int | float | bool]:
+    from io import BytesIO
+
+    with Image.open(BytesIO(image_bytes)) as image:
+        grayscale = image.convert("L")
+        values = list(grayscale.getdata())
+        minimum = min(values) if values else 0
+        maximum = max(values) if values else 0
+        mean = sum(values) / len(values) if values else 0.0
+        return {
+            "width": int(image.width), "height": int(image.height),
+            "min_pixel": minimum, "max_pixel": maximum, "mean_pixel": mean,
+            "complete_black": not values or maximum == 0,
+        }
+
+
+def _download_pose_preview(history: dict[str, Any], node_id: str, *, backend: str) -> Path | None:
+    outputs = history.get("outputs") if isinstance(history, dict) else None
+    output = outputs.get(str(node_id)) if isinstance(outputs, dict) else None
+    images = output.get("images") if isinstance(output, dict) else None
+    if not isinstance(images, list):
+        return None
+    for item in images:
+        if not isinstance(item, dict) or not isinstance(item.get("filename"), str):
+            continue
+        try:
+            response = requests.get(
+                _api_url("/view"),
+                params={
+                    "filename": item["filename"],
+                    "type": item.get("type", "output"),
+                    "subfolder": item.get("subfolder", ""),
+                },
+                timeout=60,
+            )
+            response.raise_for_status()
+        except requests.RequestException:
+            logger.exception("Failed to download %s pose skeleton preview.", backend)
+            return None
+        POSE_DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+        path = POSE_DEBUG_DIR / f"{backend}_{uuid.uuid4().hex[:12]}.png"
+        path.write_bytes(response.content)
+        return path
+    return None
+
+
+def _pose_metadata_from_history(history: dict[str, Any], node_id: str) -> list[Any]:
+    outputs = history.get("outputs") if isinstance(history, dict) else None
+    output = outputs.get(str(node_id)) if isinstance(outputs, dict) else None
+    if not isinstance(output, dict):
+        return []
+    values: list[Any] = []
+    for key in ("openpose_json", "text", "json", "metadata"):
+        value = output.get(key)
+        if value is not None:
+            values.extend(extract_json_candidates(value))
+    return values
+
+
+def _read_pose_keypoint_file(filename_prefix: str) -> list[Any]:
+    roots: list[Path] = []
+    for env_name in ("COMFY_OUTPUT_DIR", "COMFYUI_OUTPUT_DIR"):
+        value = os.getenv(env_name, "").strip().strip('"')
+        if value:
+            roots.append(Path(value))
+    for root in roots:
+        if not root.is_dir():
+            continue
+        try:
+            for path in root.rglob(f"{filename_prefix}_*.json"):
+                try:
+                    return extract_json_candidates(json.loads(path.read_text(encoding="utf-8")))
+                except (OSError, json.JSONDecodeError):
+                    continue
+        except OSError:
+            continue
+    return []
+
+
+def _prepare_pose_detection_image(image_bytes: bytes) -> bytes:
+    """Flatten alpha/transparency for the DWPose retry without cv2."""
+
+    from io import BytesIO
+
+    with Image.open(BytesIO(image_bytes)) as source:
+        image = source.convert("RGBA")
+        background = Image.new("RGBA", image.size, (255, 255, 255, 255))
+        background.alpha_composite(image)
+        output = BytesIO()
+        background.convert("RGB").save(output, format="PNG")
+        return output.getvalue()
+
+
+def _run_pose_backend_preflight(
+    image_name: str,
+    *,
+    backend: str,
+    options: SdGenerationOptions,
+    client_id: str,
+    filename_prefix: str | None = None,
+) -> dict[str, Any]:
+    if backend == "dwpose":
+        workflow, _, preview_id, metadata_id = build_dwpose_preflight_workflow(
+            image_name,
+            detect_hand=options.pose_detect_hand,
+            detect_face=options.pose_detect_face,
+        )
+    elif backend == "sdpose":
+        workflow, _, preview_id, metadata_id = build_sdpose_preflight_workflow(
+            image_name,
+            filename_prefix or f"discord_sdpose_{uuid.uuid4().hex[:12]}",
+        )
+    elif backend == "animepose":
+        workflow, _, preview_id, metadata_id = build_animepose_preflight_workflow(image_name)
+    else:
+        raise ValueError(f"unknown pose backend: {backend}")
+
+    result: dict[str, Any] = {"backend": backend, "success": False, "input": image_name}
+    try:
+        prompt_id = _queue_comfy_prompt_with_logging(workflow, client_id)
+        history = _wait_comfy_history(prompt_id)
+        execution_error = _pose_history_execution_error(history)
+        if execution_error:
+            raise RuntimeError(execution_error)
+        preview_path = _download_pose_preview(history, preview_id, backend=backend)
+        skeleton_stats = _image_pixel_stats_from_bytes(preview_path.read_bytes()) if preview_path else None
+        candidates = _pose_metadata_from_history(history, metadata_id)
+        if not candidates and backend == "sdpose":
+            candidates = _read_pose_keypoint_file(filename_prefix or "")
+        if not candidates:
+            raise RuntimeError(f"{backend} keypoint metadata was not returned by ComfyUI")
+        raw = candidates[0]
+        if backend == "animepose":
+            metadata = raw if isinstance(raw, dict) else {}
+            batch = metadata.get("batch") if isinstance(metadata, dict) else None
+            rows = batch[0].get("keypoints") if isinstance(batch, list) and batch and isinstance(batch[0], dict) else metadata.get("keypoints") if isinstance(metadata, dict) else None
+            image_size = batch[0].get("image_size") if isinstance(batch, list) and batch and isinstance(batch[0], dict) else None
+            summary = animepose_keypoint_summary(rows, image_size=image_size)
+        else:
+            summary = sdpose_keypoint_summary(raw, POSE_SDPOSE_DRAW_THRESHOLD)
+        evaluation = evaluate_pose_quality(summary, skeleton_stats, backend=backend)
+        if backend == "dwpose":
+            evaluation["lower_limb_evidence_available"] = bool(candidates)
+            evaluation["full_body_pass"] = bool(evaluation.get("full_body_pass"))
+            evaluation["success"] = bool(evaluation.get("full_body_pass")) and preview_path is not None
+        else:
+            evaluation["success"] = bool(evaluation.get("pose_quality_pass")) and preview_path is not None
+        result.update(evaluation)
+        result["prompt_id"] = prompt_id
+        result["skeleton_path"] = preview_path
+        result["skeleton_stats"] = skeleton_stats
+        result["keypoint_summary"] = summary
+        result["profile"], result["profile_reason"] = classify_pose_reference_profile(result, backend=backend)
+        if not result["success"]:
+            result["failure_reason"] = result.get("failure_reason") or "pose quality gate failed"
+    except Exception as exc:
+        result["failure_reason"] = f"{type(exc).__name__}: {exc}"
+        logger.exception("Pose preflight failed: backend=%s input=%s", backend, image_name)
+    logger.info(
+        "Pose preflight result: backend=%s success=%s profile=%s reason=%s people=%s "
+        "valid=%s chains=%s torso=%s leg_evidence=%s full_body_pass=%s "
+        "upper_body_quality_pass=%s detected=%s hip_normalized_y=%s arm_chains=%s",
+        backend, result.get("success"), result.get("profile"), result.get("profile_reason"),
+        result.get("people", "unknown"), result.get("valid_body_keypoints", result.get("body_keypoints_valid_gt0", "unknown")),
+        result.get("completed_chain_count", "unknown"), result.get("torso_complete", False),
+        result.get("full_body_leg_chain_evidence", False), result.get("full_body_pass", False),
+        result.get("upper_body_quality_pass", False), result.get("detected", "unknown"),
+        result.get("hip_normalized_y", "unknown"), result.get("upper_body_arm_chains", "unknown"),
+    )
+    return result
+
+
+def _run_pose_pipeline(
+    pose_reference_name: str,
+    pose_reference_bytes: bytes,
+    *,
+    options: SdGenerationOptions,
+    client_id: str,
+) -> dict[str, Any]:
+    """Run DWPose -> preprocessed DWPose -> SDPose -> AnimePose."""
+
+    attempts: list[dict[str, Any]] = []
+    dwpose = _run_pose_backend_preflight(
+        pose_reference_name, backend="dwpose", options=options, client_id=client_id
+    )
+    attempts.append(dwpose)
+    if dwpose.get("success"):
+        return dwpose
+
+    try:
+        prepared_bytes = _prepare_pose_detection_image(pose_reference_bytes)
+        prepared_name = _upload_comfy_reference_image(prepared_bytes, "image/png")
+        prepared = _run_pose_backend_preflight(
+            prepared_name,
+            backend="dwpose",
+            options=options,
+            client_id=client_id,
+        )
+        prepared["preprocessed_fallback"] = True
+        attempts.append(prepared)
+        if prepared.get("success"):
+            return prepared
+    except Exception as exc:
+        logger.exception("DWPose preprocessing fallback failed: %s", exc)
+
+    sdpose = _run_pose_backend_preflight(
+        pose_reference_name,
+        backend="sdpose",
+        options=options,
+        client_id=client_id,
+        filename_prefix=f"discord_sdpose_{uuid.uuid4().hex[:12]}",
+    )
+    attempts.append(sdpose)
+    if sdpose.get("success"):
+        return sdpose
+
+    animepose = _run_pose_backend_preflight(
+        pose_reference_name,
+        backend="animepose",
+        options=options,
+        client_id=client_id,
+    )
+    attempts.append(animepose)
+    if animepose.get("success"):
+        return animepose
+
+    reasons = "; ".join(
+        f"{item.get('backend', 'unknown')}: {item.get('failure_reason', 'quality gate failed')}"
+        for item in attempts
+    )
+    raise RuntimeError(f"Pose referenceの骨格品質判定に失敗しました。未検証の骨格は使用しません。 {reasons[:700]}")
+
+
 def _download_comfy_images(history: dict[str, Any], batch_index: int) -> list[Path]:
     outputs = history.get("outputs")
     if not isinstance(outputs, dict):
@@ -1409,6 +1968,7 @@ def _generate_webui_images(options: SdGenerationOptions) -> list[Path]:
 
 def _generate_comfy_images_with_metadata(options: SdGenerationOptions) -> list[GeneratedImage]:
     reference_enabled = options.reference_image_bytes is not None
+    pose_enabled = options.pose_reference_bytes is not None
     loras = effective_lora_selections(options)
     workflow_file = _get_comfy_workflow_file(reference_enabled, loras)
     workflow_file_text = str(workflow_file)
@@ -1421,11 +1981,39 @@ def _generate_comfy_images_with_metadata(options: SdGenerationOptions) -> list[G
             options.reference_image_content_type or "image/png",
         )
 
-    images: list[GeneratedImage] = []
+    pose_reference_name = None
+    pose_control_image_name = None
+    pose_backend = None
+    pose_result: dict[str, Any] | None = None
     client_id = str(uuid.uuid4())
+    if pose_enabled:
+        pose_reference_name = _upload_comfy_reference_image(
+            options.pose_reference_bytes or b"",
+            options.pose_reference_content_type or "image/png",
+        )
+        pose_result = _run_pose_pipeline(
+            pose_reference_name,
+            options.pose_reference_bytes or b"",
+            options=options,
+            client_id=client_id,
+        )
+        pose_backend = str(pose_result.get("backend"))
+        skeleton_path = pose_result.get("skeleton_path")
+        if not isinstance(skeleton_path, Path) or not skeleton_path.is_file():
+            raise RuntimeError("品質判定を通過したpose skeleton画像がありません。")
+        pose_control_image_name = _upload_comfy_reference_image(
+            skeleton_path.read_bytes(), "image/png"
+        )
+
+    images: list[GeneratedImage] = []
     for batch_index in range(1, options.count + 1):
         workflow, seed_node_id, seed_key = _apply_comfy_options(
-            _load_comfy_workflow(reference_enabled, loras), options, reference_image_name
+            _load_comfy_workflow(reference_enabled, loras),
+            options,
+            reference_image_name,
+            pose_reference_name=pose_reference_name,
+            pose_control_image_name=pose_control_image_name,
+            pose_backend=pose_backend,
         )
 
         seed_value: int | None = None
@@ -1458,6 +2046,16 @@ def _generate_comfy_images_with_metadata(options: SdGenerationOptions) -> list[G
                     height=height,
                     workflow_file=workflow_file_text,
                     workflow_hash=workflow_hash,
+                    pose_backend=pose_backend,
+                    pose_reference_profile=(
+                        None if pose_result is None else pose_result.get("profile")
+                    ),
+                    pose_profile_reason=(
+                        None if pose_result is None else pose_result.get("profile_reason")
+                    ),
+                    pose_reference_debug_path=(
+                        None if pose_result is None else pose_result.get("skeleton_path")
+                    ),
                 )
             )
     return images
@@ -1502,6 +2100,8 @@ def generate_images_with_metadata(options: SdGenerationOptions) -> list[Generate
             raise RuntimeError("モデルを明示選択できるのはComfyUIバックエンドだけです。SD_BACKEND=comfyを指定してください。")
         if backend != "comfy" and safe_options.reference_image_bytes is not None:
             raise RuntimeError("reference_imageを指定できるのはComfyUIバックエンドだけです。SD_BACKEND=comfyを指定してください。")
+        if backend != "comfy" and safe_options.pose_reference_bytes is not None:
+            raise RuntimeError("pose_referenceを指定できるのはComfyUIバックエンドだけです。SD_BACKEND=comfyを指定してください。")
         if backend == "comfy":
             images = _generate_comfy_images_with_metadata(safe_options)
         elif backend == "webui":

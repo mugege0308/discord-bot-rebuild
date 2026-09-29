@@ -10,10 +10,10 @@ class CompositionReferenceWiringTests(unittest.TestCase):
     def tearDown(self) -> None:
         prompt_commands._last_reference_images.clear()
 
-    def test_public_reference_modes_are_none_and_composition_only(self):
+    def test_public_reference_modes_are_none_composition_and_pose(self):
         self.assertEqual(
             [(choice.value, choice.name) for choice in prompt_commands.GENERATE_AI_REFERENCE_MODE_CHOICES],
-            [("none", "参照なし"), ("composition", "構図参照")],
+            [("none", "参照なし"), ("composition", "構図参照"), ("pose", "ポーズ参照")],
         )
 
     def test_resolver_clears_strength_for_explicit_none(self):

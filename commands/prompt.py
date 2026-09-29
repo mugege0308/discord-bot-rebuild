@@ -103,7 +103,9 @@ SHOGOU_SUMMARY_LIMIT = 300
 SHOGOU_MESSAGE_LIMIT = 1900
 REFERENCE_MODE_NONE = "none"
 REFERENCE_MODE_COMPOSITION = "composition"
+REFERENCE_MODE_POSE = "pose"
 REFERENCE_REQUIRED_MESSAGE = "構図参照には参考画像を添付するか、直前の画像を再利用してください。"
+POSE_REFERENCE_REQUIRED_MESSAGE = "ポーズ参照にはポーズ画像を添付するか、直前の画像を再利用してください。"
 GENERATE_AI_DEFAULT_SELECTION_AI = True
 GENERATE_AI_MODEL_CHOICES = [
     app_commands.Choice(name="Animagine XL 4.0 Clear", value="animagine"),
@@ -151,11 +153,10 @@ GENERATE_AI_COMPOSITION_CHOICES = [
     app_commands.Choice(name=label, value=key)
     for key, label in COMPOSITION_LABELS.items()
 ]
-# Reference/Pose is restored in a later commit.  Keeping only the safe
-# disabled value here prevents the panel from exposing an unimplemented path.
 GENERATE_AI_REFERENCE_MODE_CHOICES = [
     app_commands.Choice(name="参照なし", value=REFERENCE_MODE_NONE),
     app_commands.Choice(name="構図参照", value=REFERENCE_MODE_COMPOSITION),
+    app_commands.Choice(name="ポーズ参照", value=REFERENCE_MODE_POSE),
 ]
 
 
@@ -644,6 +645,11 @@ async def run_generate_ai_from_panel(
     )
     if not isinstance(use_last_reference, bool):
         raise ValueError("直前の参考画像再利用指定が不正です。")
+    if resolved_reference_mode == REFERENCE_MODE_POSE and not use_last_reference:
+        # The panel has no attachment field. A restored pose mode without an
+        # explicit image reuse request must not leak the previous pose mode
+        # into an ordinary generation.
+        resolved_reference_mode = REFERENCE_MODE_NONE
     if resolved_reference_mode == REFERENCE_MODE_NONE:
         reference_strength = None
         use_last_reference = False
@@ -1116,9 +1122,15 @@ def _build_generation_options(
     reference_image_bytes: bytes | None = None,
     reference_image_content_type: str | None = None,
     reference_strength: float | None = None,
+    reference_mode: str = REFERENCE_MODE_NONE,
+    pose_reference_bytes: bytes | None = None,
+    pose_reference_content_type: str | None = None,
+    pose_reference_width: int | None = None,
+    pose_reference_height: int | None = None,
+    pose_strength: float | None = None,
 ) -> SdGenerationOptions:
     selection_available = is_image_selection_available()
-    count = 1 if reference_image_bytes is not None else (
+    count = 1 if (reference_image_bytes is not None or pose_reference_bytes is not None) else (
         get_selection_generate_count() if selection_available else 1
     )
     logger.info(
@@ -1147,6 +1159,12 @@ def _build_generation_options(
         reference_image_bytes=reference_image_bytes,
         reference_image_content_type=reference_image_content_type,
         reference_strength=reference_strength,
+        reference_mode=reference_mode,
+        pose_reference_bytes=pose_reference_bytes,
+        pose_reference_content_type=pose_reference_content_type,
+        pose_reference_width=pose_reference_width,
+        pose_reference_height=pose_reference_height,
+        pose_strength=0.7 if pose_strength is None else pose_strength,
     )
 
 
@@ -1389,6 +1407,12 @@ async def _generate_images_from_shogou_result(
     reference_image_bytes: bytes | None = None,
     reference_image_content_type: str | None = None,
     reference_strength: float | None = None,
+    reference_mode: str = REFERENCE_MODE_NONE,
+    pose_reference_bytes: bytes | None = None,
+    pose_reference_content_type: str | None = None,
+    pose_reference_width: int | None = None,
+    pose_reference_height: int | None = None,
+    pose_strength: float | None = None,
 ) -> None:
     # Mirrors _generate_images_from_prompts' preserve_prompt_text=True path exactly,
     # but keeps its own message builder so /generate_raw's behavior stays untouched.
@@ -1410,6 +1434,12 @@ async def _generate_images_from_shogou_result(
         reference_image_bytes=reference_image_bytes,
         reference_image_content_type=reference_image_content_type,
         reference_strength=reference_strength,
+        reference_mode=reference_mode,
+        pose_reference_bytes=pose_reference_bytes,
+        pose_reference_content_type=pose_reference_content_type,
+        pose_reference_width=pose_reference_width,
+        pose_reference_height=pose_reference_height,
+        pose_strength=pose_strength,
     )
     try:
         generated_images = await asyncio.to_thread(generate_images_with_metadata, options)
@@ -1424,7 +1454,7 @@ async def _generate_images_from_shogou_result(
         return
 
     paths = [image.path for image in generated_images]
-    if reference_image_bytes is not None and len(paths) == 1:
+    if (reference_image_bytes is not None or pose_reference_bytes is not None) and len(paths) == 1:
         selection = ImageSelectionResult(selected_paths=[], used_selection=False)
     else:
         selection = await asyncio.to_thread(select_generated_images, paths)
@@ -1435,8 +1465,8 @@ async def _generate_images_from_shogou_result(
         len(send_paths),
         len(paths),
         model_key=profile.model_key,
-        reference_used=reference_image_bytes is not None,
-        reference_strength=reference_strength,
+        reference_used=(reference_image_bytes is not None or pose_reference_bytes is not None),
+        reference_strength=(reference_strength if reference_image_bytes is not None else pose_strength),
         positive_prompt=effective_positive,
     )
 
@@ -1903,6 +1933,12 @@ async def _resume_generate_ai_after_character_confirmation(
     reference_image_bytes: bytes | None,
     reference_image_content_type: str | None,
     resolved_reference_strength: float | None,
+    reference_mode: str,
+    pose_reference_bytes: bytes | None,
+    pose_reference_content_type: str | None,
+    pose_reference_width: int | None,
+    pose_reference_height: int | None,
+    pose_strength: float | None,
     style_key: str | None,
     lora_strength: float | None,
     loras: tuple[LoraSelection, ...],
@@ -1939,6 +1975,12 @@ async def _resume_generate_ai_after_character_confirmation(
         reference_image_bytes=reference_image_bytes,
         reference_image_content_type=reference_image_content_type,
         reference_strength=resolved_reference_strength,
+        reference_mode=reference_mode,
+        pose_reference_bytes=pose_reference_bytes,
+        pose_reference_content_type=pose_reference_content_type,
+        pose_reference_width=pose_reference_width,
+        pose_reference_height=pose_reference_height,
+        pose_strength=pose_strength,
     )
 
 
@@ -2210,14 +2252,22 @@ def setup(client: discord.Client) -> None:
             )
             return
         if (
-            resolved_settings.reference_mode == REFERENCE_MODE_COMPOSITION
+            resolved_settings.reference_mode in {REFERENCE_MODE_COMPOSITION, REFERENCE_MODE_POSE}
             and reference_image is None
             and cached_reference is None
         ):
             await _send_error(
                 interaction,
-                REFERENCE_REQUIRED_MESSAGE,
-                label="generate_ai.reference_missing",
+                (
+                    POSE_REFERENCE_REQUIRED_MESSAGE
+                    if resolved_settings.reference_mode == REFERENCE_MODE_POSE
+                    else REFERENCE_REQUIRED_MESSAGE
+                ),
+                label=(
+                    "generate_ai.pose_reference_missing"
+                    if resolved_settings.reference_mode == REFERENCE_MODE_POSE
+                    else "generate_ai.reference_missing"
+                ),
             )
             return
 
@@ -2269,6 +2319,16 @@ def setup(client: discord.Client) -> None:
                 reference_image_content_type,
             )
 
+        pose_reference_bytes = None
+        pose_reference_content_type = None
+        pose_strength = None
+        if resolved_settings.reference_mode == REFERENCE_MODE_POSE:
+            pose_reference_bytes = reference_image_bytes
+            pose_reference_content_type = reference_image_content_type
+            pose_strength = resolved_reference_strength
+            reference_image_bytes = None
+            reference_image_content_type = None
+
         profile = get_image_generation_profile(resolved_settings.model_key)
         if model is not None and not is_comfy_backend():
             await _send_error(
@@ -2319,6 +2379,12 @@ def setup(client: discord.Client) -> None:
                     reference_image_bytes=reference_image_bytes,
                     reference_image_content_type=reference_image_content_type,
                     resolved_reference_strength=resolved_reference_strength,
+                    reference_mode=resolved_settings.reference_mode,
+                    pose_reference_bytes=pose_reference_bytes,
+                    pose_reference_content_type=pose_reference_content_type,
+                    pose_reference_width=None,
+                    pose_reference_height=None,
+                    pose_strength=pose_strength,
                     style_key=resolved_settings.style_key,
                     lora_strength=resolved_settings.lora_strength,
                     loras=resolved_settings.loras,
@@ -2366,6 +2432,12 @@ def setup(client: discord.Client) -> None:
             reference_image_bytes=reference_image_bytes,
             reference_image_content_type=reference_image_content_type,
             reference_strength=resolved_reference_strength,
+            reference_mode=resolved_settings.reference_mode,
+            pose_reference_bytes=pose_reference_bytes,
+            pose_reference_content_type=pose_reference_content_type,
+            pose_reference_width=None,
+            pose_reference_height=None,
+            pose_strength=pose_strength,
         )
 
     @client.tree.command(

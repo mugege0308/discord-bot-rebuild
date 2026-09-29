@@ -119,6 +119,39 @@ class GenerateAiLastReferenceTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(generate_mock.await_args.kwargs["reference_image_content_type"])
         self.assertIsNone(generate_mock.await_args.kwargs["reference_strength"])
 
+    async def test_explicit_pose_routes_image_to_pose_fields(self):
+        generate_mock, _ = await self._invoke(
+            self._interaction(101),
+            reference_mode=app_commands.Choice(name="ポーズ参照", value="pose"),
+            reference_image=self._attachment(b"pose"),
+            reference_strength=0.7,
+        )
+
+        kwargs = generate_mock.await_args.kwargs
+        self.assertEqual(kwargs["reference_mode"], "pose")
+        self.assertIsNone(kwargs["reference_image_bytes"])
+        self.assertIsNone(kwargs["reference_image_content_type"])
+        self.assertEqual(kwargs["pose_reference_bytes"], b"pose")
+        self.assertEqual(kwargs["pose_reference_content_type"], "image/png")
+        self.assertEqual(kwargs["pose_strength"], 0.7)
+
+    async def test_pose_reuses_the_cached_image_as_pose_input(self):
+        prompt_module._last_reference_images[101] = (b"cached-pose", "image/jpeg")
+
+        generate_mock, _ = await self._invoke(
+            self._interaction(101),
+            reference_mode=app_commands.Choice(name="ポーズ参照", value="pose"),
+            use_last_reference=True,
+            reference_strength=0.65,
+        )
+
+        kwargs = generate_mock.await_args.kwargs
+        self.assertEqual(kwargs["reference_mode"], "pose")
+        self.assertIsNone(kwargs["reference_image_bytes"])
+        self.assertEqual(kwargs["pose_reference_bytes"], b"cached-pose")
+        self.assertEqual(kwargs["pose_reference_content_type"], "image/jpeg")
+        self.assertEqual(kwargs["pose_strength"], 0.65)
+
     async def test_reuse_without_a_previous_reference_reports_an_error(self):
         generate_mock, send_mock = await self._invoke(
             self._interaction(101), use_last_reference=True
