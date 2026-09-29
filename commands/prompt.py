@@ -3,7 +3,7 @@ from dataclasses import dataclass, replace
 import inspect
 import logging
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Awaitable, Callable
 
 import discord
 from discord import app_commands
@@ -42,9 +42,11 @@ from services.image_selection import (
 )
 from services.image_analyzer import MAX_IMAGE_BYTES, detect_image_content_type, validate_image_bytes
 from services.generate_ai_last_settings import (
+    GenerateAiLastSettings,
     GenerateAiLastSettingsError,
     get_last_model_key,
     get_last_settings,
+    save_last_settings,
 )
 from services.image_composition import (
     COMPOSITION_LABELS,
@@ -58,18 +60,25 @@ from services.image_generation_profiles import (
     DEFAULT_IMAGE_GENERATION_MODEL_KEY,
     get_image_generation_profile,
 )
+from services.lora_catalog import get_comfy_lora_choice_specs
 from services.danbooru_character_resolver import DanbooruCharacterResolution
 from services.verified_character_registry import VerifiedCharacterRegistry
 from services.pc_control import is_pc_control_allowed
 from services.prompt_generator import PromptGeneratorError, PromptGeneratorTimeout, generate_sd_prompt_result
 from services.sd_control import (
+    COMFY_MODEL_FAMILIES,
     GeneratedImage,
+    LoraSelection,
     SdGenerationOptions,
+    apply_lora_triggers,
     generate_images,
     generate_images_with_metadata,
+    get_lora_status_text,
     get_negative_prompt,
     get_reference_status_text,
     is_comfy_backend,
+    lora_selections_to_dicts,
+    resolve_lora_selections,
     resolve_reference_strength,
 )
 from services.shogou_prompt_designer import (
@@ -108,6 +117,28 @@ GENERATE_AI_INPUT_MODE_CHOICES = [
     app_commands.Choice(name=INPUT_MODE_LABELS[JAPANESE_AI_INPUT_MODE], value=JAPANESE_AI_INPUT_MODE),
     app_commands.Choice(name=INPUT_MODE_LABELS[ENGLISH_DIRECT_INPUT_MODE], value=ENGLISH_DIRECT_INPUT_MODE),
     app_commands.Choice(name=INPUT_MODE_LABELS[PROMPT_IMPORT_INPUT_MODE], value=PROMPT_IMPORT_INPUT_MODE),
+]
+GENERATE_AI_NO_LORA_VALUE = "__none__"
+GENERATE_AI_STYLE_CHOICES = [
+    app_commands.Choice(name="なし（LoRAなし）", value=GENERATE_AI_NO_LORA_VALUE),
+    *(
+        app_commands.Choice(name=display_name, value=lora_key)
+        for display_name, lora_key in get_comfy_lora_choice_specs("style", model_family="sdxl")
+    ),
+]
+GENERATE_AI_CHARACTER_LORA_CHOICES = [
+    app_commands.Choice(name="なし（無効）", value=GENERATE_AI_NO_LORA_VALUE),
+    *(
+        app_commands.Choice(name=display_name, value=lora_key)
+        for display_name, lora_key in get_comfy_lora_choice_specs("character", model_family="sdxl")
+    ),
+]
+GENERATE_AI_ADDITIONAL_LORA_CHOICES = [
+    app_commands.Choice(name="なし（無効）", value=GENERATE_AI_NO_LORA_VALUE),
+    *(
+        app_commands.Choice(name=display_name, value=lora_key)
+        for display_name, lora_key in get_comfy_lora_choice_specs("additional", model_family="sdxl")
+    ),
 ]
 GENERATE_AI_SIZE_CHOICES = [
     app_commands.Choice(name=spec.label, value=spec.key)
@@ -195,22 +226,8 @@ _last_reference_images: dict[int, tuple[bytes, str]] = {}
 
 
 @dataclass(frozen=True)
-class PanelLoraSetting:
-    """Raw LoRA slot state retained for the panel, without catalog lookup."""
-
-    key: str
-    lora_type: str
-    strength: float
-
-
-@dataclass(frozen=True)
 class ResolvedGenerateAiSettings:
-    """Shared, validated settings consumed by the image-generation panel.
-
-    This is deliberately a settings bridge only.  LoRA catalog resolution,
-    reference processing, selection, history, and generation remain in their
-    existing command/service layers and are restored in later commits.
-    """
+    """Shared, validated settings consumed by Panel and /generate_ai."""
 
     model_key: str
     style_key: str | None
@@ -223,7 +240,7 @@ class ResolvedGenerateAiSettings:
     size_key: str
     composition_preset: str
     sources: dict[str, str]
-    loras: tuple[PanelLoraSetting, ...] = ()
+    loras: tuple[LoraSelection, ...] = ()
     reference_mode: str = REFERENCE_MODE_NONE
     use_last_reference: bool = False
     input_mode: str = JAPANESE_AI_INPUT_MODE
@@ -246,20 +263,11 @@ def _panel_choice_value(
     raise ValueError(f"{field_name}の選択肢が現在の設定に見つかりません。")
 
 
-def _panel_lora_slots(value: tuple[dict[str, Any], ...]) -> tuple[PanelLoraSetting, ...]:
-    """Copy persisted slot values without resolving catalog metadata."""
-
-    slots: list[PanelLoraSetting] = []
-    for item in value:
-        key = item.get("key")
-        lora_type = item.get("lora_type")
-        strength = item.get("strength")
-        if not isinstance(key, str) or not isinstance(lora_type, str):
-            continue
-        if isinstance(strength, bool) or not isinstance(strength, (int, float)):
-            continue
-        slots.append(PanelLoraSetting(key=key, lora_type=lora_type, strength=float(strength)))
-    return tuple(slots)
+def _raw_lora_choice(value: str | None) -> app_commands.Choice[str]:
+    normalized = value.strip() if isinstance(value, str) else ""
+    if not normalized or normalized == GENERATE_AI_NO_LORA_VALUE:
+        return app_commands.Choice(name="なし（無効）", value=GENERATE_AI_NO_LORA_VALUE)
+    return app_commands.Choice(name=normalized, value=normalized)
 
 
 def _default_generate_ai_panel_settings(*, model_key: str | None = None) -> ResolvedGenerateAiSettings:
@@ -289,6 +297,230 @@ def _default_generate_ai_panel_settings(*, model_key: str | None = None) -> Reso
     )
 
 
+def _optional_lora_choice_value(choice: app_commands.Choice[str] | None) -> str | None:
+    if choice is None or choice.value == GENERATE_AI_NO_LORA_VALUE:
+        return None
+    if not isinstance(choice.value, str) or not choice.value.strip():
+        return None
+    return choice.value.strip()
+
+
+def _previous_lora_slot(previous, lora_type: str) -> dict[str, object] | None:
+    if previous is None:
+        return None
+    for item in previous.loras:
+        if isinstance(item, dict) and item.get("lora_type") == lora_type:
+            return item
+    return None
+
+
+def _resolve_generate_ai_settings(
+    user_id: int,
+    *,
+    model: app_commands.Choice[str] | None = None,
+    style: app_commands.Choice[str] | None = None,
+    strength: float | None = None,
+    rating: app_commands.Choice[str] | None = None,
+    selection_ai: bool | None = None,
+    candidate_count: int | None = None,
+    size: app_commands.Choice[str] | None = None,
+    composition_preset: app_commands.Choice[str] | None = None,
+    input_mode: app_commands.Choice[str] | None = None,
+    character_lora: app_commands.Choice[str] | None = None,
+    character_lora_strength: float | None = None,
+    additional_lora: app_commands.Choice[str] | None = None,
+    additional_lora_strength: float | None = None,
+    inherit_previous: bool = True,
+) -> ResolvedGenerateAiSettings:
+    """Resolve Panel and slash values through one precedence-aware path."""
+
+    sources: dict[str, str] = {}
+    inherited_model_key: str | None = None
+    if model is None and inherit_previous:
+        try:
+            inherited_model_key = get_last_model_key(user_id)
+            if inherited_model_key:
+                get_image_generation_profile(inherited_model_key)
+        except (GenerateAiLastSettingsError, ValueError):
+            logger.warning("Stored model is unavailable; using default: user_id=%s", user_id, exc_info=True)
+            inherited_model_key = None
+
+    if model is not None:
+        model_key = _panel_choice_value(GENERATE_AI_MODEL_CHOICES, model.value, "Model")
+        sources["model"] = "explicit"
+    elif inherited_model_key:
+        model_key = inherited_model_key
+        sources["model"] = "inherited"
+    else:
+        model_key = DEFAULT_IMAGE_GENERATION_MODEL_KEY
+        sources["model"] = "default"
+    profile = get_image_generation_profile(model_key)
+
+    previous = None
+    if inherit_previous:
+        try:
+            previous = get_last_settings(user_id, profile.model_key)
+        except GenerateAiLastSettingsError:
+            logger.warning(
+                "Stored settings are unavailable; using defaults: user_id=%s model=%s",
+                user_id,
+                profile.model_key,
+                exc_info=True,
+            )
+
+    if input_mode is not None:
+        resolved_input_mode = _panel_choice_value(GENERATE_AI_INPUT_MODE_CHOICES, input_mode.value, "入力方式")
+        sources["input_mode"] = "explicit"
+    elif previous is not None:
+        resolved_input_mode = _panel_choice_value(GENERATE_AI_INPUT_MODE_CHOICES, previous.input_mode, "入力方式")
+        sources["input_mode"] = "inherited"
+    else:
+        resolved_input_mode = JAPANESE_AI_INPUT_MODE
+        sources["input_mode"] = "default"
+
+    if rating is not None:
+        resolved_rating = _panel_choice_value(GENERATE_AI_PROMPT_RATING_CHOICES, rating.value, "Rating")
+        sources["rating"] = "explicit"
+    elif previous is not None:
+        resolved_rating = _panel_choice_value(GENERATE_AI_PROMPT_RATING_CHOICES, previous.rating, "Rating")
+        sources["rating"] = "inherited"
+    else:
+        resolved_rating = PROMPT_RATING_AUTO
+        sources["rating"] = "default"
+
+    if selection_ai is not None:
+        resolved_selection_ai = selection_ai
+        sources["selection_ai"] = "explicit"
+    elif previous is not None:
+        resolved_selection_ai = previous.selection_ai
+        sources["selection_ai"] = "inherited"
+    else:
+        resolved_selection_ai = GENERATE_AI_DEFAULT_SELECTION_AI
+        sources["selection_ai"] = "default"
+    if not isinstance(resolved_selection_ai, bool):
+        raise ValueError("Selection AIの指定が不正です。")
+
+    if candidate_count is not None:
+        resolved_candidate_count = candidate_count
+        sources["candidate_count"] = "explicit"
+    elif previous is not None:
+        resolved_candidate_count = previous.candidate_count
+        sources["candidate_count"] = "inherited"
+    else:
+        resolved_candidate_count = get_selection_generate_count()
+        sources["candidate_count"] = "default"
+    if (
+        isinstance(resolved_candidate_count, bool)
+        or not isinstance(resolved_candidate_count, int)
+        or not 1 <= resolved_candidate_count <= 20
+    ):
+        raise ValueError("候補枚数は1～20で指定してください。")
+
+    if size is not None:
+        resolved_size = get_image_size_spec(_panel_choice_value(GENERATE_AI_SIZE_CHOICES, size.value, "サイズ")).key
+        sources["size"] = "explicit"
+    elif previous is not None:
+        resolved_size = get_image_size_spec(previous.size_key).key
+        sources["size"] = "inherited"
+    else:
+        resolved_size = DEFAULT_SIZE_KEY
+        sources["size"] = "default"
+
+    if composition_preset is not None:
+        resolved_composition = validate_composition_preset(
+            _panel_choice_value(GENERATE_AI_COMPOSITION_CHOICES, composition_preset.value, "構図")
+        )
+        sources["composition_preset"] = "explicit"
+    elif previous is not None:
+        resolved_composition = validate_composition_preset(previous.composition_preset)
+        sources["composition_preset"] = "inherited"
+    else:
+        resolved_composition = DEFAULT_COMPOSITION_PRESET
+        sources["composition_preset"] = "default"
+
+    if style is not None:
+        style_key = _optional_lora_choice_value(style)
+        style_strength = None if style_key is None and strength is None else strength
+        sources["style"] = "explicit"
+        sources["style_strength"] = "explicit"
+    else:
+        previous_style = _previous_lora_slot(previous, "style")
+        style_key = previous.style_key if previous is not None else None
+        style_strength = previous.lora_strength if previous is not None else None
+        if style_key is None and previous_style is not None:
+            style_key = str(previous_style.get("key"))
+            style_strength = previous_style.get("strength")  # type: ignore[assignment]
+        sources["style"] = "inherited" if previous is not None else "default"
+        sources["style_strength"] = "inherited" if previous is not None else "default"
+        if strength is not None:
+            style_strength = strength
+            sources["style_strength"] = "explicit"
+
+    character_previous = _previous_lora_slot(previous, "character")
+    if character_lora is not None:
+        character_key = _optional_lora_choice_value(character_lora)
+        character_strength = character_lora_strength
+        sources["character_lora"] = "explicit"
+        sources["character_lora_strength"] = "explicit"
+    elif character_previous is not None:
+        character_key = str(character_previous.get("key"))
+        character_strength = character_previous.get("strength")
+        sources["character_lora"] = "inherited"
+        sources["character_lora_strength"] = "inherited"
+    else:
+        character_key = None
+        character_strength = None
+        sources["character_lora"] = "default"
+        sources["character_lora_strength"] = "default"
+
+    additional_previous = _previous_lora_slot(previous, "additional")
+    if additional_lora is not None:
+        additional_key = _optional_lora_choice_value(additional_lora)
+        additional_strength = additional_lora_strength
+        sources["additional_lora"] = "explicit"
+        sources["additional_lora_strength"] = "explicit"
+    elif additional_previous is not None:
+        additional_key = str(additional_previous.get("key"))
+        additional_strength = additional_previous.get("strength")
+        sources["additional_lora"] = "inherited"
+        sources["additional_lora_strength"] = "inherited"
+    else:
+        additional_key = None
+        additional_strength = None
+        sources["additional_lora"] = "default"
+        sources["additional_lora_strength"] = "default"
+
+    model_family = COMFY_MODEL_FAMILIES.get(profile.model_key)
+    loras = resolve_lora_selections(
+        character_key=character_key,
+        character_strength=character_strength,
+        style_key=style_key,
+        style_strength=style_strength,
+        additional_key=additional_key,
+        additional_strength=additional_strength,
+        model_family=model_family,
+    )
+    style_selection = next((item for item in loras if item.lora_type == "style"), None)
+
+    return ResolvedGenerateAiSettings(
+        model_key=profile.model_key,
+        style_key=None if style_selection is None else style_selection.key,
+        lora_strength=None if style_selection is None else style_selection.strength,
+        rating=resolved_rating,
+        seed=None,
+        reference_strength=None,
+        selection_ai=resolved_selection_ai,
+        candidate_count=resolved_candidate_count,
+        size_key=resolved_size,
+        composition_preset=resolved_composition,
+        sources=sources,
+        loras=loras,
+        reference_mode=REFERENCE_MODE_NONE,
+        use_last_reference=False,
+        input_mode=resolved_input_mode,
+    )
+
+
 def get_generate_ai_panel_defaults(
     user_id: int,
     *,
@@ -296,59 +528,11 @@ def get_generate_ai_panel_defaults(
 ) -> ResolvedGenerateAiSettings:
     """Return validated panel defaults using the existing last-settings store."""
 
-    if not inherit:
-        return _default_generate_ai_panel_settings()
-
     try:
-        last_model_key = get_last_model_key(user_id)
-        model_key = last_model_key or DEFAULT_IMAGE_GENERATION_MODEL_KEY
-        get_image_generation_profile(model_key)
-        previous = get_last_settings(user_id, model_key) if last_model_key else None
-        if previous is None:
-            settings = _default_generate_ai_panel_settings(model_key=model_key)
-            return replace(
-                settings,
-                sources={**settings.sources, "model": "inherited" if last_model_key else "default"},
-            )
-
-        input_mode = _panel_choice_value(
-            GENERATE_AI_INPUT_MODE_CHOICES,
-            previous.input_mode,
-            "入力方式",
-        )
-        rating = _panel_choice_value(
-            GENERATE_AI_PROMPT_RATING_CHOICES,
-            previous.rating,
-            "Rating",
-        )
-        size_key = get_image_size_spec(previous.size_key).key
-        composition_preset = validate_composition_preset(previous.composition_preset)
-        return ResolvedGenerateAiSettings(
-            model_key=model_key,
-            style_key=previous.style_key,
-            lora_strength=previous.lora_strength,
-            rating=rating,
-            seed=None,
-            reference_strength=None,
-            selection_ai=previous.selection_ai,
-            candidate_count=previous.candidate_count,
-            size_key=size_key,
-            composition_preset=composition_preset,
-            sources={
-                "model": "inherited",
-                "input_mode": "inherited",
-                "rating": "inherited",
-                "seed": "default",
-                "selection_ai": "inherited",
-                "candidate_count": "inherited",
-                "size": "inherited",
-                "composition_preset": "inherited",
-            },
-            loras=_panel_lora_slots(previous.loras),
-            reference_mode=REFERENCE_MODE_NONE,
-            input_mode=input_mode,
-        )
+        return _resolve_generate_ai_settings(user_id, inherit_previous=inherit)
     except (GenerateAiLastSettingsError, PromptGeneratorError, ValueError):
+        if not inherit:
+            raise
         logger.exception("Falling back to safe /generate_ai panel defaults for user %s", user_id)
         return _default_generate_ai_panel_settings()
 
@@ -410,6 +594,12 @@ async def run_generate_ai_from_panel(
         "model": app_commands.Choice(name=resolved_model, value=resolved_model),
         "input_mode": app_commands.Choice(name=resolved_input_mode, value=resolved_input_mode),
         "rating": app_commands.Choice(name=resolved_rating, value=resolved_rating),
+        "style": _raw_lora_choice(style_key),
+        "strength": style_strength,
+        "character_lora": _raw_lora_choice(character_lora_key),
+        "character_lora_strength": character_lora_strength,
+        "additional_lora": _raw_lora_choice(additional_lora_key),
+        "additional_lora_strength": additional_lora_strength,
         "reference_id": None,
         "reference_image": None,
         "reference_strength": None,
@@ -846,8 +1036,13 @@ def _build_generation_options(
     *,
     preserve_prompt_text: bool = False,
     model_key: str | None = None,
+    model_family: str | None = None,
     filename_prefix: str | None = None,
     model_selection_explicit: bool = False,
+    style_key: str | None = None,
+    lora_strength: float | None = None,
+    loras: tuple[LoraSelection, ...] = (),
+    seed: int = -1,
     reference_image_bytes: bytes | None = None,
     reference_image_content_type: str | None = None,
     reference_strength: float | None = None,
@@ -865,6 +1060,7 @@ def _build_generation_options(
         prompt=positive_prompt,
         negative_prompt=negative_prompt,
         model_key=model_key,
+        model_family=model_family,
         filename_prefix=filename_prefix,
         model_selection_explicit=model_selection_explicit,
         preserve_prompt_text=preserve_prompt_text,
@@ -874,7 +1070,10 @@ def _build_generation_options(
         steps=20,
         cfg=7.0,
         sampler="Euler a",
-        seed=-1,
+        seed=seed,
+        style_key=style_key,
+        lora_strength=lora_strength,
+        loras=loras,
         reference_image_bytes=reference_image_bytes,
         reference_image_content_type=reference_image_content_type,
         reference_strength=reference_strength,
@@ -939,6 +1138,7 @@ def _build_shogou_generated_image_message(
     model_key: str = DEFAULT_IMAGE_GENERATION_MODEL_KEY,
     reference_used: bool = False,
     reference_strength: float | None = None,
+    positive_prompt: str | None = None,
 ) -> str:
     profile = get_image_generation_profile(model_key)
     selection_text = _selection_message(selection, send_count, generated_count)
@@ -952,7 +1152,7 @@ def _build_shogou_generated_image_message(
         "Assumptions:\n"
         f"{_format_shogou_assumptions(result.assumptions)}\n\n"
         "Positive:\n"
-        f"```text\n{_truncate_prompt(result.positive)}\n```\n"
+        f"```text\n{_truncate_prompt(positive_prompt if positive_prompt is not None else result.positive)}\n```\n"
         "Negative:\n"
         f"```text\n{_truncate_prompt(result.negative)}\n```"
     )
@@ -1111,6 +1311,11 @@ async def _generate_images_from_shogou_result(
     custom_instruction: str | None = None,
     model_key: str = DEFAULT_IMAGE_GENERATION_MODEL_KEY,
     model_selection_explicit: bool = False,
+    style_key: str | None = None,
+    lora_strength: float | None = None,
+    loras: tuple[LoraSelection, ...] = (),
+    seed: int | None = None,
+    last_settings: GenerateAiLastSettings | None = None,
     reference_image_bytes: bytes | None = None,
     reference_image_content_type: str | None = None,
     reference_strength: float | None = None,
@@ -1118,13 +1323,20 @@ async def _generate_images_from_shogou_result(
     # Mirrors _generate_images_from_prompts' preserve_prompt_text=True path exactly,
     # but keeps its own message builder so /generate_raw's behavior stays untouched.
     profile = get_image_generation_profile(model_key)
+    effective_positive = apply_lora_triggers(result.positive, loras)
+    effective_result = replace(result, positive=effective_positive)
     options = _build_generation_options(
-        result.positive,
-        result.negative,
+        effective_result.positive,
+        effective_result.negative,
         preserve_prompt_text=True,
         model_key=profile.model_key,
+        model_family=COMFY_MODEL_FAMILIES.get(profile.model_key),
         filename_prefix=profile.filename_prefix,
         model_selection_explicit=model_selection_explicit,
+        style_key=style_key,
+        lora_strength=lora_strength,
+        loras=loras,
+        seed=-1 if seed is None else seed,
         reference_image_bytes=reference_image_bytes,
         reference_image_content_type=reference_image_content_type,
         reference_strength=reference_strength,
@@ -1148,20 +1360,21 @@ async def _generate_images_from_shogou_result(
         selection = await asyncio.to_thread(select_generated_images, paths)
     send_paths = selection.selected_paths or paths
     message = _build_shogou_generated_image_message(
-        result,
+        effective_result,
         selection,
         len(send_paths),
         len(paths),
         model_key=profile.model_key,
         reference_used=reference_image_bytes is not None,
         reference_strength=reference_strength,
+        positive_prompt=effective_positive,
     )
 
     saved = await _save_generation_history_safely(
         user_id=interaction.user.id,
         request_text=request_text,
         reference_id=reference_id,
-        result=result,
+        result=effective_result,
         generated_images=generated_images,
         selection=selection,
         parent_request_id=parent_request_id,
@@ -1184,6 +1397,20 @@ async def _generate_images_from_shogou_result(
     if view is not None:
         view.message = sent_message
         await _store_discord_message_safely(rated_image_ids, sent_message)
+    if last_settings is not None:
+        try:
+            await asyncio.to_thread(
+                save_last_settings,
+                interaction.user.id,
+                profile.model_key,
+                last_settings,
+            )
+        except Exception:
+            logger.exception(
+                "Failed to save successful /generate_ai settings: user_id=%s model=%s",
+                interaction.user.id,
+                profile.model_key,
+            )
 
 
 async def _build_shogou_prompt_result(
@@ -1606,6 +1833,11 @@ async def _resume_generate_ai_after_character_confirmation(
     reference_image_bytes: bytes | None,
     reference_image_content_type: str | None,
     resolved_reference_strength: float | None,
+    style_key: str | None,
+    lora_strength: float | None,
+    loras: tuple[LoraSelection, ...],
+    seed: int | None,
+    last_settings: GenerateAiLastSettings,
 ) -> None:
     confirmed_result = replace(
         result,
@@ -1629,6 +1861,11 @@ async def _resume_generate_ai_after_character_confirmation(
         reference_id=reference_id,
         model_key=profile.model_key,
         model_selection_explicit=model is not None,
+        style_key=style_key,
+        lora_strength=lora_strength,
+        loras=loras,
+        seed=seed,
+        last_settings=last_settings,
         reference_image_bytes=reference_image_bytes,
         reference_image_content_type=reference_image_content_type,
         reference_strength=resolved_reference_strength,
@@ -1825,19 +2062,6 @@ def setup(client: discord.Client) -> None:
             result_ephemeral=not public,
         )
 
-    @client.tree.command(
-        name="generate_ai",
-        description="日本語の要望からshogou-chan-prompt-designerでプロンプト生成し画像生成します。",
-    )
-    @app_commands.choices(model=GENERATE_AI_MODEL_CHOICES)
-    @app_commands.describe(
-        request="作りたい画像の日本語要望。",
-        model="画像生成モデル。未指定時はAnimagine XL 4.0 Clearを使います。",
-        reference_id="任意。全タグを使う画像参考メモID",
-        reference_image="任意。同じキャラの顔・髪・雰囲気を参照する画像1枚。",
-        reference_strength="参考画像の強さ（0.0～1.0）。未指定時は0.5です。",
-        use_last_reference="直前に使用した参考画像を再利用します。reference_image指定時はそちらを優先します。",
-    )
     async def slash_generate_ai(
         interaction: discord.Interaction,
         request: str,
@@ -1846,11 +2070,46 @@ def setup(client: discord.Client) -> None:
         reference_image: discord.Attachment | None = None,
         reference_strength: float | None = None,
         use_last_reference: bool = False,
+        **panel_options: object,
     ) -> None:
         await interaction.response.defer(ephemeral=True)
+        input_mode = panel_options.pop("input_mode", None)
+        rating = panel_options.pop("rating", None)
+        style = panel_options.pop("style", None)
+        strength = panel_options.pop("strength", None)
+        character_lora = panel_options.pop("character_lora", None)
+        character_lora_strength = panel_options.pop("character_lora_strength", None)
+        additional_lora = panel_options.pop("additional_lora", None)
+        additional_lora_strength = panel_options.pop("additional_lora_strength", None)
+        seed = panel_options.pop("seed", None)
+        selection_ai = panel_options.pop("selection_ai", None)
+        candidate_count = panel_options.pop("candidate_count", None)
+        size = panel_options.pop("size", None)
+        composition_preset = panel_options.pop("composition_preset", None)
         if not is_pc_control_allowed(interaction.user.id):
             logger.warning("Denied /generate_ai by user_id=%s", interaction.user.id)
             await _send_error(interaction, SD_DENIED_MESSAGE, label="generate_ai.denied")
+            return
+
+        try:
+            resolved_settings = _resolve_generate_ai_settings(
+                interaction.user.id,
+                model=model,
+                style=style,
+                strength=strength,
+                rating=rating,
+                selection_ai=selection_ai,
+                candidate_count=candidate_count,
+                size=size,
+                composition_preset=composition_preset,
+                input_mode=input_mode,
+                character_lora=character_lora,
+                character_lora_strength=character_lora_strength,
+                additional_lora=additional_lora,
+                additional_lora_strength=additional_lora_strength,
+            )
+        except (GenerateAiLastSettingsError, ValueError) as exc:
+            await _send_error(interaction, str(exc), label="generate_ai.settings_invalid")
             return
 
         cached_reference = (
@@ -1914,11 +2173,7 @@ def setup(client: discord.Client) -> None:
                 reference_image_content_type,
             )
 
-        try:
-            profile = get_image_generation_profile(model.value if model is not None else None)
-        except ValueError as exc:
-            await _send_error(interaction, str(exc), label="generate_ai.model_invalid")
-            return
+        profile = get_image_generation_profile(resolved_settings.model_key)
         if model is not None and not is_comfy_backend():
             await _send_error(
                 interaction,
@@ -1937,6 +2192,20 @@ def setup(client: discord.Client) -> None:
         if result is None:
             return
 
+        last_settings = GenerateAiLastSettings(
+            style_key=resolved_settings.style_key,
+            lora_strength=resolved_settings.lora_strength,
+            rating=resolved_settings.rating,
+            reference_strength=0.5,
+            selection_ai=resolved_settings.selection_ai,
+            candidate_count=resolved_settings.candidate_count,
+            size_key=resolved_settings.size_key,
+            composition_preset=resolved_settings.composition_preset,
+            loras=lora_selections_to_dicts(resolved_settings.loras),
+            reference_mode=REFERENCE_MODE_NONE,
+            input_mode=resolved_settings.input_mode,
+        )
+
         if result.character_confirmation_required and result.danbooru_character_resolution is not None:
             async def continue_after_character_confirmation(confirmed_resolution: DanbooruCharacterResolution) -> None:
                 await _resume_generate_ai_after_character_confirmation(
@@ -1950,6 +2219,11 @@ def setup(client: discord.Client) -> None:
                     reference_image_bytes=reference_image_bytes,
                     reference_image_content_type=reference_image_content_type,
                     resolved_reference_strength=resolved_reference_strength,
+                    style_key=resolved_settings.style_key,
+                    lora_strength=resolved_settings.lora_strength,
+                    loras=resolved_settings.loras,
+                    seed=seed,
+                    last_settings=last_settings,
                 )
 
             confirmation_view = GenerateAiDanbooruCharacterConfirmationView(
@@ -1984,9 +2258,67 @@ def setup(client: discord.Client) -> None:
             reference_id=reference_id,
             model_key=profile.model_key,
             model_selection_explicit=model is not None,
+            style_key=resolved_settings.style_key,
+            lora_strength=resolved_settings.lora_strength,
+            loras=resolved_settings.loras,
+            seed=seed,
+            last_settings=last_settings,
             reference_image_bytes=reference_image_bytes,
             reference_image_content_type=reference_image_content_type,
             reference_strength=resolved_reference_strength,
+        )
+
+    @client.tree.command(
+        name="generate_ai",
+        description="日本語の要望からshogou-chan-prompt-designerでプロンプト生成し画像生成します。",
+    )
+    @app_commands.choices(
+        model=GENERATE_AI_MODEL_CHOICES,
+        style=GENERATE_AI_STYLE_CHOICES,
+        character_lora=GENERATE_AI_CHARACTER_LORA_CHOICES,
+        additional_lora=GENERATE_AI_ADDITIONAL_LORA_CHOICES,
+    )
+    @app_commands.describe(
+        request="作りたい画像の日本語要望。",
+        model="画像生成モデル。未指定時は前回値、なければAnimagine XL 4.0 Clearです。",
+        style="絵柄LoRA。未指定時は前回値、なしで解除します。",
+        strength="絵柄LoRAの強度（0.0～1.0）。",
+        character_lora="キャラクターLoRA。なしで解除します。",
+        character_lora_strength="キャラクターLoRAの強度（0.0～1.0）。",
+        additional_lora="追加LoRA。なしで解除します。",
+        additional_lora_strength="追加LoRAの強度（0.0～1.0）。",
+        reference_id="任意。全タグを使う画像参考メモID",
+        reference_image="任意。同じキャラの顔・髪・雰囲気を参照する画像1枚。",
+        reference_strength="参考画像の強さ（0.0～1.0）。未指定時は0.5です。",
+    )
+    async def _slash_generate_ai_command(
+        interaction: discord.Interaction,
+        request: str,
+        model: app_commands.Choice[str] | None = None,
+        style: app_commands.Choice[str] | None = None,
+        strength: float | None = None,
+        character_lora: app_commands.Choice[str] | None = None,
+        character_lora_strength: float | None = None,
+        additional_lora: app_commands.Choice[str] | None = None,
+        additional_lora_strength: float | None = None,
+        reference_id: int | None = None,
+        reference_image: discord.Attachment | None = None,
+        reference_strength: float | None = None,
+    ) -> None:
+        await slash_generate_ai(
+            interaction,
+            request,
+            model=model,
+            style=style,
+            strength=strength,
+            character_lora=character_lora,
+            character_lora_strength=character_lora_strength,
+            additional_lora=additional_lora,
+            additional_lora_strength=additional_lora_strength,
+            reference_id=reference_id,
+            reference_image=reference_image,
+            reference_strength=reference_strength,
+            use_last_reference=False,
         )
 
     # Panel generation reuses this existing callback.  No second generation

@@ -23,9 +23,9 @@ class PanelSettingsBridgeTests(unittest.TestCase):
         self.assertFalse(settings.use_last_reference)
         self.assertFalse(settings.loras)
 
-    def test_last_settings_are_inherited_without_lora_resolution(self):
+    def test_last_settings_are_inherited_with_lora_resolution(self):
         previous = GenerateAiLastSettings(
-            style_key="raw-style",
+            style_key="natsume",
             lora_strength=0.65,
             rating="sensitive",
             reference_strength=0.9,
@@ -34,7 +34,7 @@ class PanelSettingsBridgeTests(unittest.TestCase):
             size_key="portrait",
             composition_preset="full_body",
             loras=(
-                {"key": "raw-character", "lora_type": "character", "strength": 0.8},
+                {"key": "natsume", "lora_type": "style", "strength": 0.65},
             ),
             reference_mode="pose",
             input_mode="prompt_import",
@@ -55,8 +55,8 @@ class PanelSettingsBridgeTests(unittest.TestCase):
         self.assertEqual(settings.reference_mode, "none")
         self.assertFalse(settings.use_last_reference)
         self.assertIsNone(settings.reference_strength)
-        self.assertEqual(settings.loras[0].key, "raw-character")
-        self.assertEqual(settings.loras[0].lora_type, "character")
+        self.assertEqual(settings.loras[0].key, "natsume")
+        self.assertEqual(settings.loras[0].lora_type, "style")
 
     def test_panel_state_can_be_constructed_from_shared_defaults(self):
         with mock.patch.object(
@@ -87,6 +87,8 @@ class PanelSettingsBridgeTests(unittest.TestCase):
                     model_key="janku",
                     input_mode="prompt_import",
                     rating="safe",
+                    style_key="natsume",
+                    style_strength=0.55,
                     seed=123,
                     selection_ai=False,
                     candidate_count=2,
@@ -103,6 +105,8 @@ class PanelSettingsBridgeTests(unittest.TestCase):
         self.assertEqual(payload["model"].value, "janku")
         self.assertEqual(payload["input_mode"].value, "prompt_import")
         self.assertEqual(payload["rating"].value, "safe")
+        self.assertEqual(payload["style"].value, "natsume")
+        self.assertEqual(payload["strength"], 0.55)
         self.assertEqual(payload["seed"], 123)
         self.assertFalse(payload["selection_ai"])
         self.assertEqual(payload["candidate_count"], 2)
