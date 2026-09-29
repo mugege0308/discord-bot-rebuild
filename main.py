@@ -16,6 +16,7 @@ from commands import character_generate
 from commands import claude
 from commands import claude_remote
 from commands import dev_task
+from commands import gallery
 from commands import image_analyze
 from commands import image_feedback
 from commands import lora
@@ -109,6 +110,7 @@ REQUIRED_SLASH_COMMANDS = {
     "ba_tl_cost",
     "generate_raw",
     "generate_ai",
+    "gallery",
     "image_memory_list",
     "image_memory_show",
     "image_memory_rename",
@@ -251,6 +253,7 @@ blue_archive.setup(client)
 claude.setup(client)
 claude_remote.setup(client)
 dev_task.setup(client)
+gallery.setup(client)
 character_generate.setup(client)
 image_analyze.setup(client)
 image_feedback.setup(client)
