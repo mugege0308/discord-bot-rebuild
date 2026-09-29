@@ -90,6 +90,7 @@ from services.shogou_prompt_designer import (
     generate_shogou_composition_variation,
     generate_shogou_custom_instruction_variation,
     generate_shogou_prompt_result,
+    validate_requested_prompt_rating,
 )
 
 
@@ -111,7 +112,9 @@ POSE_REFERENCE_REQUIRED_MESSAGE = "ポーズ参照にはポーズ画像を添付
 GENERATE_AI_DEFAULT_SELECTION_AI = True
 GENERATE_AI_MODEL_CHOICES = [
     app_commands.Choice(name="Animagine XL 4.0 Clear", value="animagine"),
+    app_commands.Choice(name="Animagine XL 4.0 Clear Adult", value="animagine_adult"),
     app_commands.Choice(name="JANKU v7.77", value="janku"),
+    app_commands.Choice(name="JANKU v7.77 Adult", value="janku_adult"),
 ]
 GENERATE_AI_PROMPT_RATING_CHOICES = [
     app_commands.Choice(name="Auto", value=PROMPT_RATING_AUTO),
@@ -423,6 +426,26 @@ def _resolve_generate_ai_settings(
     else:
         resolved_rating = PROMPT_RATING_AUTO
         sources["rating"] = "default"
+    try:
+        resolved_rating = validate_requested_prompt_rating(
+            resolved_rating,
+            is_adult=profile.is_adult,
+        )
+    except PromptGeneratorError:
+        if sources["rating"] != "inherited":
+            raise
+        logger.warning(
+            "Stored /generate_ai rating is incompatible with model; using default: "
+            "user_id=%s model=%s rating=%s",
+            user_id,
+            profile.model_key,
+            resolved_rating,
+        )
+        resolved_rating = validate_requested_prompt_rating(
+            PROMPT_RATING_AUTO,
+            is_adult=profile.is_adult,
+        )
+        sources["rating"] = "default"
 
     if selection_ai is not None:
         resolved_selection_ai = selection_ai
@@ -547,7 +570,7 @@ def _resolve_generate_ai_settings(
         sources["additional_lora"] = "default"
         sources["additional_lora_strength"] = "default"
 
-    model_family = COMFY_MODEL_FAMILIES.get(profile.model_key)
+    model_family = profile.model_family
     loras = resolve_lora_selections(
         character_key=character_key,
         character_strength=character_strength,
@@ -1703,6 +1726,7 @@ async def _build_shogou_prompt_result(
     label_prefix: str,
     reference_id: int | None = None,
     model_key: str = DEFAULT_IMAGE_GENERATION_MODEL_KEY,
+    requested_rating: str = PROMPT_RATING_AUTO,
 ) -> ShogouPromptResult | None:
     try:
         result = await asyncio.to_thread(
@@ -1711,6 +1735,7 @@ async def _build_shogou_prompt_result(
             interaction.user.id,
             reference_id,
             model_key,
+            requested_rating,
             enable_generic_danbooru=(label_prefix == "generate_ai"),
         )
         logger.info(
@@ -2532,6 +2557,7 @@ def setup(client: discord.Client) -> None:
             label_prefix="generate_ai",
             reference_id=reference_id,
             model_key=profile.model_key,
+            requested_rating=resolved_settings.rating,
         )
         if result is None:
             return

@@ -174,10 +174,17 @@ def load_shogou_instruction(model_key: str = DEFAULT_IMAGE_GENERATION_MODEL_KEY)
         profile = get_image_generation_profile(model_key)
     except ValueError as exc:
         raise PromptGeneratorError(str(exc)) from exc
-    instruction_file = INSTRUCTION_FILE if profile.model_key == DEFAULT_IMAGE_GENERATION_MODEL_KEY else profile.prompt_designer_instruction
+    instruction_file = profile.prompt_designer_instruction
     if not instruction_file.exists():
         raise PromptGeneratorError(f"{instruction_file} が見つかりません。")
-    return instruction_file.read_text(encoding="utf-8")
+    instruction = instruction_file.read_text(encoding="utf-8")
+    addendum_file = profile.prompt_designer_addendum
+    if addendum_file is None:
+        return instruction
+    if not addendum_file.exists():
+        raise PromptGeneratorError(f"{addendum_file} が見つかりません。")
+    addendum = addendum_file.read_text(encoding="utf-8")
+    return instruction.rstrip() + "\n\n" + addendum.lstrip()
 
 
 def _strip_think_blocks(text: str) -> str:
@@ -309,6 +316,10 @@ def generate_shogou_prompt_result(
         raise PromptGeneratorError("少し長すぎます。1000文字以内にしてください。")
 
     profile = get_image_generation_profile(model_key)
+    requested_rating = validate_requested_prompt_rating(
+        requested_rating,
+        is_adult=profile.is_adult,
+    )
     trace_id = hashlib.sha256(
         f"{user_id}|{profile.model_key}|{text}".encode("utf-8", errors="replace")
     ).hexdigest()[:16]
@@ -423,6 +434,11 @@ def generate_shogou_prompt_result(
     system_prompt = append_memory_to_system_prompt(
         load_shogou_instruction(model_key), user_id, text, mode="prompt"
     )
+    if requested_rating != PROMPT_RATING_AUTO:
+        system_prompt += (
+            f"\n\nRequested rating: {requested_rating}. Use only this rating tag in positive; "
+            "do not add or intensify content to justify it."
+        )
     if user_id is not None:
         try:
             reference_context = build_image_memory_prompt_context(user_id, text, reference_id)

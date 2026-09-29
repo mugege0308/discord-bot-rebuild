@@ -93,11 +93,15 @@ REFERENCE_IMAGE_EXTENSIONS = {
 }
 COMFY_CHECKPOINTS = {
     "janku": "JANKUTrainedChenkinNoobai_v777.safetensors",
+    "janku_adult": "JANKUTrainedChenkinNoobai_v777.safetensors",
     "animagine": "animagineXL40Opt_clear.safetensors",
+    "animagine_adult": "animagineXL40Opt_clear.safetensors",
 }
 COMFY_MODEL_FAMILIES = {
     "janku": "sdxl",
+    "janku_adult": "sdxl",
     "animagine": "sdxl",
+    "animagine_adult": "sdxl",
 }
 COMFY_POLL_INTERVAL_SECONDS = 2
 COMFY_TIMEOUT_SECONDS = 600

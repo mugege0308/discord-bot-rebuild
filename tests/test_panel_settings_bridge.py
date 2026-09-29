@@ -27,7 +27,7 @@ class PanelSettingsBridgeTests(unittest.TestCase):
         previous = GenerateAiLastSettings(
             style_key="natsume",
             lora_strength=0.65,
-            rating="sensitive",
+            rating="safe",
             reference_strength=0.9,
             selection_ai=False,
             candidate_count=3,
@@ -47,7 +47,7 @@ class PanelSettingsBridgeTests(unittest.TestCase):
 
         self.assertEqual(settings.model_key, "janku")
         self.assertEqual(settings.input_mode, "prompt_import")
-        self.assertEqual(settings.rating, "sensitive")
+        self.assertEqual(settings.rating, "safe")
         self.assertFalse(settings.selection_ai)
         self.assertEqual(settings.candidate_count, 3)
         self.assertEqual(settings.size_key, "portrait")

@@ -14,6 +14,8 @@ class ImageGenerationProfile:
     checkpoint: str
     prompt_designer_instruction: Path
     filename_prefix: str
+    is_adult: bool = False
+    prompt_designer_addendum: Path | None = None
     positive_prefix: str | None = None
     positive_suffix: str | None = None
     negative_default: str | None = None
@@ -24,6 +26,7 @@ class ImageGenerationProfile:
     sampler: str | None = None
     scheduler: str | None = None
     denoise: float | None = None
+    model_family: str = "sdxl"
 
 
 IMAGE_GENERATION_PROFILES: dict[str, ImageGenerationProfile] = {
@@ -34,6 +37,15 @@ IMAGE_GENERATION_PROFILES: dict[str, ImageGenerationProfile] = {
         prompt_designer_instruction=Path("shogou_chan_prompt_designer_instruction.md"),
         filename_prefix="Shogou_AnimagineXL",
     ),
+    "animagine_adult": ImageGenerationProfile(
+        model_key="animagine_adult",
+        display_name="Animagine XL 4.0 Clear Adult",
+        checkpoint=COMFY_CHECKPOINTS["animagine_adult"],
+        prompt_designer_instruction=Path("shogou_chan_prompt_designer_instruction.md"),
+        filename_prefix="Shogou_AnimagineXL_Adult",
+        is_adult=True,
+        prompt_designer_addendum=Path("shogou_chan_prompt_designer_instruction_animagine_adult.md"),
+    ),
     "janku": ImageGenerationProfile(
         model_key="janku",
         display_name="JANKU v7.77",
@@ -41,6 +53,23 @@ IMAGE_GENERATION_PROFILES: dict[str, ImageGenerationProfile] = {
         prompt_designer_instruction=Path("shogou_chan_prompt_designer_instruction_janku.md"),
         filename_prefix="Shogou_JANKU",
     ),
+    "janku_adult": ImageGenerationProfile(
+        model_key="janku_adult",
+        display_name="JANKU v7.77 Adult",
+        checkpoint=COMFY_CHECKPOINTS["janku_adult"],
+        prompt_designer_instruction=Path("shogou_chan_prompt_designer_instruction_janku_adult.md"),
+        filename_prefix="Shogou_JANKU_Adult",
+        is_adult=True,
+        prompt_designer_addendum=None,
+    ),
+}
+
+# A checkpoint cannot distinguish the regular and Adult prompt profiles.
+# This mapping is used only for legacy rows whose model_key is NULL; newly
+# saved rows retain their explicit profile key and are resolved before this.
+LEGACY_CHECKPOINT_MODEL_KEYS = {
+    COMFY_CHECKPOINTS["animagine"]: "animagine",
+    COMFY_CHECKPOINTS["janku"]: "janku",
 }
 
 
@@ -55,9 +84,10 @@ def get_image_generation_profile(model_key: str | None = None) -> ImageGeneratio
 def get_model_key_for_checkpoint(checkpoint: str | None) -> str | None:
     if not checkpoint:
         return None
-    matches = [
-        profile.model_key
-        for profile in IMAGE_GENERATION_PROFILES.values()
-        if profile.checkpoint == checkpoint
-    ]
-    return matches[0] if len(matches) == 1 else None
+    legacy_key = LEGACY_CHECKPOINT_MODEL_KEYS.get(checkpoint)
+    if legacy_key is None:
+        return None
+    profile = IMAGE_GENERATION_PROFILES.get(legacy_key)
+    if profile is None or profile.checkpoint != checkpoint:
+        return None
+    return legacy_key
