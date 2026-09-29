@@ -22,6 +22,7 @@ from commands import image_feedback
 from commands import lora
 from commands import memory
 from commands import prompt
+from commands import references
 from commands import voice
 from commands.help import handle_help
 from commands.memo import handle_memo
@@ -254,6 +255,7 @@ claude.setup(client)
 claude_remote.setup(client)
 dev_task.setup(client)
 gallery.setup(client)
+references.setup(client)
 character_generate.setup(client)
 image_analyze.setup(client)
 image_feedback.setup(client)

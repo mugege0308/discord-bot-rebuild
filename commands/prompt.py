@@ -64,6 +64,7 @@ from services.image_generation_profiles import (
 )
 from services.gallery_control import get_gallery_images_root
 from services.lora_catalog import get_comfy_lora_choice_specs
+from services.saved_references import get_reference, read_reference_bytes
 from services.danbooru_character_resolver import DanbooruCharacterResolution
 from services.verified_character_registry import VerifiedCharacterRegistry
 from services.pc_control import is_pc_control_allowed
@@ -635,6 +636,7 @@ async def run_generate_ai_from_panel(
     reference_mode: str = REFERENCE_MODE_NONE,
     use_last_reference: bool = False,
     reference_strength: float | None = None,
+    saved_reference_id: int | None = None,
     selection_ai: bool = GENERATE_AI_DEFAULT_SELECTION_AI,
     candidate_count: int = 5,
     size_key: str = DEFAULT_SIZE_KEY,
@@ -653,6 +655,12 @@ async def run_generate_ai_from_panel(
         isinstance(seed, bool) or not isinstance(seed, int) or not 0 <= seed <= 4_294_967_295
     ):
         raise ValueError("Seedは0～4294967295で指定してください。")
+    if saved_reference_id is not None and (
+        isinstance(saved_reference_id, bool)
+        or not isinstance(saved_reference_id, int)
+        or saved_reference_id <= 0
+    ):
+        raise ValueError("保存済み参考画像IDの指定が不正です。")
 
     resolved_model = _panel_choice_value(GENERATE_AI_MODEL_CHOICES, model_key, "Model")
     resolved_input_mode = _panel_choice_value(GENERATE_AI_INPUT_MODE_CHOICES, input_mode, "入力方式")
@@ -706,6 +714,7 @@ async def run_generate_ai_from_panel(
             value=resolved_reference_mode,
         ),
         "use_last_reference": use_last_reference,
+        "saved_reference_id": saved_reference_id,
         "seed": seed,
         "selection_ai": selection_ai,
         "candidate_count": candidate_count,
@@ -2412,6 +2421,14 @@ def setup(client: discord.Client) -> None:
         size = panel_options.pop("size", None)
         composition_preset = panel_options.pop("composition_preset", None)
         reference_mode = panel_options.pop("reference_mode", None)
+        saved_reference_id = panel_options.pop("saved_reference_id", None)
+        if saved_reference_id is not None and (
+            isinstance(saved_reference_id, bool)
+            or not isinstance(saved_reference_id, int)
+            or saved_reference_id <= 0
+        ):
+            await _send_error(interaction, "保存済み参考画像IDの指定が不正です。", label="generate_ai.saved_reference_invalid")
+            return
         if reference_mode is None and (reference_image is not None or use_last_reference):
             reference_mode = app_commands.Choice(
                 name="構図参照",
@@ -2445,6 +2462,49 @@ def setup(client: discord.Client) -> None:
             await _send_error(interaction, str(exc), label="generate_ai.settings_invalid")
             return
 
+        if saved_reference_id is not None and resolved_settings.reference_mode == REFERENCE_MODE_NONE:
+            await _send_error(
+                interaction,
+                "保存済み参考画像を使う場合は、構図参照またはポーズ参照を選択してください。",
+                label="generate_ai.saved_reference_mode_none",
+            )
+            return
+        if saved_reference_id is not None and (reference_image is not None or use_last_reference):
+            await _send_error(
+                interaction,
+                "保存済み参考画像と別の参考画像は同時に指定できません。",
+                label="generate_ai.saved_reference_conflict",
+            )
+            return
+        saved_reference_bytes: bytes | None = None
+        saved_reference_content_type: str | None = None
+        if saved_reference_id is not None:
+            try:
+                saved_reference = await asyncio.to_thread(
+                    get_reference,
+                    interaction.user.id,
+                    saved_reference_id,
+                )
+                if saved_reference is None:
+                    raise ValueError("指定した保存IDが見つかりません。")
+                if resolved_settings.reference_mode == REFERENCE_MODE_POSE and saved_reference.kind != "pose":
+                    raise ValueError("ポーズ参照にはkind=poseの保存画像を指定してください。")
+                if resolved_settings.reference_mode == REFERENCE_MODE_COMPOSITION and saved_reference.kind == "pose":
+                    raise ValueError("pose保存画像はポーズ参照として指定してください。")
+                saved_reference_bytes = await asyncio.to_thread(read_reference_bytes, saved_reference)
+                saved_reference_content_type = detect_image_content_type(
+                    saved_reference_bytes,
+                    None,
+                )
+                validate_image_bytes(saved_reference_bytes, saved_reference_content_type)
+            except (PromptGeneratorError, ValueError, RuntimeError) as exc:
+                await _send_error(interaction, str(exc), label="generate_ai.saved_reference_invalid")
+                return
+            except Exception:
+                logger.exception("Failed to read saved reference: user_id=%s id=%s", interaction.user.id, saved_reference_id)
+                await _send_error(interaction, "保存済み参考画像を読み込めませんでした。", label="generate_ai.saved_reference_read_failed")
+                return
+
         if resolved_settings.reference_mode == REFERENCE_MODE_NONE:
             # An explicit "none" selection is authoritative and clears any
             # stale attachment/reuse values before they reach ComfyUI.
@@ -2454,10 +2514,10 @@ def setup(client: discord.Client) -> None:
 
         cached_reference = (
             _last_reference_images.get(interaction.user.id)
-            if reference_image is None and use_last_reference
+            if saved_reference_id is None and reference_image is None and use_last_reference
             else None
         )
-        if reference_image is None and use_last_reference and cached_reference is None:
+        if reference_image is None and saved_reference_id is None and use_last_reference and cached_reference is None:
             await _send_error(
                 interaction,
                 LAST_REFERENCE_MISSING_MESSAGE,
@@ -2467,6 +2527,7 @@ def setup(client: discord.Client) -> None:
         if (
             resolved_settings.reference_mode in {REFERENCE_MODE_COMPOSITION, REFERENCE_MODE_POSE}
             and reference_image is None
+            and saved_reference_id is None
             and cached_reference is None
         ):
             await _send_error(
@@ -2484,7 +2545,7 @@ def setup(client: discord.Client) -> None:
             )
             return
 
-        reference_used = reference_image is not None or cached_reference is not None
+        reference_used = reference_image is not None or saved_reference_bytes is not None or cached_reference is not None
         if reference_used and not is_comfy_backend():
             await _send_error(
                 interaction,
@@ -2501,7 +2562,11 @@ def setup(client: discord.Client) -> None:
             await _send_error(interaction, str(exc), label="generate_ai.reference_strength_invalid")
             return
 
-        reference_image_bytes, reference_image_content_type = cached_reference or (None, None)
+        reference_image_bytes, reference_image_content_type = (
+            (saved_reference_bytes, saved_reference_content_type)
+            if saved_reference_bytes is not None
+            else (cached_reference or (None, None))
+        )
         if reference_image is not None:
             if reference_image.size > MAX_IMAGE_BYTES:
                 await _send_error(

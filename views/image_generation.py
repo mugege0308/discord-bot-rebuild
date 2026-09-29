@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import math
 from dataclasses import dataclass
@@ -11,6 +12,7 @@ import discord
 from commands import prompt as prompt_commands
 from services.image_composition import COMPOSITION_LABELS, get_image_size_spec
 from services.image_generation_profiles import DEFAULT_IMAGE_GENERATION_MODEL_KEY, get_image_generation_profile
+from services.saved_references import list_references
 from views.panel import OwnerOnlyView
 
 
@@ -55,6 +57,7 @@ class ImageGenerationPanelState:
     reference_mode: str = prompt_commands.REFERENCE_MODE_NONE
     use_last_reference: bool = False
     reference_strength: float | None = None
+    saved_reference_id: int | None = None
     selection_ai: bool = prompt_commands.GENERATE_AI_DEFAULT_SELECTION_AI
     candidate_count: int = 5
     size_key: str = prompt_commands.DEFAULT_SIZE_KEY
@@ -330,6 +333,7 @@ class ImageGenerationPanel(_ImageGenerationView):
                 reference_mode=self.state.reference_mode,
                 use_last_reference=self.state.use_last_reference,
                 reference_strength=self.state.reference_strength,
+                saved_reference_id=self.state.saved_reference_id,
                 selection_ai=self.state.selection_ai,
                 candidate_count=self.state.candidate_count,
                 size_key=self.state.size_key,
@@ -440,6 +444,7 @@ class _PanelChoiceSelect(discord.ui.Select):
         if self.setting_name == "reference_mode" and self.values[0] == prompt_commands.REFERENCE_MODE_NONE:
             self.state.use_last_reference = False
             self.state.reference_strength = None
+            self.state.saved_reference_id = None
         await _edit_main_panel(interaction, self.owner_id, self.bot_mention, self.state)
 
 
@@ -644,7 +649,7 @@ class ReferencePanel(_ImageGenerationView):
             f"直前の /generate_ai 参考画像: {availability}\n"
             f"参照画像: {_reference_info_text(self.owner_id)}\n"
             f"現在: {_choice_name(prompt_commands.GENERATE_AI_REFERENCE_MODE_CHOICES, self.state.reference_mode)} / "
-            f"{'画像あり' if self.state.use_last_reference else '画像未指定'}\n"
+            f"{'保存ID ' + str(self.state.saved_reference_id) if self.state.saved_reference_id else ('画像あり' if self.state.use_last_reference else '画像未指定')}\n"
             f"strength: {_reference_strength_text(self.state.reference_strength) or '既定値'}\n\n"
             "画像本体は /generate_ai の参考画像添付、または直前の画像を使います。"
         )
@@ -657,6 +662,7 @@ class ReferencePanel(_ImageGenerationView):
         if mode == prompt_commands.REFERENCE_MODE_NONE:
             self.state.use_last_reference = False
             self.state.reference_strength = None
+            self.state.saved_reference_id = None
         await _edit_main_panel(interaction, self.owner_id, self.bot_mention, self.state)
 
     @discord.ui.button(label="参照なし", style=discord.ButtonStyle.secondary)
@@ -682,11 +688,30 @@ class ReferencePanel(_ImageGenerationView):
         if self.state.reference_mode == prompt_commands.REFERENCE_MODE_NONE:
             self.state.reference_mode = prompt_commands.REFERENCE_MODE_COMPOSITION
         self.state.use_last_reference = True
+        self.state.saved_reference_id = None
         await _edit_main_panel(interaction, self.owner_id, self.bot_mention, self.state)
+
+    @discord.ui.button(label="保存済みを選ぶ", style=discord.ButtonStyle.primary)
+    async def saved_reference_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("このパネルは呼び出した本人用だよ。", ephemeral=True)
+            return
+        try:
+            items = await asyncio.to_thread(list_references, self.owner_id, limit=25)
+        except Exception:
+            logger.exception("Failed to list saved references for panel: user_id=%s", self.owner_id)
+            await interaction.response.send_message("保存済み参考画像の一覧を取得できませんでした。", ephemeral=True)
+            return
+        if not items:
+            await interaction.response.send_message("保存済み参考画像はありません。先に /ref_save を使ってね。", ephemeral=True)
+            return
+        view = SavedReferencePickerPanel(self.owner_id, self.bot_mention, self.state, items)
+        await _edit_picker_panel(interaction, view, "使いたい保存済み参考画像を選んでね。")
 
     @discord.ui.button(label="参考画像なし", style=discord.ButtonStyle.secondary)
     async def disable_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         self.state.use_last_reference = False
+        self.state.saved_reference_id = None
         self.state.reference_mode = prompt_commands.REFERENCE_MODE_NONE
         self.state.reference_strength = None
         await _edit_main_panel(interaction, self.owner_id, self.bot_mention, self.state)
@@ -698,6 +723,63 @@ class ReferencePanel(_ImageGenerationView):
     @discord.ui.button(label="🔙 戻る", style=discord.ButtonStyle.secondary)
     async def back_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await _edit_main_panel(interaction, self.owner_id, self.bot_mention, self.state)
+
+
+class SavedReferenceSelect(discord.ui.Select):
+    def __init__(self, owner_id: int, bot_mention: str, state: ImageGenerationPanelState, items) -> None:
+        self.owner_id = owner_id
+        self.bot_mention = bot_mention
+        self.state = state
+        self.items_by_id = {str(item.id): item for item in items}
+        options = [
+            discord.SelectOption(
+                label=f"{item.name[:70]} ({item.kind})",
+                value=str(item.id),
+                description=(", ".join(item.tags) or "タグなし")[:100],
+            )
+            for item in items[:25]
+        ]
+        super().__init__(placeholder="保存済み参考画像", min_values=1, max_values=1, options=options)
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("このパネルは呼び出した本人用だよ。", ephemeral=True)
+            return
+        item = self.items_by_id.get(self.values[0])
+        if item is None:
+            await interaction.response.send_message("保存済み参考画像が見つかりません。", ephemeral=True)
+            return
+        self.state.saved_reference_id = item.id
+        self.state.use_last_reference = False
+        self.state.reference_mode = (
+            prompt_commands.REFERENCE_MODE_POSE
+            if item.kind == "pose"
+            else prompt_commands.REFERENCE_MODE_COMPOSITION
+        )
+        await _edit_main_panel(interaction, self.owner_id, self.bot_mention, self.state)
+
+
+class SavedReferencePickerPanel(_ImageGenerationView):
+    def __init__(self, owner_id: int, bot_mention: str, state: ImageGenerationPanelState, items) -> None:
+        super().__init__(owner_id, bot_mention, timeout=PANEL_TIMEOUT_SECONDS)
+        self.state = state
+        self.add_item(SavedReferenceSelect(owner_id, bot_mention, state, items))
+
+    @discord.ui.button(label="保存済み参照を解除", style=discord.ButtonStyle.secondary)
+    async def clear_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("このパネルは呼び出した本人用だよ。", ephemeral=True)
+            return
+        self.state.saved_reference_id = None
+        self.state.reference_mode = prompt_commands.REFERENCE_MODE_NONE
+        self.state.use_last_reference = False
+        self.state.reference_strength = None
+        await _edit_main_panel(interaction, self.owner_id, self.bot_mention, self.state)
+
+    @discord.ui.button(label="🔙 参考画像設定へ", style=discord.ButtonStyle.secondary)
+    async def back_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        view = ReferencePanel(self.owner_id, self.bot_mention, self.state)
+        await _edit_picker_panel(interaction, view, view.render())
 
 
 class ReferenceStrengthModal(discord.ui.Modal):
