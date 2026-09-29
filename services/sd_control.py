@@ -203,6 +203,10 @@ class SdGenerationOptions:
     pose_detect_hand: bool = True
     pose_detect_face: bool = True
     pose_debug_enabled: bool = True
+    # Optional metadata written beside generated images for the independent
+    # Gallery consumer.  Generation remains fully functional when unset.
+    gallery_output_root: Path | None = None
+    gallery_metadata: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -702,6 +706,8 @@ def validate_options(options: SdGenerationOptions) -> SdGenerationOptions:
         pose_detect_hand=bool(options.pose_detect_hand),
         pose_detect_face=bool(options.pose_detect_face),
         pose_debug_enabled=bool(options.pose_debug_enabled),
+        gallery_output_root=options.gallery_output_root,
+        gallery_metadata=(None if options.gallery_metadata is None else dict(options.gallery_metadata)),
     )
 
 
@@ -1900,7 +1906,50 @@ def _run_pose_pipeline(
     raise RuntimeError(f"Pose referenceの骨格品質判定に失敗しました。未検証の骨格は使用しません。 {reasons[:700]}")
 
 
-def _download_comfy_images(history: dict[str, Any], batch_index: int) -> list[Path]:
+def _write_gallery_metadata_sidecar(path: Path, payload: dict[str, Any]) -> None:
+    """Write the small sidecar contract consumed by the optional Gallery.
+
+    Sidecars are best effort: they must never turn a successfully downloaded
+    image into a failed Discord generation.
+    """
+
+    sidecar = path.with_name(path.name + ".metadata.json")
+    try:
+        sidecar.write_text(
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+            encoding="utf-8",
+        )
+    except (OSError, TypeError, ValueError):
+        logger.warning("Gallery metadata sidecar could not be written: %s", sidecar, exc_info=True)
+
+
+def _resolve_gallery_output_path(
+    output_root: Path | None,
+    filename: str,
+    subfolder: str,
+    image_type: str,
+) -> Path | None:
+    """Resolve an authoritative ComfyUI output path without escaping root."""
+
+    if output_root is None or image_type != "output":
+        return None
+    try:
+        root = output_root.expanduser().resolve()
+        candidate = (root / subfolder / filename).resolve()
+        candidate.relative_to(root)
+        return candidate if candidate.is_file() else None
+    except (OSError, ValueError):
+        return None
+
+
+def _download_comfy_images(
+    history: dict[str, Any],
+    batch_index: int,
+    *,
+    gallery_output_root: Path | None = None,
+    gallery_metadata: dict[str, Any] | None = None,
+    prompt_id: str | None = None,
+) -> list[Path]:
     outputs = history.get("outputs")
     if not isinstance(outputs, dict):
         raise RuntimeError("ComfyUI history に outputs がなかったよ。")
@@ -1933,6 +1982,19 @@ def _download_comfy_images(history: dict[str, Any], batch_index: int) -> list[Pa
             suffix = Path(filename).suffix or ".png"
             output_path = OUTPUT_DIR / f"{timestamp}_{batch_index:02d}_{len(paths) + image_index:02d}{suffix}"
             output_path.write_bytes(response.content)
+            if gallery_metadata is not None:
+                payload = dict(gallery_metadata)
+                payload.setdefault("job_id", prompt_id or "")
+                payload.setdefault("prompt_id", prompt_id or "")
+                payload.setdefault("source_image", filename)
+                payload.setdefault("batch_index", batch_index)
+                payload.setdefault("generated_at", datetime.now(JST).isoformat(timespec="seconds"))
+                _write_gallery_metadata_sidecar(output_path, payload)
+                source_path = _resolve_gallery_output_path(
+                    gallery_output_root, filename, subfolder, str(image_type)
+                )
+                if source_path is not None:
+                    _write_gallery_metadata_sidecar(source_path, payload)
             paths.append(output_path)
 
     if not paths:
@@ -2031,7 +2093,13 @@ def _generate_comfy_images_with_metadata(options: SdGenerationOptions) -> list[G
 
             prompt_id = _queue_comfy_prompt_with_logging(workflow, client_id)
             history = _wait_comfy_history(prompt_id)
-            paths = _download_comfy_images(history, batch_index)
+            paths = _download_comfy_images(
+                history,
+                batch_index,
+                gallery_output_root=options.gallery_output_root,
+                gallery_metadata=options.gallery_metadata,
+                prompt_id=prompt_id,
+            )
 
             for path in paths:
                 images.append(
@@ -2091,6 +2159,11 @@ def _generate_webui_images_with_metadata(options: SdGenerationOptions) -> list[G
     # None (see GeneratedImage's docstring) rather than guessed. The
     # remaining fields reflect the request options actually sent, unchanged.
     paths = _generate_webui_images(options)
+    if options.gallery_metadata is not None:
+        for index, path in enumerate(paths, start=1):
+            payload = dict(options.gallery_metadata)
+            payload.setdefault("batch_index", index)
+            _write_gallery_metadata_sidecar(path, payload)
     return [
         GeneratedImage(
             path=path,

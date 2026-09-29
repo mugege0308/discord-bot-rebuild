@@ -3,6 +3,7 @@ from dataclasses import dataclass, replace
 import hashlib
 import inspect
 import logging
+import uuid
 from pathlib import Path
 from typing import Awaitable, Callable, Sequence
 
@@ -61,6 +62,7 @@ from services.image_generation_profiles import (
     DEFAULT_IMAGE_GENERATION_MODEL_KEY,
     get_image_generation_profile,
 )
+from services.gallery_control import get_gallery_images_root
 from services.lora_catalog import get_comfy_lora_choice_specs
 from services.danbooru_character_resolver import DanbooruCharacterResolution
 from services.verified_character_registry import VerifiedCharacterRegistry
@@ -1130,6 +1132,8 @@ def _build_generation_options(
     pose_strength: float | None = None,
     selection_enabled: bool = GENERATE_AI_DEFAULT_SELECTION_AI,
     selection_generate_count: int | None = None,
+    gallery_output_root: Path | None = None,
+    gallery_metadata: dict[str, object] | None = None,
 ) -> SdGenerationOptions:
     selection_available = selection_enabled and is_image_selection_available()
     has_reference_image = reference_image_bytes is not None or pose_reference_bytes is not None
@@ -1173,6 +1177,8 @@ def _build_generation_options(
         pose_reference_width=pose_reference_width,
         pose_reference_height=pose_reference_height,
         pose_strength=0.7 if pose_strength is None else pose_strength,
+        gallery_output_root=gallery_output_root,
+        gallery_metadata=(None if gallery_metadata is None else dict(gallery_metadata)),
     )
 
 
@@ -1530,12 +1536,31 @@ async def _generate_images_from_shogou_result(
     pose_strength: float | None = None,
     selection_enabled: bool = GENERATE_AI_DEFAULT_SELECTION_AI,
     selection_generate_count: int | None = None,
+    auto_review: bool = False,
 ) -> None:
     # Mirrors _generate_images_from_prompts' preserve_prompt_text=True path exactly,
     # but keeps its own message builder so /generate_raw's behavior stays untouched.
     profile = get_image_generation_profile(model_key)
     effective_positive = apply_lora_triggers(result.positive, loras)
     effective_result = replace(result, positive=effective_positive)
+    review_scope_id = uuid.uuid4().hex[:16] if auto_review else ""
+    gallery_metadata = None
+    gallery_output_root = None
+    if review_scope_id:
+        gallery_output_root = get_gallery_images_root()
+        gallery_metadata = {
+            "job_id": review_scope_id,
+            "request_text": request_text,
+            "prompt": effective_result.positive,
+            "positive_prompt": effective_result.positive,
+            "negative_prompt": effective_result.negative,
+            "model": profile.model_key,
+            "reference_mode": reference_mode or "none",
+            "reference_used": bool(reference_image_bytes or pose_reference_bytes),
+            "reference_strength": reference_strength,
+            "pose_strength": pose_strength,
+            "selection_enabled": selection_enabled,
+        }
     options = _build_generation_options(
         effective_result.positive,
         effective_result.negative,
@@ -1559,6 +1584,8 @@ async def _generate_images_from_shogou_result(
         pose_strength=pose_strength,
         selection_enabled=selection_enabled,
         selection_generate_count=selection_generate_count,
+        gallery_output_root=gallery_output_root,
+        gallery_metadata=gallery_metadata,
     )
     try:
         generated_images = await asyncio.to_thread(generate_images_with_metadata, options)
@@ -1631,6 +1658,28 @@ async def _generate_images_from_shogou_result(
     if view is not None:
         view.message = sent_message
         await _store_discord_message_safely(rated_image_ids, sent_message)
+    if review_scope_id:
+        try:
+            from services.gallery_review_queue import enqueue_gallery_review
+
+            enqueue_gallery_review(review_scope_id, len(generated_images))
+            logger.info(
+                "Gallery review enqueued after successful generation: target=%s images=%s "
+                "selection_used=%s reference_mode=%s pose=%s",
+                review_scope_id,
+                len(generated_images),
+                selection.used_selection,
+                reference_mode or "none",
+                pose_reference_bytes is not None,
+            )
+        except Exception:
+            # Gallery is an optional consumer.  A queue/control failure must
+            # never turn a successfully delivered Discord result into an
+            # image-generation failure.
+            logger.exception(
+                "Failed to enqueue automatic gallery review: target=%s",
+                review_scope_id,
+            )
     if last_settings is not None:
         try:
             await asyncio.to_thread(
@@ -2119,6 +2168,7 @@ async def _resume_generate_ai_after_character_confirmation(
         pose_strength=pose_strength,
         selection_enabled=selection_enabled,
         selection_generate_count=selection_generate_count,
+        auto_review=True,
     )
 
 
@@ -2580,6 +2630,7 @@ def setup(client: discord.Client) -> None:
             pose_strength=pose_strength,
             selection_enabled=resolved_settings.selection_ai,
             selection_generate_count=resolved_settings.candidate_count,
+            auto_review=True,
         )
 
     @client.tree.command(

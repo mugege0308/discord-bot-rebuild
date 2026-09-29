@@ -63,6 +63,10 @@ from services.pc_control import (
 )
 from services.image_selection import select_generated_images
 from services import lora_job
+from services.gallery_review_queue import (
+    shutdown_gallery_review_queue,
+    start_gallery_review_queue,
+)
 from services.sd_control import (
     SdGenerationOptions,
     generate_images,
@@ -192,6 +196,10 @@ class SecretaryClient(discord.Client):
             await voice.cleanup(self)
         except Exception:
             logger.exception("Failed to clean up Discord voice state during Bot shutdown.")
+        try:
+            await shutdown_gallery_review_queue()
+        except Exception:
+            logger.exception("Failed to stop gallery review queue cleanly.")
         await super().close()
 
     async def setup_hook(self) -> None:
@@ -204,6 +212,12 @@ class SecretaryClient(discord.Client):
                 )
         except Exception:
             logger.exception("LoRA job recovery failed; continuing Bot startup.")
+        try:
+            await start_gallery_review_queue()
+        except Exception:
+            # Gallery review is an optional consumer.  Its startup must never
+            # prevent Discord commands or image generation from coming online.
+            logger.exception("Failed to start gallery review queue; continuing Bot startup.")
         guild_id = os.getenv("DISCORD_GUILD_ID")
         try:
             _log_app_command_names("registered before sync (global)", self.tree.get_commands())
