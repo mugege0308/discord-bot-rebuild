@@ -62,6 +62,12 @@ logger = logging.getLogger("secretary-bot.shogou_prompt_designer")
 INSTRUCTION_FILE = Path("shogou_chan_prompt_designer_instruction.md")
 REQUIRED_KEYS = ("positive", "negative", "summary", "assumptions")
 SHOGOU_RESPONSE_FORMAT = {"type": "json_schema", "json_schema": {"name": "shogou_prompt_result", "schema": {"type": "object"}}}
+PROMPT_RATING_AUTO = "auto"
+PROMPT_RATING_VALUES = ("safe", "sensitive", "nsfw", "explicit")
+PROMPT_RATING_CHOICES = (PROMPT_RATING_AUTO, *PROMPT_RATING_VALUES)
+LEGACY_PROMPT_RATING = "questionable"
+_ALL_PROMPT_RATING_TAGS = (*PROMPT_RATING_VALUES, LEGACY_PROMPT_RATING)
+_PROMPT_RATING_PRIORITY = {rating: index for index, rating in enumerate(PROMPT_RATING_VALUES)}
 
 
 @dataclass(frozen=True)
@@ -120,6 +126,28 @@ _SUMMARY_OMIT_TAGS = frozenset(
         "absurdres",
     }
 )
+
+
+def validate_requested_prompt_rating(requested_rating: str | None, *, is_adult: bool) -> str:
+    rating = (requested_rating or PROMPT_RATING_AUTO).strip().casefold()
+    if rating not in PROMPT_RATING_CHOICES:
+        raise PromptGeneratorError("ratingはAuto / Safe / Sensitive / NSFW / Explicitから選んでください。")
+    if not is_adult and rating not in (PROMPT_RATING_AUTO, "safe"):
+        raise PromptGeneratorError("このratingはAdultモデルでのみ使用できます。")
+    return rating
+
+
+def extract_prompt_rating(positive: str) -> str | None:
+    found: list[str] = []
+    for raw_tag in positive.split(","):
+        tag = raw_tag.strip().casefold()
+        if tag == LEGACY_PROMPT_RATING:
+            tag = "nsfw"
+        if tag in PROMPT_RATING_VALUES:
+            found.append(tag)
+    if not found:
+        return None
+    return max(found, key=_PROMPT_RATING_PRIORITY.__getitem__)
 
 
 def _build_grounded_summary(positive: str) -> str:
