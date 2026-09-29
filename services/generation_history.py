@@ -26,7 +26,7 @@ DB_FILE = DATA_DIR / "generation_history.db"
 # future change can tell which shape an existing file has and migrate it.
 # Bump this whenever the CREATE TABLE statements below change, and add the
 # matching migration step to _apply_schema_version().
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 _HASH_CHUNK_SIZE = 1024 * 1024
 
@@ -123,6 +123,7 @@ class GenerationRequestRecord:
     # None for every other regeneration_type and for normal requests.
     custom_instruction: str | None = None
     model_key: str = DEFAULT_IMAGE_GENERATION_MODEL_KEY
+    composition_preset: str = "none"
 
 
 @dataclass(frozen=True)
@@ -155,6 +156,7 @@ class GenerationRequestDetail:
     regeneration_type: str | None
     custom_instruction: str | None
     model_key: str = DEFAULT_IMAGE_GENERATION_MODEL_KEY
+    composition_preset: str = "none"
 
 
 @dataclass(frozen=True)
@@ -322,7 +324,8 @@ def init_db() -> None:
                 selection_message TEXT,
                 parent_request_id INTEGER,
                 regeneration_type TEXT,
-                custom_instruction TEXT
+                custom_instruction TEXT,
+                composition_preset TEXT
             )
             """
         )
@@ -440,6 +443,10 @@ def _migrate_v4_to_v5(connection: sqlite3.Connection) -> None:
     return
 
 
+def _migrate_v5_to_v6(connection: sqlite3.Connection) -> None:
+    """Adds the selected composition preset without rewriting old rows."""
+    _add_column_if_missing(connection, "generation_requests", "composition_preset", "TEXT")
+
 def _apply_schema_version(connection: sqlite3.Connection) -> None:
     """Stamps/checks PRAGMA user_version so future schema changes have a
     reliable version to migrate from.
@@ -464,6 +471,7 @@ def _apply_schema_version(connection: sqlite3.Connection) -> None:
         _migrate_v2_to_v3(connection)
         _migrate_v3_to_v4(connection)
         _migrate_v4_to_v5(connection)
+        _migrate_v5_to_v6(connection)
         connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         return
     if current > SCHEMA_VERSION:
@@ -479,21 +487,29 @@ def _apply_schema_version(connection: sqlite3.Connection) -> None:
         _migrate_v2_to_v3(connection)
         _migrate_v3_to_v4(connection)
         _migrate_v4_to_v5(connection)
+        _migrate_v5_to_v6(connection)
         connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         return
     if current == 2:
         _migrate_v2_to_v3(connection)
         _migrate_v3_to_v4(connection)
         _migrate_v4_to_v5(connection)
+        _migrate_v5_to_v6(connection)
         connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         return
     if current == 3:
         _migrate_v3_to_v4(connection)
         _migrate_v4_to_v5(connection)
+        _migrate_v5_to_v6(connection)
         connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         return
     if current == 4:
         _migrate_v4_to_v5(connection)
+        _migrate_v5_to_v6(connection)
+        connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        return
+    if current == 5:
+        _migrate_v5_to_v6(connection)
         connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         return
     # Deliberately does not bump an unknown older version: silently
@@ -624,8 +640,8 @@ def save_generation_history_detailed(
                     created_at, user_id, request_text, reference_id, model_key,
                     positive, negative, summary, assumptions_json,
                     workflow_file, workflow_hash, selection_used, selection_message,
-                    parent_request_id, regeneration_type, custom_instruction
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    parent_request_id, regeneration_type, custom_instruction, composition_preset
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     _now_text(),
@@ -644,6 +660,7 @@ def save_generation_history_detailed(
                     resolved_parent_id,
                     resolved_regeneration_type,
                     request.custom_instruction,
+                    request.composition_preset,
                 ),
             )
             request_id = int(cursor.lastrowid)
@@ -1112,6 +1129,7 @@ def get_generation_request(request_id: int) -> GenerationRequestDetail | None:
             regeneration_type=row["regeneration_type"],
             custom_instruction=row["custom_instruction"],
             model_key=model_key,
+            composition_preset=row["composition_preset"] or "none",
         )
     except Exception:
         logger.exception("Failed to read generation request: request_id=%s", request_id)

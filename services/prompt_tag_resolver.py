@@ -17,7 +17,10 @@ from services.prompt_tag_dictionary import (
 
 _COMPOSITION_PRESET_TAGS = {
     "face_closeup": "framing.portrait",
+    "portrait": "framing.portrait",
     "upper_body": "framing.upper_body",
+    "cowboy_shot": "framing.cowboy_shot",
+    "medium_shot": "framing.medium_shot",
     "full_body": "framing.full_body",
     "full_body_tight": "framing.full_body",
 }
@@ -37,6 +40,16 @@ _QUALITY_SUFFIX_TAGS = {
     "very aesthetic",
     "anime style",
 }
+
+
+@dataclass(frozen=True)
+class CompositionTagApplication:
+    """Result of applying an explicit composition preset to a final prompt."""
+
+    positive: str
+    composition_preset: str
+    composition_tag_applied: str | None = None
+    conflict_removed_tags: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -74,6 +87,126 @@ class PromptTagResolution:
 
 def _normalise(value: str) -> str:
     return " ".join(unicodedata.normalize("NFKC", value).casefold().split())
+
+
+def _split_top_level_prompt_tags(value: str) -> tuple[str, ...]:
+    """Split prompt tags without breaking commas nested in prompt syntax."""
+
+    source = str(value or "")
+    tokens: list[str] = []
+    current: list[str] = []
+    depths = {"(": 0, "[": 0, "{": 0}
+    closing = {")": "(", "]": "[", "}": "{"}
+    escaped = False
+    for char in source:
+        if escaped:
+            current.append(char)
+            escaped = False
+            continue
+        if char == "\\":
+            current.append(char)
+            escaped = True
+            continue
+        if char in depths:
+            depths[char] += 1
+            current.append(char)
+            continue
+        if char in closing:
+            opener = closing[char]
+            if depths[opener] > 0:
+                depths[opener] -= 1
+            current.append(char)
+            continue
+        if char == "," and not any(depths.values()):
+            token = "".join(current).strip()
+            if token:
+                tokens.append(token)
+            current.clear()
+            continue
+        current.append(char)
+    token = "".join(current).strip()
+    if token:
+        tokens.append(token)
+    return tuple(tokens)
+
+
+def _composition_entry_for_token(
+    token: str,
+    dictionary: PromptTagDictionary,
+) -> PromptTagEntry | None:
+    entry = dictionary.prompt_token_entry(token)
+    if entry is not None:
+        return entry
+
+    # Treat a weighted known framing tag as the same dictionary entry for
+    # conflict removal, while leaving all unknown weighted tags untouched.
+    stripped = token.strip()
+    if stripped.startswith("(") and stripped.endswith(")") and ":" in stripped:
+        inner, _, weight = stripped[1:-1].rpartition(":")
+        if inner.strip() and weight.strip():
+            return dictionary.prompt_token_entry(inner.strip())
+    return None
+
+
+def apply_composition_preset_to_positive(
+    positive: str,
+    composition_preset: str | None,
+    *,
+    dictionary: PromptTagDictionary | None = None,
+) -> CompositionTagApplication:
+    """Apply the selected composition tag at the final prompt boundary.
+
+    Only verified dictionary entries in the same exclusive group as the
+    selected composition are removed.  Unknown imported/user tags are kept.
+    The selected canonical tag is inserted immediately before trailing quality
+    tags and appears at most once.
+    """
+
+    preset = _normalise(composition_preset or "none").replace(" ", "_")
+    preset_id = _COMPOSITION_PRESET_TAGS.get(preset)
+    if preset_id is None:
+        return CompositionTagApplication(
+            positive=positive,
+            composition_preset=preset or "none",
+        )
+
+    prompt_dictionary = dictionary or load_prompt_tag_dictionary(DEFAULT_PROMPT_TAG_PROFILE)
+    selected_entry = prompt_dictionary.entry_by_id.get(preset_id)
+    if selected_entry is None or selected_entry.status != "verified":
+        return CompositionTagApplication(
+            positive=positive,
+            composition_preset=preset,
+        )
+
+    kept: list[str] = []
+    removed: list[str] = []
+    for token in _split_top_level_prompt_tags(positive):
+        entry = _composition_entry_for_token(token, prompt_dictionary)
+        if entry is not None and entry.id == selected_entry.id:
+            # Reinsert the canonical unweighted tag once below.
+            continue
+        if (
+            entry is not None
+            and selected_entry.exclusive_group
+            and entry.exclusive_group == selected_entry.exclusive_group
+        ):
+            removed.append(token)
+            continue
+        kept.append(token)
+
+    quality_start = len(kept)
+    while (
+        quality_start > 0
+        and _normalise(kept[quality_start - 1]) in _QUALITY_SUFFIX_TAGS
+    ):
+        quality_start -= 1
+    kept.insert(quality_start, selected_entry.prompt_tag)
+    return CompositionTagApplication(
+        positive=", ".join(kept),
+        composition_preset=preset,
+        composition_tag_applied=selected_entry.prompt_tag,
+        conflict_removed_tags=tuple(removed),
+    )
 
 
 def _alias_match(text: str, alias: str) -> int | None:
