@@ -138,12 +138,12 @@ class SchemaTestCase(_DbBackedTestCase):
             names = {row["name"] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         self.assertIn("image_generation_feedback", names)
 
-    def test_schema_version_is_5(self):
+    def test_schema_version_is_current_and_composition_migration_is_defined(self):
         init_db()
         with self._connect() as connection:
             version = connection.execute("PRAGMA user_version").fetchone()[0]
         self.assertEqual(version, SCHEMA_VERSION)
-        self.assertEqual(SCHEMA_VERSION, 5)
+        self.assertEqual(SCHEMA_VERSION, 6)
 
     def test_old_db_file_gains_the_feedback_table_on_next_init(self):
         # Simulates a DB file written before this feature existed: every
@@ -187,8 +187,10 @@ class SchemaTestCase(_DbBackedTestCase):
 
         with self._connect() as connection:
             names = {row["name"] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            columns = {row["name"] for row in connection.execute("PRAGMA table_info(generation_requests)")}
             version = connection.execute("PRAGMA user_version").fetchone()[0]
         self.assertIn("image_generation_feedback", names)
+        self.assertIn("composition_preset", columns)
         self.assertEqual(version, SCHEMA_VERSION)
 
 

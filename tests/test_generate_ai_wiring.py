@@ -51,18 +51,32 @@ class GenerateAiWiringTestCase(unittest.TestCase):
 
         command = next(command for command in main.client.tree.get_commands() if command.name == "generate_ai")
         options = command.to_dict(main.client.tree).get("options", [])
+        option_names = {option["name"] for option in options}
 
-        self.assertEqual(25, len(options))
-        self.assertNotIn("use_last_reference", {option["name"] for option in options})
+        self.assertLessEqual(len(options), 25)
+        self.assertNotIn("use_last_reference", option_names)
+        self.assertNotIn("input_mode", option_names)
+        self.assertNotIn("selection_ai", option_names)
+        self.assertNotIn("candidate_count", option_names)
+        self.assertNotIn("size", option_names)
+        self.assertNotIn("composition_preset", option_names)
+        self.assertNotIn("rating", option_names)
 
-        input_mode = next(option for option in options if option["name"] == "input_mode")
+        model = next(option for option in options if option["name"] == "model")
         self.assertEqual(
-            [(choice["name"], choice["value"]) for choice in input_mode["choices"]],
+            [(choice["name"], choice["value"]) for choice in model["choices"]],
             [
-                ("日本語・AI変換", "ja_ai"),
-                ("英語・直接入力", "en_direct"),
-                ("外部Promptを整えて使う", "prompt_import"),
+                ("Animagine XL 4.0 Clear", "animagine"),
+                ("Animagine XL 4.0 Clear Adult", "animagine_adult"),
+                ("JANKU v7.77", "janku"),
+                ("JANKU v7.77 Adult", "janku_adult"),
             ],
+        )
+
+        reference_mode = next(option for option in options if option["name"] == "reference_mode")
+        self.assertEqual(
+            [(choice["name"], choice["value"]) for choice in reference_mode["choices"]],
+            [("参照なし", "none"), ("構図参照", "composition"), ("ポーズ参照", "pose")],
         )
 
     def test_generate_ai_forwards_reference_image_data_and_strength(self):
@@ -74,12 +88,14 @@ class GenerateAiWiringTestCase(unittest.TestCase):
         self.assertIn("reference_image_content_type", keyword_names)
         self.assertIn("reference_strength", keyword_names)
 
-    def test_generate_ai_model_choices_are_exactly_animagine_and_janku(self):
+    def test_generate_ai_model_choices_include_normal_and_adult_profiles(self):
         self.assertEqual(
             [(choice.name, choice.value) for choice in GENERATE_AI_MODEL_CHOICES],
             [
                 ("Animagine XL 4.0 Clear", "animagine"),
+                ("Animagine XL 4.0 Clear Adult", "animagine_adult"),
                 ("JANKU v7.77", "janku"),
+                ("JANKU v7.77 Adult", "janku_adult"),
             ],
         )
 

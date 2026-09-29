@@ -1110,13 +1110,20 @@ class KnownCharacterContextWiringTestCase(unittest.TestCase):
         self.assertIn("character tag: ichikawa hinana", sent_system_prompt)
         self.assertNotIn("confirmed appearance tags", sent_system_prompt)
 
-    def test_known_character_context_is_identical_across_all_three_model_profiles(self):
-        # Animagine / JANKU / JANKU Adult load different instruction .md
-        # files (services.shogou_prompt_designer.load_shogou_instruction),
-        # but _append_known_character_context is called the same way
-        # regardless of model_key - the Known character block (including the
-        # new signature_tags line) must be byte-identical across all three.
-        captured_prompts: dict[str, str] = {}
+    def test_known_character_context_and_confirmed_tags_reach_all_model_profiles(self):
+        # Profiles may append different deterministic dictionary instructions,
+        # so compare the character facts and final Positive rather than the
+        # entire system prompt suffix.
+        confirmed_tags = ("white hair", "very long hair", "pink eyes", "sharp eyes", "asymmetrical bangs")
+        response = json.dumps(
+            {
+                "positive": "1girl, kei (blue archive), blue archive, smile, masterpiece",
+                "negative": "lowres, bad anatomy",
+                "summary": "ケイが笑っている画像",
+                "assumptions": [],
+            },
+            ensure_ascii=False,
+        )
         for model_key in ("animagine", "janku", "janku_adult"):
             with mock.patch(
                 "services.shogou_prompt_designer.load_shogou_instruction",
@@ -1129,25 +1136,23 @@ class KnownCharacterContextWiringTestCase(unittest.TestCase):
                 return_value="",
             ), mock.patch(
                 "services.shogou_prompt_designer._post_chat_completion",
-                return_value=VALID_JSON,
+                return_value=response,
             ) as post_mock:
-                generate_shogou_prompt_result(
+                result = generate_shogou_prompt_result(
                     "ブルアカのケイ、笑顔", user_id=1, reference_id=None, model_key=model_key
                 )
 
             load_mock.assert_called_once_with(model_key)
             sent_system_prompt = post_mock.call_args.args[0]
-            # Confirms the per-model instruction body really did differ...
             self.assertIn(f"INSTRUCTION_BODY_{model_key}", sent_system_prompt)
-            # ...while the appended Known character block is captured
-            # separately below for a strict equality check across models.
-            known_character_block = sent_system_prompt.split("Known character:", 1)[1]
-            captured_prompts[model_key] = "Known character:" + known_character_block
-
-        self.assertEqual(captured_prompts["animagine"], captured_prompts["janku"])
-        self.assertEqual(captured_prompts["janku"], captured_prompts["janku_adult"])
-        self.assertIn("character tag: kei (blue archive)", captured_prompts["animagine"])
-        self.assertIn("confirmed appearance tags for kei (blue archive)", captured_prompts["animagine"])
+            self.assertIn("character tag: kei (blue archive)", sent_system_prompt)
+            self.assertIn("series tag: blue archive", sent_system_prompt)
+            self.assertIn(
+                "confirmed appearance tags for kei (blue archive): " + ", ".join(confirmed_tags),
+                sent_system_prompt,
+            )
+            for tag in confirmed_tags:
+                self.assertIn(tag, result.positive)
 
     def test_plain_generation_omits_known_character_context_when_nothing_resolves(self):
         with mock.patch(
