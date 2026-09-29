@@ -3,13 +3,15 @@ from __future__ import annotations
 import unittest
 from unittest.mock import patch
 
+from discord import app_commands
+
+from commands import prompt as prompt_commands
 from services.direct_prompt_parser import (
     ENGLISH_DIRECT_INPUT_MODE,
     JAPANESE_AI_INPUT_MODE,
     PROMPT_IMPORT_INPUT_MODE,
     parse_direct_prompt,
 )
-from services.generation_service import build_generation_metadata_payload, build_one_image_generation_options
 from services.prompt_import import QUALITY_SUFFIX, resolve_prompt_import, tokenize_prompt
 
 
@@ -125,25 +127,23 @@ class PromptImportTestCase(unittest.TestCase):
         self.assertEqual(direct.positive, "1girl")
         self.assertEqual(direct.negative, "lowres")
 
-    def test_generation_metadata_keeps_prompt_import_input_mode(self):
-        payload = build_generation_metadata_payload(
-            positive_prompt="1girl, safe",
-            negative_prompt=STANDARD_NEGATIVE,
-            model_key="animagine",
-            model_family="sdxl",
-            loras=(),
-            extras={"input_mode": PROMPT_IMPORT_INPUT_MODE},
+    def test_current_settings_keep_prompt_import_input_mode(self):
+        settings = prompt_commands._resolve_generate_ai_settings(
+            123456789,
+            input_mode=app_commands.Choice(
+                name="外部Promptを整えて使う",
+                value=PROMPT_IMPORT_INPUT_MODE,
+            ),
+            inherit_previous=False,
         )
-        self.assertEqual(payload["input_mode"], PROMPT_IMPORT_INPUT_MODE)
+        self.assertEqual(settings.input_mode, PROMPT_IMPORT_INPUT_MODE)
+        self.assertEqual(settings.sources["input_mode"], "explicit")
 
     def test_final_generation_options_keep_prompt_without_lora_changes(self):
         result = self.resolve("1girl, upper body")
-        options = build_one_image_generation_options(
-            positive_prompt=result.positive,
-            negative_prompt=result.negative,
-            model_key="animagine",
-            model_family="sdxl",
-            loras=(),
+        options = prompt_commands._build_generation_options(
+            result.positive,
+            result.negative,
             preserve_prompt_text=True,
         )
         self.assertEqual(options.prompt, result.positive)
@@ -152,23 +152,19 @@ class PromptImportTestCase(unittest.TestCase):
         result = self.resolve("1girl, upper body")
         reference = b"reference"
         pose = b"pose"
-        options = build_one_image_generation_options(
-            positive_prompt=result.positive,
-            negative_prompt=result.negative,
-            model_key="animagine",
-            model_family="sdxl",
+        options = prompt_commands._build_generation_options(
+            result.positive,
+            result.negative,
+            preserve_prompt_text=True,
             reference_image_bytes=reference,
             reference_mode="composition",
             pose_reference_bytes=pose,
             pose_strength=0.8,
-            pose_end_percent=0.9,
-            loras=(),
-            preserve_prompt_text=True,
         )
         self.assertIs(options.reference_image_bytes, reference)
         self.assertIs(options.pose_reference_bytes, pose)
         self.assertEqual(options.pose_strength, 0.8)
-        self.assertEqual(options.pose_end_percent, 0.9)
+        self.assertEqual(options.reference_mode, "composition")
 
 
 if __name__ == "__main__":
