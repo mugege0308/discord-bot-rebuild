@@ -18,6 +18,7 @@ from commands import claude_remote
 from commands import dev_task
 from commands import image_analyze
 from commands import image_feedback
+from commands import lora
 from commands import memory
 from commands import prompt
 from commands import voice
@@ -61,6 +62,7 @@ from services.pc_control import (
     seconds_until_time,
 )
 from services.image_selection import select_generated_images
+from services import lora_job
 from services.sd_control import (
     SdGenerationOptions,
     generate_images,
@@ -179,6 +181,10 @@ class SecretaryClient(discord.Client):
 
     async def close(self) -> None:
         try:
+            await lora_job.job_manager.shutdown()
+        except Exception:
+            logger.exception("Failed to clean up LoRA job monitoring during Bot shutdown.")
+        try:
             await claude_remote_manager.cleanup()
         except Exception:
             logger.exception("Failed to clean up Claude Remote Control during Bot shutdown.")
@@ -189,6 +195,15 @@ class SecretaryClient(discord.Client):
         await super().close()
 
     async def setup_hook(self) -> None:
+        try:
+            recovered_lora_jobs = await lora_job.job_manager.recover()
+            if recovered_lora_jobs:
+                logger.warning(
+                    "LoRA job recovery updated %s persisted job(s) during startup.",
+                    len(recovered_lora_jobs),
+                )
+        except Exception:
+            logger.exception("LoRA job recovery failed; continuing Bot startup.")
         guild_id = os.getenv("DISCORD_GUILD_ID")
         try:
             _log_app_command_names("registered before sync (global)", self.tree.get_commands())
@@ -225,6 +240,7 @@ dev_task.setup(client)
 character_generate.setup(client)
 image_analyze.setup(client)
 image_feedback.setup(client)
+lora.setup(client)
 memory.setup(client)
 prompt.setup(client)
 voice.setup(client)
