@@ -37,7 +37,10 @@ from services.danbooru_character_resolver import (
     resolve_danbooru_character_tags,
     should_search_character_tags,
 )
-from services.character_appearance_filter import filter_unrequested_character_appearance
+from services.character_appearance_filter import (
+    enforce_confirmed_character_appearance,
+    filter_unrequested_character_appearance,
+)
 from services.prompt_positive_cleanup import (
     cleanup_positive_prompt,
     enforce_atomic_prompt_tags,
@@ -467,6 +470,24 @@ def generate_shogou_prompt_result(
         if character_resolution is not None
         else ()
     )
+    confirmed_appearance_tags = tuple(
+        dict.fromkeys(
+            tag
+            for resolution in manual_characters
+            for tag in resolution.signature_tags
+            if str(tag or "").strip()
+        )
+    )
+    confirmed_character_identity_tags = tuple(
+        dict.fromkeys(
+            tag
+            for resolution in manual_characters
+            for tag in (resolution.character_tag, resolution.series_tag)
+            if str(tag or "").strip()
+        )
+    )
+    authoritative_character_tags = character_prompt_tags + confirmed_appearance_tags
+    authoritative_prompt_tags = verified_prompt_tags + authoritative_character_tags
     authoritative_tag_sources: dict[str, str] = {
         tag: "core_resolver"
         for tag in (tuple(prompt_resolution.resolved_prompt_tags) if prompt_resolution else ())
@@ -480,11 +501,19 @@ def generate_shogou_prompt_result(
     authoritative_tag_sources.update(
         {tag: "confirmed_character" for tag in character_prompt_tags}
     )
+    authoritative_tag_sources.update(
+        {tag: "confirmed_character_appearance" for tag in confirmed_appearance_tags}
+    )
+    initial_cleanup = cleanup_positive_prompt(
+        result.positive,
+        canonical_prompt_tags=authoritative_prompt_tags,
+        user_input=text,
+    )
     semantic_grounding = (
         ground_prompt_semantics(
-            result.positive,
+            initial_cleanup.positive,
             user_input=text,
-            authoritative_prompt_tags=verified_prompt_tags + character_prompt_tags,
+            authoritative_prompt_tags=authoritative_prompt_tags,
             authoritative_tag_sources=authoritative_tag_sources,
             assumptions=result.assumptions,
             defer_character_appearance=(
@@ -505,7 +534,7 @@ def generate_shogou_prompt_result(
         semantic_positive,
         user_input=text,
         character_resolution=character_resolution,
-        verified_prompt_tags=verified_prompt_tags,
+        verified_prompt_tags=authoritative_prompt_tags,
     )
     final_positive = appearance.positive
     if prompt_resolution is not None:
@@ -514,12 +543,20 @@ def generate_shogou_prompt_result(
         final_positive = apply_danbooru_tag_resolution(final_positive, generic_resolution)
     if character_resolution is not None:
         final_positive = apply_danbooru_character_resolution(final_positive, character_resolution)
+    confirmed_appearance = enforce_confirmed_character_appearance(
+        final_positive,
+        confirmed_appearance_tags,
+        user_input=text,
+        explicit_prompt_tags=verified_prompt_tags,
+        identity_tags=confirmed_character_identity_tags,
+    )
+    final_positive = confirmed_appearance.positive
     final_positive = enforce_atomic_prompt_tags(final_positive, character_prompt_tags)
     final_semantic_grounding = (
         ground_prompt_semantics(
             final_positive,
             user_input=text,
-            authoritative_prompt_tags=verified_prompt_tags + character_prompt_tags,
+            authoritative_prompt_tags=authoritative_prompt_tags,
             authoritative_tag_sources=authoritative_tag_sources,
             assumptions=(
                 semantic_grounding.assumptions
@@ -537,10 +574,18 @@ def generate_shogou_prompt_result(
     )
     if final_semantic_grounding is not None:
         final_positive = final_semantic_grounding.positive
+    final_confirmed_appearance = enforce_confirmed_character_appearance(
+        final_positive,
+        confirmed_appearance_tags,
+        user_input=text,
+        explicit_prompt_tags=verified_prompt_tags,
+        identity_tags=confirmed_character_identity_tags,
+    )
+    final_positive = final_confirmed_appearance.positive
     final_positive = enforce_atomic_prompt_tags(final_positive, character_prompt_tags)
     cleanup = cleanup_positive_prompt(
         final_positive,
-        canonical_prompt_tags=verified_prompt_tags + character_prompt_tags,
+        canonical_prompt_tags=authoritative_prompt_tags,
         user_input=text,
     )
     result = replace(
@@ -561,8 +606,16 @@ def generate_shogou_prompt_result(
         danbooru_character_resolved_tag_ids=tuple(str(tag_id) for tag_id in character_resolution.selected_tag_ids) if character_resolution else (),
         danbooru_character_resolved_tags=character_resolution.selected_prompt_tags if character_resolution else (),
         danbooru_character_resolution=character_resolution,
-        character_appearance_suppressed_tags=appearance.removed_tags,
-        positive_cleanup_removed_tags=cleanup.removed_tags,
+        character_appearance_suppressed_tags=tuple(
+            dict.fromkeys(
+                appearance.removed_tags
+                + confirmed_appearance.removed_tags
+                + final_confirmed_appearance.removed_tags
+            )
+        ),
+        positive_cleanup_removed_tags=tuple(
+            dict.fromkeys(initial_cleanup.removed_tags + cleanup.removed_tags)
+        ),
     )
     semantic_passes = tuple(
         grounding
@@ -622,6 +675,7 @@ def generate_shogou_prompt_result(
     summary_was_rebuilt = bool(
         semantic_removed_tags
         or semantic_removed_assumptions
+        or initial_cleanup.removed_tags
         or cleanup.removed_tags
     )
     final_summary = (
@@ -677,8 +731,8 @@ def generate_shogou_prompt_result(
             trace_id,
             "06_rating",
             positive=result.positive,
-            appearance_removed_tags=appearance.removed_tags,
-            cleanup_removed_tags=cleanup.removed_tags,
+            appearance_removed_tags=result.character_appearance_suppressed_tags,
+            cleanup_removed_tags=result.positive_cleanup_removed_tags,
             raw_llm_positive=result.raw_llm_positive,
             raw_summary=result.raw_summary,
             final_summary=result.final_summary,

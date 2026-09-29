@@ -351,3 +351,114 @@ def filter_unrequested_character_appearance(
         removed_tags=tuple(removed),
         removed_reasons=tuple(reasons),
     )
+
+
+def enforce_confirmed_character_appearance(
+    positive: str,
+    confirmed_tags: Iterable[str],
+    *,
+    user_input: str = "",
+    explicit_prompt_tags: Iterable[str] = (),
+    identity_tags: Iterable[str] = (),
+) -> CharacterAppearanceFilterResult:
+    """Keep curated appearance tags authoritative through final cleanup.
+
+    Confirmed character appearance is stronger than an unsupported LLM tag,
+    but an explicitly requested appearance remains the user's choice.  When
+    no explicit appearance category is present, another appearance tag in
+    the same category is removed before the confirmed tag is inserted.  This
+    prevents a character's curated hair/eye features from being silently
+    dropped or contradicted by the model response.
+    """
+
+    confirmed: list[str] = []
+    confirmed_by_key: dict[str, str] = {}
+    for raw_tag in confirmed_tags:
+        tag = str(raw_tag or "").strip()
+        key = _tag_key(tag)
+        if not tag or key in confirmed_by_key:
+            continue
+        confirmed.append(tag)
+        confirmed_by_key[key] = tag
+    if not confirmed:
+        return CharacterAppearanceFilterResult(str(positive or "").strip())
+
+    explicit_keys = {
+        _tag_key(tag)
+        for tag in explicit_prompt_tags
+        if str(tag or "").strip()
+    }
+    explicit_scopes = _japanese_appearance_scopes(user_input)
+    explicit_categories = {
+        category
+        for tag in explicit_prompt_tags
+        for category in _appearance_categories(str(tag))
+        if str(tag or "").strip()
+    }
+    confirmed_categories = {
+        category
+        for tag in confirmed
+        for category in _appearance_categories(tag)
+    }
+
+    kept: list[str] = []
+    removed: list[str] = []
+    reasons: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for raw_token in str(positive or "").split(","):
+        token = raw_token.strip()
+        if not token:
+            continue
+        key = _tag_key(token)
+        if key in seen:
+            removed.append(token)
+            reasons.append((token, "duplicate_normalized_tag"))
+            continue
+        categories = _appearance_categories(token)
+        if categories and categories.intersection(explicit_categories or explicit_scopes):
+            if key in explicit_keys:
+                kept.append(token)
+                seen.add(key)
+                continue
+            if key in confirmed_by_key:
+                removed.append(token)
+                reasons.append((token, "confirmed_appearance_overridden_by_explicit_request"))
+                continue
+            # Explicit user appearance takes precedence over another model
+            # completion in the same category.
+            kept.append(token)
+            seen.add(key)
+            continue
+        if key in confirmed_by_key:
+            kept.append(token)
+            seen.add(key)
+            continue
+        if categories and categories.intersection(confirmed_categories):
+            removed.append(token)
+            reasons.append((token, "conflicts_with_confirmed_appearance"))
+            continue
+        kept.append(token)
+        seen.add(key)
+
+    eligible_confirmed = [
+        tag
+        for tag in confirmed
+        if not _appearance_categories(tag).intersection(explicit_categories or explicit_scopes)
+    ]
+    missing = [tag for tag in eligible_confirmed if _tag_key(tag) not in seen]
+    if missing:
+        identity_keys = {
+            _tag_key(tag)
+            for tag in identity_tags
+            if str(tag or "").strip()
+        }
+        insert_at = 1 if kept and re.fullmatch(r"\d+(?:girl|girls|boy|boys|other)", kept[0].casefold()) else 0
+        while insert_at < len(kept) and _tag_key(kept[insert_at]) in identity_keys:
+            insert_at += 1
+        kept[insert_at:insert_at] = missing
+
+    return CharacterAppearanceFilterResult(
+        positive=", ".join(kept),
+        removed_tags=tuple(removed),
+        removed_reasons=tuple(reasons),
+    )
