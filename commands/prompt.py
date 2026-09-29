@@ -1,7 +1,9 @@
 import asyncio
-from dataclasses import replace
+from dataclasses import dataclass, replace
+import inspect
 import logging
 from pathlib import Path
+from typing import Any, Awaitable, Callable
 
 import discord
 from discord import app_commands
@@ -39,7 +41,19 @@ from services.image_selection import (
     select_generated_images,
 )
 from services.image_analyzer import MAX_IMAGE_BYTES, detect_image_content_type, validate_image_bytes
-from services.image_composition import DEFAULT_COMPOSITION_PRESET, DEFAULT_SIZE_KEY
+from services.generate_ai_last_settings import (
+    GenerateAiLastSettingsError,
+    get_last_model_key,
+    get_last_settings,
+)
+from services.image_composition import (
+    COMPOSITION_LABELS,
+    DEFAULT_COMPOSITION_PRESET,
+    DEFAULT_SIZE_KEY,
+    IMAGE_SIZE_SPECS,
+    get_image_size_spec,
+    validate_composition_preset,
+)
 from services.image_generation_profiles import (
     DEFAULT_IMAGE_GENERATION_MODEL_KEY,
     get_image_generation_profile,
@@ -94,6 +108,19 @@ GENERATE_AI_INPUT_MODE_CHOICES = [
     app_commands.Choice(name=INPUT_MODE_LABELS[JAPANESE_AI_INPUT_MODE], value=JAPANESE_AI_INPUT_MODE),
     app_commands.Choice(name=INPUT_MODE_LABELS[ENGLISH_DIRECT_INPUT_MODE], value=ENGLISH_DIRECT_INPUT_MODE),
     app_commands.Choice(name=INPUT_MODE_LABELS[PROMPT_IMPORT_INPUT_MODE], value=PROMPT_IMPORT_INPUT_MODE),
+]
+GENERATE_AI_SIZE_CHOICES = [
+    app_commands.Choice(name=spec.label, value=spec.key)
+    for spec in IMAGE_SIZE_SPECS.values()
+]
+GENERATE_AI_COMPOSITION_CHOICES = [
+    app_commands.Choice(name=label, value=key)
+    for key, label in COMPOSITION_LABELS.items()
+]
+# Reference/Pose is restored in a later commit.  Keeping only the safe
+# disabled value here prevents the panel from exposing an unimplemented path.
+GENERATE_AI_REFERENCE_MODE_CHOICES = [
+    app_commands.Choice(name="参照なし", value=REFERENCE_MODE_NONE),
 ]
 
 
@@ -165,6 +192,261 @@ _active_regenerations: set[int] = set()
 # In-process only: the most recently supplied /generate_ai reference image,
 # isolated by Discord user ID. It intentionally resets when the bot restarts.
 _last_reference_images: dict[int, tuple[bytes, str]] = {}
+
+
+@dataclass(frozen=True)
+class PanelLoraSetting:
+    """Raw LoRA slot state retained for the panel, without catalog lookup."""
+
+    key: str
+    lora_type: str
+    strength: float
+
+
+@dataclass(frozen=True)
+class ResolvedGenerateAiSettings:
+    """Shared, validated settings consumed by the image-generation panel.
+
+    This is deliberately a settings bridge only.  LoRA catalog resolution,
+    reference processing, selection, history, and generation remain in their
+    existing command/service layers and are restored in later commits.
+    """
+
+    model_key: str
+    style_key: str | None
+    lora_strength: float | None
+    rating: str
+    seed: int | None
+    reference_strength: float | None
+    selection_ai: bool
+    candidate_count: int
+    size_key: str
+    composition_preset: str
+    sources: dict[str, str]
+    loras: tuple[PanelLoraSetting, ...] = ()
+    reference_mode: str = REFERENCE_MODE_NONE
+    use_last_reference: bool = False
+    input_mode: str = JAPANESE_AI_INPUT_MODE
+
+
+_generate_ai_panel_callback: Callable[..., Awaitable[None]] | None = None
+
+
+def _panel_choice_value(
+    choices: list[app_commands.Choice[str]],
+    value: str | None,
+    field_name: str,
+) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name}の指定がありません。")
+    normalized = value.strip().casefold()
+    for choice in choices:
+        if choice.value == normalized:
+            return choice.value
+    raise ValueError(f"{field_name}の選択肢が現在の設定に見つかりません。")
+
+
+def _panel_lora_slots(value: tuple[dict[str, Any], ...]) -> tuple[PanelLoraSetting, ...]:
+    """Copy persisted slot values without resolving catalog metadata."""
+
+    slots: list[PanelLoraSetting] = []
+    for item in value:
+        key = item.get("key")
+        lora_type = item.get("lora_type")
+        strength = item.get("strength")
+        if not isinstance(key, str) or not isinstance(lora_type, str):
+            continue
+        if isinstance(strength, bool) or not isinstance(strength, (int, float)):
+            continue
+        slots.append(PanelLoraSetting(key=key, lora_type=lora_type, strength=float(strength)))
+    return tuple(slots)
+
+
+def _default_generate_ai_panel_settings(*, model_key: str | None = None) -> ResolvedGenerateAiSettings:
+    resolved_model = model_key or DEFAULT_IMAGE_GENERATION_MODEL_KEY
+    get_image_generation_profile(resolved_model)
+    return ResolvedGenerateAiSettings(
+        model_key=resolved_model,
+        style_key=None,
+        lora_strength=None,
+        rating=PROMPT_RATING_AUTO,
+        seed=None,
+        reference_strength=None,
+        selection_ai=GENERATE_AI_DEFAULT_SELECTION_AI,
+        candidate_count=get_selection_generate_count(),
+        size_key=DEFAULT_SIZE_KEY,
+        composition_preset=DEFAULT_COMPOSITION_PRESET,
+        sources={
+            "model": "default",
+            "input_mode": "default",
+            "rating": "default",
+            "seed": "default",
+            "selection_ai": "default",
+            "candidate_count": "default",
+            "size": "default",
+            "composition_preset": "default",
+        },
+    )
+
+
+def get_generate_ai_panel_defaults(
+    user_id: int,
+    *,
+    inherit: bool = True,
+) -> ResolvedGenerateAiSettings:
+    """Return validated panel defaults using the existing last-settings store."""
+
+    if not inherit:
+        return _default_generate_ai_panel_settings()
+
+    try:
+        last_model_key = get_last_model_key(user_id)
+        model_key = last_model_key or DEFAULT_IMAGE_GENERATION_MODEL_KEY
+        get_image_generation_profile(model_key)
+        previous = get_last_settings(user_id, model_key) if last_model_key else None
+        if previous is None:
+            settings = _default_generate_ai_panel_settings(model_key=model_key)
+            return replace(
+                settings,
+                sources={**settings.sources, "model": "inherited" if last_model_key else "default"},
+            )
+
+        input_mode = _panel_choice_value(
+            GENERATE_AI_INPUT_MODE_CHOICES,
+            previous.input_mode,
+            "入力方式",
+        )
+        rating = _panel_choice_value(
+            GENERATE_AI_PROMPT_RATING_CHOICES,
+            previous.rating,
+            "Rating",
+        )
+        size_key = get_image_size_spec(previous.size_key).key
+        composition_preset = validate_composition_preset(previous.composition_preset)
+        return ResolvedGenerateAiSettings(
+            model_key=model_key,
+            style_key=previous.style_key,
+            lora_strength=previous.lora_strength,
+            rating=rating,
+            seed=None,
+            reference_strength=None,
+            selection_ai=previous.selection_ai,
+            candidate_count=previous.candidate_count,
+            size_key=size_key,
+            composition_preset=composition_preset,
+            sources={
+                "model": "inherited",
+                "input_mode": "inherited",
+                "rating": "inherited",
+                "seed": "default",
+                "selection_ai": "inherited",
+                "candidate_count": "inherited",
+                "size": "inherited",
+                "composition_preset": "inherited",
+            },
+            loras=_panel_lora_slots(previous.loras),
+            reference_mode=REFERENCE_MODE_NONE,
+            input_mode=input_mode,
+        )
+    except (GenerateAiLastSettingsError, PromptGeneratorError, ValueError):
+        logger.exception("Falling back to safe /generate_ai panel defaults for user %s", user_id)
+        return _default_generate_ai_panel_settings()
+
+
+async def run_generate_ai_from_panel(
+    interaction: discord.Interaction,
+    *,
+    request: str,
+    character: str | None = None,
+    model_key: str = DEFAULT_IMAGE_GENERATION_MODEL_KEY,
+    input_mode: str = JAPANESE_AI_INPUT_MODE,
+    rating: str = PROMPT_RATING_AUTO,
+    style_key: str | None = None,
+    style_strength: float | None = None,
+    character_lora_key: str | None = None,
+    character_lora_strength: float | None = None,
+    additional_lora_key: str | None = None,
+    additional_lora_strength: float | None = None,
+    seed: int | None = None,
+    reference_mode: str = REFERENCE_MODE_NONE,
+    use_last_reference: bool = False,
+    reference_strength: float | None = None,
+    selection_ai: bool = GENERATE_AI_DEFAULT_SELECTION_AI,
+    candidate_count: int = 5,
+    size_key: str = DEFAULT_SIZE_KEY,
+    composition_preset: str = DEFAULT_COMPOSITION_PRESET,
+) -> None:
+    """Forward panel state to the existing /generate_ai callback once."""
+
+    callback = _generate_ai_panel_callback
+    if callback is None:
+        raise RuntimeError("/generate_ai の登録が完了していません。Botを再起動してください。")
+    if not isinstance(selection_ai, bool):
+        raise ValueError("Selection AIの指定が不正です。")
+    if isinstance(candidate_count, bool) or not isinstance(candidate_count, int) or not 1 <= candidate_count <= 20:
+        raise ValueError("候補枚数は1～20で指定してください。")
+    if seed is not None and (
+        isinstance(seed, bool) or not isinstance(seed, int) or not 0 <= seed <= 4_294_967_295
+    ):
+        raise ValueError("Seedは0～4294967295で指定してください。")
+
+    resolved_model = _panel_choice_value(GENERATE_AI_MODEL_CHOICES, model_key, "Model")
+    resolved_input_mode = _panel_choice_value(GENERATE_AI_INPUT_MODE_CHOICES, input_mode, "入力方式")
+    resolved_rating = _panel_choice_value(GENERATE_AI_PROMPT_RATING_CHOICES, rating, "Rating")
+    resolved_size = _panel_choice_value(GENERATE_AI_SIZE_CHOICES, size_key, "サイズ")
+    resolved_composition = _panel_choice_value(
+        GENERATE_AI_COMPOSITION_CHOICES,
+        composition_preset,
+        "構図",
+    )
+    if reference_mode != REFERENCE_MODE_NONE or use_last_reference:
+        raise ValueError("Reference / PoseはまだPanel生成から利用できません。")
+
+    # Keep the full bridge payload available to future callback versions.  The
+    # current command may accept only a subset; filtering by its signature
+    # lets this commit restore the bridge without changing its slash schema.
+    payload: dict[str, object] = {
+        "character": character.strip() or None if isinstance(character, str) else character,
+        "model": app_commands.Choice(name=resolved_model, value=resolved_model),
+        "input_mode": app_commands.Choice(name=resolved_input_mode, value=resolved_input_mode),
+        "rating": app_commands.Choice(name=resolved_rating, value=resolved_rating),
+        "reference_id": None,
+        "reference_image": None,
+        "reference_strength": None,
+        "reference_mode": app_commands.Choice(name=REFERENCE_MODE_NONE, value=REFERENCE_MODE_NONE),
+        "use_last_reference": False,
+        "seed": seed,
+        "selection_ai": selection_ai,
+        "candidate_count": candidate_count,
+        "size": app_commands.Choice(name=resolved_size, value=resolved_size),
+        "composition_preset": app_commands.Choice(name=resolved_composition, value=resolved_composition),
+    }
+    callback_target = getattr(callback, "callback", callback)
+    signature = inspect.signature(callback_target)
+    accepts_kwargs = any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in signature.parameters.values()
+    )
+    if accepts_kwargs:
+        forwarded = payload
+    else:
+        forwarded = {
+            key: value
+            for key, value in payload.items()
+            if key in signature.parameters
+        }
+    logger.info(
+        "Generate AI panel forwarding to existing callback: model=%s input_mode=%s rating=%s "
+        "size=%s composition=%s selection_ai=%s candidate_count=%s",
+        resolved_model,
+        resolved_input_mode,
+        resolved_rating,
+        resolved_size,
+        resolved_composition,
+        selection_ai,
+        candidate_count,
+    )
+    await callback_target(interaction, request, **forwarded)
 
 
 async def _disable_view_message_safely(
@@ -1412,6 +1694,8 @@ async def _build_prompt_result(interaction: discord.Interaction, text: str, *, l
 
 
 def setup(client: discord.Client) -> None:
+    global _generate_ai_panel_callback
+
     @client.tree.command(name="prompt", description="日本語入力からStable Diffusion用プロンプトを作ります。")
     @app_commands.describe(text="作りたい画像の内容。日本語で入力できます。", reference_id="全タグを使う画像参考メモID")
     async def slash_prompt(interaction: discord.Interaction, text: str, reference_id: int | None = None) -> None:
@@ -1704,6 +1988,10 @@ def setup(client: discord.Client) -> None:
             reference_image_content_type=reference_image_content_type,
             reference_strength=resolved_reference_strength,
         )
+
+    # Panel generation reuses this existing callback.  No second generation
+    # path or additional slash command is registered here.
+    _generate_ai_panel_callback = slash_generate_ai
 
     @client.tree.command(
         name="generate_ai_stats",
