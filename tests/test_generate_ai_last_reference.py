@@ -1,6 +1,8 @@
 import unittest
 from unittest import mock
 
+from discord import app_commands
+
 import commands.prompt as prompt_module
 from services.shogou_prompt_designer import ShogouPromptResult
 
@@ -29,7 +31,9 @@ class GenerateAiLastReferenceTestCase(unittest.IsolatedAsyncioTestCase):
         prompt_module._last_reference_images.clear()
         client = FakeClient()
         prompt_module.setup(client)
-        self.command = client.tree.commands["generate_ai"]
+        # use_last_reference is intentionally not a public Slash option. Test
+        # the internal callback used by the Panel instead of the public wrapper.
+        self.command = prompt_module._generate_ai_panel_callback
 
     def _interaction(self, user_id: int):
         interaction = mock.MagicMock()
@@ -99,6 +103,21 @@ class GenerateAiLastReferenceTestCase(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsNone(generate_mock.await_args.kwargs["reference_image_bytes"])
         self.assertIsNone(generate_mock.await_args.kwargs["reference_image_content_type"])
+
+    async def test_explicit_none_clears_attachment_reuse_and_strength(self):
+        prompt_module._last_reference_images[101] = (b"cached", "image/png")
+
+        generate_mock, _ = await self._invoke(
+            self._interaction(101),
+            reference_mode=app_commands.Choice(name="参照なし", value="none"),
+            reference_image=self._attachment(b"ignored"),
+            use_last_reference=True,
+            reference_strength=0.9,
+        )
+
+        self.assertIsNone(generate_mock.await_args.kwargs["reference_image_bytes"])
+        self.assertIsNone(generate_mock.await_args.kwargs["reference_image_content_type"])
+        self.assertIsNone(generate_mock.await_args.kwargs["reference_strength"])
 
     async def test_reuse_without_a_previous_reference_reports_an_error(self):
         generate_mock, send_mock = await self._invoke(

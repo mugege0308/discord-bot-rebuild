@@ -1,5 +1,6 @@
 import asyncio
 from dataclasses import dataclass, replace
+import hashlib
 import inspect
 import logging
 from pathlib import Path
@@ -101,6 +102,8 @@ SHOGOU_ASSUMPTION_ITEM_LIMIT = 200
 SHOGOU_SUMMARY_LIMIT = 300
 SHOGOU_MESSAGE_LIMIT = 1900
 REFERENCE_MODE_NONE = "none"
+REFERENCE_MODE_COMPOSITION = "composition"
+REFERENCE_REQUIRED_MESSAGE = "構図参照には参考画像を添付するか、直前の画像を再利用してください。"
 GENERATE_AI_DEFAULT_SELECTION_AI = True
 GENERATE_AI_MODEL_CHOICES = [
     app_commands.Choice(name="Animagine XL 4.0 Clear", value="animagine"),
@@ -152,6 +155,7 @@ GENERATE_AI_COMPOSITION_CHOICES = [
 # disabled value here prevents the panel from exposing an unimplemented path.
 GENERATE_AI_REFERENCE_MODE_CHOICES = [
     app_commands.Choice(name="参照なし", value=REFERENCE_MODE_NONE),
+    app_commands.Choice(name="構図参照", value=REFERENCE_MODE_COMPOSITION),
 ]
 
 
@@ -225,6 +229,31 @@ _active_regenerations: set[int] = set()
 _last_reference_images: dict[int, tuple[bytes, str]] = {}
 
 
+def get_last_reference_image_info(user_id: int) -> dict[str, object] | None:
+    """Return non-sensitive metadata for the user's in-memory reference image."""
+
+    cached = _last_reference_images.get(user_id)
+    if not cached or not cached[0]:
+        return None
+    image_bytes, content_type = cached
+    return {
+        "source_type": "last_reference",
+        "content_type": content_type,
+        "size_bytes": len(image_bytes),
+        "sha256": hashlib.sha256(image_bytes).hexdigest(),
+        "original_filename": "-",
+        "url_kind": "cached",
+        "reused_from_previous": True,
+    }
+
+
+def has_last_reference_image(user_id: int) -> bool:
+    """Return whether the user has a reusable in-memory reference image."""
+
+    cached = _last_reference_images.get(user_id)
+    return bool(cached and cached[0])
+
+
 @dataclass(frozen=True)
 class ResolvedGenerateAiSettings:
     """Shared, validated settings consumed by Panel and /generate_ai."""
@@ -289,6 +318,8 @@ def _default_generate_ai_panel_settings(*, model_key: str | None = None) -> Reso
             "input_mode": "default",
             "rating": "default",
             "seed": "default",
+            "reference_mode": "default",
+            "reference_strength": "default",
             "selection_ai": "default",
             "candidate_count": "default",
             "size": "default",
@@ -326,6 +357,8 @@ def _resolve_generate_ai_settings(
     size: app_commands.Choice[str] | None = None,
     composition_preset: app_commands.Choice[str] | None = None,
     input_mode: app_commands.Choice[str] | None = None,
+    reference_mode: app_commands.Choice[str] | None = None,
+    reference_strength: float | None = None,
     character_lora: app_commands.Choice[str] | None = None,
     character_lora_strength: float | None = None,
     additional_lora: app_commands.Choice[str] | None = None,
@@ -438,6 +471,27 @@ def _resolve_generate_ai_settings(
         resolved_composition = DEFAULT_COMPOSITION_PRESET
         sources["composition_preset"] = "default"
 
+    if reference_mode is not None:
+        resolved_reference_mode = _panel_choice_value(
+            GENERATE_AI_REFERENCE_MODE_CHOICES,
+            reference_mode.value,
+            "参照モード",
+        )
+        sources["reference_mode"] = "explicit"
+    else:
+        # Reference mode is invocation state, not a silently reusable image
+        # preference. This prevents a previous reference from leaking into a
+        # new ordinary generation after restart or panel reopen.
+        resolved_reference_mode = REFERENCE_MODE_NONE
+        sources["reference_mode"] = "default"
+
+    if resolved_reference_mode == REFERENCE_MODE_NONE:
+        resolved_reference_strength = None
+        sources["reference_strength"] = "cleared" if reference_strength is not None else "default"
+    else:
+        resolved_reference_strength = resolve_reference_strength(True, reference_strength)
+        sources["reference_strength"] = "explicit" if reference_strength is not None else "default"
+
     if style is not None:
         style_key = _optional_lora_choice_value(style)
         style_strength = None if style_key is None and strength is None else strength
@@ -508,14 +562,14 @@ def _resolve_generate_ai_settings(
         lora_strength=None if style_selection is None else style_selection.strength,
         rating=resolved_rating,
         seed=None,
-        reference_strength=None,
+        reference_strength=resolved_reference_strength,
         selection_ai=resolved_selection_ai,
         candidate_count=resolved_candidate_count,
         size_key=resolved_size,
         composition_preset=resolved_composition,
         sources=sources,
         loras=loras,
-        reference_mode=REFERENCE_MODE_NONE,
+        reference_mode=resolved_reference_mode,
         use_last_reference=False,
         input_mode=resolved_input_mode,
     )
@@ -583,8 +637,21 @@ async def run_generate_ai_from_panel(
         composition_preset,
         "構図",
     )
-    if reference_mode != REFERENCE_MODE_NONE or use_last_reference:
-        raise ValueError("Reference / PoseはまだPanel生成から利用できません。")
+    resolved_reference_mode = _panel_choice_value(
+        GENERATE_AI_REFERENCE_MODE_CHOICES,
+        reference_mode,
+        "参照モード",
+    )
+    if not isinstance(use_last_reference, bool):
+        raise ValueError("直前の参考画像再利用指定が不正です。")
+    if resolved_reference_mode == REFERENCE_MODE_NONE:
+        reference_strength = None
+        use_last_reference = False
+    reference_choice_name = next(
+        choice.name
+        for choice in GENERATE_AI_REFERENCE_MODE_CHOICES
+        if choice.value == resolved_reference_mode
+    )
 
     # Keep the full bridge payload available to future callback versions.  The
     # current command may accept only a subset; filtering by its signature
@@ -602,9 +669,12 @@ async def run_generate_ai_from_panel(
         "additional_lora_strength": additional_lora_strength,
         "reference_id": None,
         "reference_image": None,
-        "reference_strength": None,
-        "reference_mode": app_commands.Choice(name=REFERENCE_MODE_NONE, value=REFERENCE_MODE_NONE),
-        "use_last_reference": False,
+        "reference_strength": reference_strength,
+        "reference_mode": app_commands.Choice(
+            name=reference_choice_name,
+            value=resolved_reference_mode,
+        ),
+        "use_last_reference": use_last_reference,
         "seed": seed,
         "selection_ai": selection_ai,
         "candidate_count": candidate_count,
@@ -2086,6 +2156,12 @@ def setup(client: discord.Client) -> None:
         candidate_count = panel_options.pop("candidate_count", None)
         size = panel_options.pop("size", None)
         composition_preset = panel_options.pop("composition_preset", None)
+        reference_mode = panel_options.pop("reference_mode", None)
+        if reference_mode is None and (reference_image is not None or use_last_reference):
+            reference_mode = app_commands.Choice(
+                name="構図参照",
+                value=REFERENCE_MODE_COMPOSITION,
+            )
         if not is_pc_control_allowed(interaction.user.id):
             logger.warning("Denied /generate_ai by user_id=%s", interaction.user.id)
             await _send_error(interaction, SD_DENIED_MESSAGE, label="generate_ai.denied")
@@ -2103,6 +2179,8 @@ def setup(client: discord.Client) -> None:
                 size=size,
                 composition_preset=composition_preset,
                 input_mode=input_mode,
+                reference_mode=reference_mode,
+                reference_strength=reference_strength,
                 character_lora=character_lora,
                 character_lora_strength=character_lora_strength,
                 additional_lora=additional_lora,
@@ -2111,6 +2189,13 @@ def setup(client: discord.Client) -> None:
         except (GenerateAiLastSettingsError, ValueError) as exc:
             await _send_error(interaction, str(exc), label="generate_ai.settings_invalid")
             return
+
+        if resolved_settings.reference_mode == REFERENCE_MODE_NONE:
+            # An explicit "none" selection is authoritative and clears any
+            # stale attachment/reuse values before they reach ComfyUI.
+            reference_image = None
+            use_last_reference = False
+            reference_strength = None
 
         cached_reference = (
             _last_reference_images.get(interaction.user.id)
@@ -2122,6 +2207,17 @@ def setup(client: discord.Client) -> None:
                 interaction,
                 LAST_REFERENCE_MISSING_MESSAGE,
                 label="generate_ai.last_reference_missing",
+            )
+            return
+        if (
+            resolved_settings.reference_mode == REFERENCE_MODE_COMPOSITION
+            and reference_image is None
+            and cached_reference is None
+        ):
+            await _send_error(
+                interaction,
+                REFERENCE_REQUIRED_MESSAGE,
+                label="generate_ai.reference_missing",
             )
             return
 
@@ -2196,13 +2292,17 @@ def setup(client: discord.Client) -> None:
             style_key=resolved_settings.style_key,
             lora_strength=resolved_settings.lora_strength,
             rating=resolved_settings.rating,
-            reference_strength=0.5,
+            reference_strength=(
+                resolved_settings.reference_strength
+                if resolved_settings.reference_strength is not None
+                else 0.5
+            ),
             selection_ai=resolved_settings.selection_ai,
             candidate_count=resolved_settings.candidate_count,
             size_key=resolved_settings.size_key,
             composition_preset=resolved_settings.composition_preset,
             loras=lora_selections_to_dicts(resolved_settings.loras),
-            reference_mode=REFERENCE_MODE_NONE,
+            reference_mode=resolved_settings.reference_mode,
             input_mode=resolved_settings.input_mode,
         )
 
@@ -2277,6 +2377,7 @@ def setup(client: discord.Client) -> None:
         style=GENERATE_AI_STYLE_CHOICES,
         character_lora=GENERATE_AI_CHARACTER_LORA_CHOICES,
         additional_lora=GENERATE_AI_ADDITIONAL_LORA_CHOICES,
+        reference_mode=GENERATE_AI_REFERENCE_MODE_CHOICES,
     )
     @app_commands.describe(
         request="作りたい画像の日本語要望。",
@@ -2287,6 +2388,7 @@ def setup(client: discord.Client) -> None:
         character_lora_strength="キャラクターLoRAの強度（0.0～1.0）。",
         additional_lora="追加LoRA。なしで解除します。",
         additional_lora_strength="追加LoRAの強度（0.0～1.0）。",
+        reference_mode="参考画像の扱い。未指定時は画像添付があれば構図参照です。",
         reference_id="任意。全タグを使う画像参考メモID",
         reference_image="任意。同じキャラの顔・髪・雰囲気を参照する画像1枚。",
         reference_strength="参考画像の強さ（0.0～1.0）。未指定時は0.5です。",
@@ -2301,6 +2403,7 @@ def setup(client: discord.Client) -> None:
         character_lora_strength: float | None = None,
         additional_lora: app_commands.Choice[str] | None = None,
         additional_lora_strength: float | None = None,
+        reference_mode: app_commands.Choice[str] | None = None,
         reference_id: int | None = None,
         reference_image: discord.Attachment | None = None,
         reference_strength: float | None = None,
@@ -2315,6 +2418,7 @@ def setup(client: discord.Client) -> None:
             character_lora_strength=character_lora_strength,
             additional_lora=additional_lora,
             additional_lora_strength=additional_lora_strength,
+            reference_mode=reference_mode,
             reference_id=reference_id,
             reference_image=reference_image,
             reference_strength=reference_strength,
