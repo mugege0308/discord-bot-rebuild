@@ -2,8 +2,10 @@ import base64
 import hashlib
 import json
 import logging
+import math
 import os
 import random
+import re
 import shutil
 import subprocess
 import threading
@@ -12,12 +14,27 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 from urllib.parse import urljoin
 
 import requests
 
 from services.pc_control import get_shutdown_delay_seconds, is_windows, schedule_shutdown
+from services.lora_catalog import (
+    COMFY_STYLES,
+    ComfyStyle,
+    build_comfy_styles,
+    get_comfy_lora_choice_specs,
+    get_comfy_style_choice_specs,
+    model_family_compatible,
+    refresh_comfy_styles,
+)
+from services.lora_training import (
+    LORA_TYPE_ADDITIONAL,
+    LORA_TYPE_CHARACTER,
+    LORA_TYPE_LABELS,
+    LORA_TYPE_STYLE,
+)
 from services.weather import JST
 
 
@@ -33,6 +50,7 @@ DEFAULT_NEGATIVE_PROMPT = (
     "bad hands, blurry, jpeg artifacts, watermark, text, logo"
 )
 DEFAULT_COMFY_WORKFLOW_FILE = Path("workflows") / "comfy_workflow.json"
+LORA_COMFY_WORKFLOW_FILE = Path("workflows") / "comfy_workflow_lora.json"
 REFERENCE_COMFY_WORKFLOW_FILE = Path("workflows") / "comfy_workflow_ipadapter.json"
 DEFAULT_REFERENCE_STRENGTH = 0.5
 REFERENCE_IMAGE_EXTENSIONS = {
@@ -43,6 +61,10 @@ REFERENCE_IMAGE_EXTENSIONS = {
 COMFY_CHECKPOINTS = {
     "janku": "JANKUTrainedChenkinNoobai_v777.safetensors",
     "animagine": "animagineXL40Opt_clear.safetensors",
+}
+COMFY_MODEL_FAMILIES = {
+    "janku": "sdxl",
+    "animagine": "sdxl",
 }
 COMFY_POLL_INTERVAL_SECONDS = 2
 COMFY_TIMEOUT_SECONDS = 600
@@ -55,10 +77,24 @@ _shutdown_after_done = False
 
 
 @dataclass(frozen=True)
+class LoraSelection:
+    """One validated LoRA selection for the generation backend."""
+
+    key: str
+    lora_name: str
+    lora_type: str
+    display_name: str
+    trigger: str
+    strength: float
+    model_family: str | None = None
+
+
+@dataclass(frozen=True)
 class SdGenerationOptions:
     prompt: str
     negative_prompt: str | None = None
     model_key: str | None = None
+    model_family: str | None = None
     filename_prefix: str | None = None
     model_selection_explicit: bool = False
     preserve_prompt_text: bool = False
@@ -69,6 +105,9 @@ class SdGenerationOptions:
     cfg: float = 7.0
     sampler: str = "Euler a"
     seed: int = -1
+    style_key: str | None = None
+    lora_strength: float | None = None
+    loras: tuple[LoraSelection, ...] = ()
     reference_image_bytes: bytes | None = None
     reference_image_content_type: str | None = None
     reference_strength: float | None = None
@@ -188,6 +227,271 @@ def get_negative_prompt(value: str | None) -> str:
     return os.getenv("SD_DEFAULT_NEGATIVE_PROMPT", DEFAULT_NEGATIVE_PROMPT).strip() or DEFAULT_NEGATIVE_PROMPT
 
 
+def _resolve_generation_model_family(
+    model_key: str | None,
+    model_family: str | None,
+) -> str | None:
+    if isinstance(model_family, str) and model_family.strip():
+        return model_family.strip().casefold()
+    if isinstance(model_key, str):
+        return COMFY_MODEL_FAMILIES.get(model_key.strip().casefold())
+    # The repository's default workflow is Animagine XL / SDXL.  Keep the
+    # default explicit so a known incompatible LoRA is rejected even when an
+    # older caller does not populate model_family.
+    return "sdxl"
+
+
+def _validate_lora_strength(value: object) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("LoRA strengthは0.0～1.0の数値で指定してください。")
+    resolved = float(value)
+    if not math.isfinite(resolved) or not 0.0 <= resolved <= 1.0:
+        raise ValueError("LoRA strengthは0.0～1.0の範囲で指定してください。")
+    return resolved
+
+
+def _validate_catalog_lora_file(lora: ComfyStyle) -> None:
+    # Managed catalog entries point back to the training output file.  Reject
+    # a stale entry before queueing; built-in legacy entries intentionally have
+    # no source_path because ComfyUI resolves them from its configured model
+    # root at execution time.
+    if lora.source_path is not None and not lora.source_path.is_file():
+        raise ValueError(f"LoRAファイルが見つかりません: {lora.display_name}")
+
+
+def resolve_style_selection(
+    style_key: str | None,
+    strength: float | None,
+    *,
+    model_family: str | None = None,
+) -> tuple[str | None, ComfyStyle | None, float | None]:
+    """Resolve the legacy style slot through the shared LoRA catalog."""
+
+    normalized_key = style_key.strip().casefold() if isinstance(style_key, str) else None
+    normalized_key = normalized_key or None
+    if normalized_key is None:
+        if strength is not None:
+            raise ValueError("LoRA strengthを指定するにはstyleを選択してください。")
+        return None, None, None
+
+    style = COMFY_STYLES.get(normalized_key)
+    if style is None:
+        raise ValueError(f"未登録のstyleです: {normalized_key}")
+    if style.load_error:
+        raise ValueError(style.load_error)
+    _validate_catalog_lora_file(style)
+    if style.lora_type != LORA_TYPE_STYLE:
+        raise ValueError(f"LoRA「{style.display_name}」はstyle枠では選択できません。")
+    if not model_family_compatible(style.model_family, model_family):
+        raise ValueError(
+            f"LoRA「{style.display_name}」はモデル系統「{model_family}」に対応していません。"
+        )
+
+    resolved_strength = style.default_strength if strength is None else strength
+    return normalized_key, style, _validate_lora_strength(resolved_strength)
+
+
+def _resolve_one_lora_selection(
+    key: str | None,
+    strength: float | None,
+    expected_type: str,
+    *,
+    model_family: str | None,
+) -> LoraSelection | None:
+    normalized_key = key.strip().casefold() if isinstance(key, str) else None
+    normalized_key = normalized_key or None
+    if normalized_key is None:
+        if strength is not None:
+            raise ValueError("LoRA強度を指定するには、そのLoRAを選択してください。")
+        return None
+
+    lora = COMFY_STYLES.get(normalized_key)
+    if lora is None:
+        raise ValueError(f"未登録のLoRAです: {normalized_key}")
+    if lora.load_error:
+        raise ValueError(lora.load_error)
+    _validate_catalog_lora_file(lora)
+    if lora.lora_type != expected_type:
+        raise ValueError(f"LoRA「{lora.display_name}」は{expected_type}枠では選択できません。")
+    if not model_family_compatible(lora.model_family, model_family):
+        raise ValueError(
+            f"LoRA「{lora.display_name}」はモデル系統「{model_family}」に対応していません。"
+        )
+
+    resolved_strength = lora.default_strength if strength is None else strength
+    return LoraSelection(
+        key=normalized_key,
+        lora_name=lora.lora_name,
+        lora_type=lora.lora_type,
+        display_name=lora.display_name,
+        trigger=lora.trigger,
+        strength=_validate_lora_strength(resolved_strength),
+        model_family=lora.model_family,
+    )
+
+
+def resolve_lora_selections(
+    *,
+    character_key: str | None = None,
+    character_strength: float | None = None,
+    style_key: str | None = None,
+    style_strength: float | None = None,
+    additional_key: str | None = None,
+    additional_strength: float | None = None,
+    model_family: str | None = None,
+) -> tuple[LoraSelection, ...]:
+    """Resolve the typed LoRA slots in deterministic order."""
+
+    requested_keys = [
+        key.strip().casefold()
+        for key in (character_key, style_key, additional_key)
+        if isinstance(key, str) and key.strip()
+    ]
+    if len(requested_keys) != len(set(requested_keys)):
+        raise ValueError("同じLoRAを複数の枠へ選択することはできません。")
+
+    selections = tuple(
+        selection
+        for selection in (
+            _resolve_one_lora_selection(
+                character_key,
+                character_strength,
+                LORA_TYPE_CHARACTER,
+                model_family=model_family,
+            ),
+            _resolve_one_lora_selection(
+                style_key,
+                style_strength,
+                LORA_TYPE_STYLE,
+                model_family=model_family,
+            ),
+            _resolve_one_lora_selection(
+                additional_key,
+                additional_strength,
+                LORA_TYPE_ADDITIONAL,
+                model_family=model_family,
+            ),
+        )
+        if selection is not None
+    )
+    if len({selection.key for selection in selections}) != len(selections):
+        raise ValueError("同じLoRAを複数の枠へ選択することはできません。")
+    return selections
+
+
+def resolve_saved_lora_selections(
+    raw_selections: object,
+    *,
+    model_family: str | None = None,
+) -> tuple[LoraSelection, ...]:
+    """Validate replayable selection snapshots without trusting their paths."""
+
+    if raw_selections in (None, (), []):
+        return ()
+    if not isinstance(raw_selections, (list, tuple)):
+        raise ValueError("保存済みLoRA構成が不正です。")
+
+    selections: list[LoraSelection] = []
+    for raw in raw_selections:
+        if isinstance(raw, LoraSelection):
+            key = raw.key
+            strength = raw.strength
+            lora_type = raw.lora_type
+        elif isinstance(raw, dict):
+            key = raw.get("key")
+            strength = raw.get("strength")
+            lora_type = raw.get("lora_type")
+        else:
+            raise ValueError("保存済みLoRA構成が不正です。")
+        if not isinstance(key, str) or not key.strip():
+            raise ValueError("保存済みLoRAのkeyが不正です。")
+        current = COMFY_STYLES.get(key.strip().casefold())
+        if current is None:
+            raise ValueError(f"未登録のLoRAです: {key.strip()}")
+        expected_type = str(lora_type or current.lora_type)
+        selection = _resolve_one_lora_selection(
+            key,
+            strength,
+            expected_type,
+            model_family=model_family,
+        )
+        if selection is not None:
+            selections.append(selection)
+    if len({selection.key for selection in selections}) != len(selections):
+        raise ValueError("同じLoRAを複数指定することはできません。")
+    return tuple(selections)
+
+
+def effective_lora_selections(options: SdGenerationOptions) -> tuple[LoraSelection, ...]:
+    model_family = _resolve_generation_model_family(options.model_key, options.model_family)
+    if options.loras:
+        return resolve_saved_lora_selections(options.loras, model_family=model_family)
+    if options.style_key is None and options.lora_strength is None:
+        return ()
+    style_key, _, style_strength = resolve_style_selection(
+        options.style_key,
+        options.lora_strength,
+        model_family=model_family,
+    )
+    return resolve_lora_selections(
+        style_key=style_key,
+        style_strength=style_strength,
+        model_family=model_family,
+    )
+
+
+def lora_selections_to_dicts(selections: tuple[LoraSelection, ...]) -> tuple[dict[str, object], ...]:
+    return tuple(
+        {
+            "key": selection.key,
+            "lora_name": selection.lora_name,
+            "lora_type": selection.lora_type,
+            "display_name": selection.display_name,
+            "trigger": selection.trigger,
+            "strength": selection.strength,
+            "model_family": selection.model_family,
+        }
+        for selection in selections
+    )
+
+
+def apply_lora_triggers(positive: str, selections: tuple[LoraSelection, ...]) -> str:
+    """Prepend missing triggers while preserving atomic and weighted tags."""
+
+    missing: list[str] = []
+    for selection in selections:
+        trigger = selection.trigger.strip()
+        if not trigger:
+            continue
+        pattern = re.compile(r"(?<![\w-])" + re.escape(trigger) + r"(?![\w-])", re.IGNORECASE)
+        if not pattern.search(positive):
+            missing.append(trigger)
+    if not missing:
+        return positive
+    body = positive.strip()
+    return ", ".join([*missing, body]) if body else ", ".join(missing)
+
+
+def get_lora_status_text(selections: tuple[LoraSelection, ...]) -> str:
+    if not selections:
+        return "LoRA: なし"
+    lines = ["LoRA:"]
+    for selection in selections:
+        trigger = selection.trigger or "トリガーなし"
+        label = LORA_TYPE_LABELS.get(selection.lora_type, selection.lora_type)
+        lines.append(
+            f"- {selection.display_name}（{label}） / strength {selection.strength:g} / trigger {trigger}"
+        )
+    return "\n".join(lines)
+
+
+def get_style_status_text(style_key: str | None, strength: float | None) -> str:
+    _, style, resolved_strength = resolve_style_selection(style_key, strength)
+    if style is None or resolved_strength is None:
+        return "Style: Default"
+    return f"Style: {style.display_name}\nLoRA strength: {resolved_strength:g}"
+
+
 def resolve_reference_strength(reference_used: bool, strength: float | None) -> float | None:
     if not reference_used:
         if strength is not None:
@@ -225,6 +529,13 @@ def validate_options(options: SdGenerationOptions) -> SdGenerationOptions:
     else:
         negative_prompt = get_negative_prompt(options.negative_prompt)
 
+    resolved_model_family = _resolve_generation_model_family(options.model_key, options.model_family)
+    style_key, _, lora_strength = resolve_style_selection(
+        options.style_key,
+        options.lora_strength,
+        model_family=resolved_model_family,
+    )
+    loras = effective_lora_selections(options)
     reference_used = options.reference_image_bytes is not None
     reference_strength = resolve_reference_strength(reference_used, options.reference_strength)
     reference_content_type = None
@@ -239,6 +550,7 @@ def validate_options(options: SdGenerationOptions) -> SdGenerationOptions:
         prompt=prompt,
         negative_prompt=negative_prompt,
         model_key=options.model_key,
+        model_family=resolved_model_family,
         filename_prefix=options.filename_prefix,
         model_selection_explicit=options.model_selection_explicit,
         preserve_prompt_text=options.preserve_prompt_text,
@@ -249,6 +561,9 @@ def validate_options(options: SdGenerationOptions) -> SdGenerationOptions:
         cfg=_clamp_float(options.cfg, 1.0, max_cfg),
         sampler=options.sampler.strip() or "Euler a",
         seed=options.seed if options.seed is not None else -1,
+        style_key=style_key,
+        lora_strength=lora_strength,
+        loras=loras,
         reference_image_bytes=options.reference_image_bytes,
         reference_image_content_type=reference_content_type,
         reference_strength=reference_strength,
@@ -403,9 +718,16 @@ def _decode_and_save_webui_images(images: list[Any]) -> list[Path]:
     return paths
 
 
-def _get_comfy_workflow_file(reference_enabled: bool = False) -> Path:
+def _get_comfy_workflow_file(
+    reference_enabled: bool = False,
+    loras: Sequence[LoraSelection] = (),
+) -> Path:
     if reference_enabled:
+        if loras:
+            raise ValueError("LoRAとReference imageの同時適用には対応していません。")
         return REFERENCE_COMFY_WORKFLOW_FILE
+    if loras:
+        return LORA_COMFY_WORKFLOW_FILE
     raw_value = os.getenv("COMFY_WORKFLOW_FILE", "").strip().strip('"')
     return Path(raw_value) if raw_value else DEFAULT_COMFY_WORKFLOW_FILE
 
@@ -414,8 +736,11 @@ def _get_node_id(name: str) -> str:
     return os.getenv(name, "").strip()
 
 
-def _load_comfy_workflow(reference_enabled: bool = False) -> dict[str, Any]:
-    workflow_file = _get_comfy_workflow_file(reference_enabled)
+def _load_comfy_workflow(
+    reference_enabled: bool = False,
+    loras: Sequence[LoraSelection] = (),
+) -> dict[str, Any]:
+    workflow_file = _get_comfy_workflow_file(reference_enabled, loras)
     if not workflow_file.exists() or not workflow_file.is_file():
         raise RuntimeError(f"ComfyUI workflow file が見つからないよ: {workflow_file}")
 
@@ -706,13 +1031,138 @@ def _find_checkpoint_loader_node_id(workflow: dict[str, Any]) -> str:
     return node_ids[0]
 
 
+def _find_lora_loader_node_ids(workflow: dict[str, Any]) -> list[str]:
+    return [
+        str(node_id)
+        for node_id, node in workflow.items()
+        if isinstance(node, dict) and str(node.get("class_type", "")) == "LoraLoader"
+    ]
+
+
+def _new_workflow_node_id(workflow: dict[str, Any]) -> str:
+    numeric_ids = [int(str(node_id)) for node_id in workflow if str(node_id).isdigit()]
+    candidate = max(numeric_ids, default=0) + 1
+    while str(candidate) in workflow:
+        candidate += 1
+    return str(candidate)
+
+
+def _replace_workflow_reference(
+    workflow: dict[str, Any],
+    old_reference: list[Any],
+    new_reference: list[Any],
+    *,
+    excluded_node_ids: set[str],
+) -> None:
+    for node_id, node in workflow.items():
+        if str(node_id) in excluded_node_ids or not isinstance(node, dict):
+            continue
+        inputs = node.get("inputs")
+        if not isinstance(inputs, dict):
+            continue
+        for input_name, value in tuple(inputs.items()):
+            if value == old_reference:
+                inputs[input_name] = list(new_reference)
+
+
+def _configure_lora_loaders(
+    workflow: dict[str, Any],
+    selections: Sequence[LoraSelection],
+    checkpoint_node_id: str,
+) -> None:
+    """Create a serial MODEL+CLIP LoraLoader chain for the selected LoRAs."""
+
+    if not selections:
+        return
+    existing_ids = _find_lora_loader_node_ids(workflow)
+    loader_ids = existing_ids[:1]
+    while len(loader_ids) < len(selections):
+        loader_id = _new_workflow_node_id(workflow)
+        workflow[loader_id] = {
+            "inputs": {},
+            "class_type": "LoraLoader",
+            "_meta": {"title": "Generated LoRA Loader"},
+        }
+        loader_ids.append(loader_id)
+
+    excluded_node_ids = set(loader_ids)
+    base_model = [str(checkpoint_node_id), 0]
+    base_clip = [str(checkpoint_node_id), 1]
+
+    # A supplied LoRA workflow already has a loader connected to downstream
+    # consumers.  Repoint those consumers to the final loader before writing
+    # the chain inputs; this also handles a workflow with one placeholder
+    # loader and a request for multiple LoRAs.
+    for old_loader_id in existing_ids:
+        _replace_workflow_reference(
+            workflow,
+            [old_loader_id, 0],
+            [loader_ids[-1], 0],
+            excluded_node_ids=excluded_node_ids,
+        )
+        _replace_workflow_reference(
+            workflow,
+            [old_loader_id, 1],
+            [loader_ids[-1], 1],
+            excluded_node_ids=excluded_node_ids,
+        )
+    _replace_workflow_reference(
+        workflow,
+        base_model,
+        [loader_ids[0], 0],
+        excluded_node_ids=excluded_node_ids,
+    )
+    _replace_workflow_reference(
+        workflow,
+        base_clip,
+        [loader_ids[0], 1],
+        excluded_node_ids=excluded_node_ids,
+    )
+
+    previous_model = base_model
+    previous_clip = base_clip
+    for loader_id, selection in zip(loader_ids, selections):
+        inputs = _node_inputs(workflow, loader_id)
+        if inputs is None:
+            raise RuntimeError(f"LoRA Loaderノードのinputsが不正です: {loader_id}")
+        inputs.update(
+            {
+                "lora_name": selection.lora_name,
+                "strength_model": selection.strength,
+                "strength_clip": selection.strength,
+                "model": list(previous_model),
+                "clip": list(previous_clip),
+            }
+        )
+        workflow[loader_id]["class_type"] = "LoraLoader"
+        previous_model = [loader_id, 0]
+        previous_clip = [loader_id, 1]
+
+    if loader_ids[0] != loader_ids[-1]:
+        _replace_workflow_reference(
+            workflow,
+            [loader_ids[0], 0],
+            [loader_ids[-1], 0],
+            excluded_node_ids=excluded_node_ids,
+        )
+        _replace_workflow_reference(
+            workflow,
+            [loader_ids[0], 1],
+            [loader_ids[-1], 1],
+            excluded_node_ids=excluded_node_ids,
+        )
+
+
 def _apply_comfy_options(
     workflow: dict[str, Any], options: SdGenerationOptions, reference_image_name: str | None = None
 ) -> tuple[dict[str, Any], str | None, str | None]:
+    loras = effective_lora_selections(options)
     checkpoint_name = None
     checkpoint_node_id = None
     if options.model_key is not None:
         checkpoint_name = _resolve_comfy_checkpoint(options.model_key)
+        checkpoint_node_id = _find_checkpoint_loader_node_id(workflow)
+    elif loras:
         checkpoint_node_id = _find_checkpoint_loader_node_id(workflow)
 
     save_nodes = _find_save_image_nodes(workflow)
@@ -741,7 +1191,19 @@ def _apply_comfy_options(
     if checkpoint_node_id is not None and checkpoint_name is not None:
         _set_node_input(workflow, checkpoint_node_id, "ckpt_name", checkpoint_name)
 
-    _set_node_input(workflow, positive_node_id, "text", options.prompt)
+    positive_prompt = apply_lora_triggers(options.prompt, loras)
+    if loras:
+        if checkpoint_node_id is None:
+            checkpoint_node_id = _find_checkpoint_loader_node_id(workflow)
+        _configure_lora_loaders(workflow, loras, checkpoint_node_id)
+        logger.info(
+            "LoRA generation integration applied: keys=%s strengths=%s model_family=%s",
+            [selection.key for selection in loras],
+            [selection.strength for selection in loras],
+            options.model_family,
+        )
+
+    _set_node_input(workflow, positive_node_id, "text", positive_prompt)
     _set_node_input(workflow, negative_node_id, "text", options.negative_prompt or "")
 
     if options.reference_image_bytes is not None:
@@ -769,7 +1231,8 @@ def _apply_comfy_options(
         seed_key = "noise_seed" if _node_class(workflow, seed_node_id) == "RandomNoise" else "seed"
 
     if seed_node_id and seed_key:
-        _set_node_input(workflow, seed_node_id, seed_key, random.randint(0, 2**32 - 1))
+        seed_value = options.seed if isinstance(options.seed, int) and options.seed >= 0 else random.randint(0, 2**32 - 1)
+        _set_node_input(workflow, seed_node_id, seed_key, seed_value)
         logger.info(
             "ComfyUI workflow inputs applied: positive=%s negative=%s seed=%s.%s save_nodes=%s",
             positive_node_id,
@@ -946,7 +1409,8 @@ def _generate_webui_images(options: SdGenerationOptions) -> list[Path]:
 
 def _generate_comfy_images_with_metadata(options: SdGenerationOptions) -> list[GeneratedImage]:
     reference_enabled = options.reference_image_bytes is not None
-    workflow_file = _get_comfy_workflow_file(reference_enabled)
+    loras = effective_lora_selections(options)
+    workflow_file = _get_comfy_workflow_file(reference_enabled, loras)
     workflow_file_text = str(workflow_file)
     workflow_hash = _safe_workflow_file_hash(workflow_file)
 
@@ -961,7 +1425,7 @@ def _generate_comfy_images_with_metadata(options: SdGenerationOptions) -> list[G
     client_id = str(uuid.uuid4())
     for batch_index in range(1, options.count + 1):
         workflow, seed_node_id, seed_key = _apply_comfy_options(
-            _load_comfy_workflow(reference_enabled), options, reference_image_name
+            _load_comfy_workflow(reference_enabled, loras), options, reference_image_name
         )
 
         seed_value: int | None = None
