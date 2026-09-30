@@ -17,6 +17,7 @@ from commands import claude
 from commands import claude_remote
 from commands import dev_task
 from commands import gallery
+from commands import generate_batch
 from commands import image_analyze
 from commands import image_feedback
 from commands import lora
@@ -111,6 +112,7 @@ REQUIRED_SLASH_COMMANDS = {
     "ba_tl_cost",
     "generate_raw",
     "generate_ai",
+    "generate_batch",
     "gallery",
     "image_memory_list",
     "image_memory_show",
@@ -192,6 +194,10 @@ class SecretaryClient(discord.Client):
         except Exception:
             logger.exception("Failed to clean up LoRA job monitoring during Bot shutdown.")
         try:
+            await generate_batch.shutdown()
+        except Exception:
+            logger.exception("Failed to stop Batch generation jobs cleanly.")
+        try:
             await claude_remote_manager.cleanup()
         except Exception:
             logger.exception("Failed to clean up Claude Remote Control during Bot shutdown.")
@@ -221,6 +227,15 @@ class SecretaryClient(discord.Client):
             # Gallery review is an optional consumer.  Its startup must never
             # prevent Discord commands or image generation from coming online.
             logger.exception("Failed to start gallery review queue; continuing Bot startup.")
+        try:
+            recovered_batch_jobs = await asyncio.to_thread(generate_batch.recover_incomplete_jobs)
+            if recovered_batch_jobs:
+                logger.warning(
+                    "Marked %s incomplete Batch generation jobs as failed after Bot restart.",
+                    recovered_batch_jobs,
+                )
+        except Exception:
+            logger.exception("Batch job recovery failed; continuing Bot startup.")
         guild_id = os.getenv("DISCORD_GUILD_ID")
         try:
             _log_app_command_names("registered before sync (global)", self.tree.get_commands())
@@ -255,6 +270,7 @@ claude.setup(client)
 claude_remote.setup(client)
 dev_task.setup(client)
 gallery.setup(client)
+generate_batch.setup(client)
 references.setup(client)
 character_generate.setup(client)
 image_analyze.setup(client)
