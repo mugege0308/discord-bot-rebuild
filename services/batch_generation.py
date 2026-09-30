@@ -423,6 +423,8 @@ class BatchGenerationManager:
                         checkpoint TEXT NOT NULL DEFAULT '',
                         requested_count INTEGER NOT NULL,
                         completed_count INTEGER NOT NULL DEFAULT 0,
+                        failed_count INTEGER NOT NULL DEFAULT 0,
+                        variation_index INTEGER NOT NULL DEFAULT 1,
                         created_at TEXT NOT NULL,
                         error TEXT NOT NULL DEFAULT ''
                     );
@@ -430,6 +432,20 @@ class BatchGenerationManager:
                         ON generation_batches(job_id, created_at);
                     """
                 )
+                columns = {
+                    str(row[1])
+                    for row in connection.execute(
+                        "PRAGMA table_info(generation_batches)"
+                    ).fetchall()
+                }
+                if "failed_count" not in columns:
+                    connection.execute(
+                        "ALTER TABLE generation_batches ADD COLUMN failed_count INTEGER NOT NULL DEFAULT 0"
+                    )
+                if "variation_index" not in columns:
+                    connection.execute(
+                        "ALTER TABLE generation_batches ADD COLUMN variation_index INTEGER NOT NULL DEFAULT 1"
+                    )
             self._schema_paths.add(path)
 
     def _fetch_job_row(self, job_id: str) -> sqlite3.Row | None:
@@ -541,6 +557,8 @@ class BatchGenerationManager:
                     "checkpoint": batch["checkpoint"],
                     "requested_count": batch["requested_count"],
                     "completed_count": batch["completed_count"],
+                    "failed_count": batch["failed_count"],
+                    "variation_index": batch["variation_index"],
                     "created_at": batch["created_at"],
                     "error": batch["error"],
                 }
@@ -591,6 +609,32 @@ class BatchGenerationManager:
                 (JOB_RUNNING, _now_iso(), job_id.strip(), JOB_QUEUED),
             )
         return self.get_job_for_user(job_id, requested_by)
+
+    def try_claim_job(self, job_id: str, requested_by: int) -> bool:
+        """Atomically claim a queued job for one in-process worker.
+
+        ``False`` means another worker already claimed it or the job is
+        terminal. Ownership and missing-job errors remain explicit.
+        """
+
+        self._init_schema()
+        with self._db_lock, _db_connection() as connection:
+            row = connection.execute(
+                "SELECT requested_by, status FROM generation_jobs WHERE job_id = ?",
+                (job_id.strip(),),
+            ).fetchone()
+            if row is None:
+                raise BatchJobNotFoundError("指定されたjob_idが見つかりません。")
+            if str(row["requested_by"]) != str(requested_by):
+                raise BatchJobOwnershipError("他のユーザーのjobは操作できません。")
+            if str(row["status"]) != JOB_QUEUED:
+                return False
+            cursor = connection.execute(
+                "UPDATE generation_jobs SET status = ?, started_at = ? "
+                "WHERE job_id = ? AND status = ?",
+                (JOB_RUNNING, _now_iso(), job_id.strip(), JOB_QUEUED),
+            )
+            return cursor.rowcount == 1
 
     def update_progress(
         self,
@@ -716,8 +760,8 @@ class BatchGenerationManager:
             connection.execute(
                 """INSERT INTO generation_batches
                    (batch_id, job_id, prompt, negative_prompt, character, loras_json,
-                    checkpoint, requested_count, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    checkpoint, requested_count, variation_index, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     resolved_batch_id,
                     job_id.strip(),
@@ -727,6 +771,7 @@ class BatchGenerationManager:
                     serialized_loras,
                     str(checkpoint or ""),
                     requested_count,
+                    variation_index,
                     _now_iso(),
                 ),
             )
@@ -738,6 +783,7 @@ class BatchGenerationManager:
         requested_by: int,
         *,
         completed_count: int,
+        failed_count: int = 0,
         error: str = "",
     ) -> None:
         self._init_schema()
@@ -756,13 +802,55 @@ class BatchGenerationManager:
                 isinstance(completed_count, bool)
                 or not isinstance(completed_count, int)
                 or completed_count < 0
-                or completed_count > int(row["requested_count"])
+                or isinstance(failed_count, bool)
+                or not isinstance(failed_count, int)
+                or failed_count < 0
+                or completed_count + failed_count > int(row["requested_count"])
             ):
                 raise ValueError("batch進捗が不正です。")
             connection.execute(
-                "UPDATE generation_batches SET completed_count = ?, error = ? WHERE batch_id = ?",
-                (completed_count, _stored_error_text(error) if error else "", batch_id.strip()),
+                "UPDATE generation_batches SET completed_count = ?, failed_count = ?, error = ? "
+                "WHERE batch_id = ?",
+                (
+                    completed_count,
+                    failed_count,
+                    _stored_error_text(error) if error else "",
+                    batch_id.strip(),
+                ),
             )
+
+    def get_batch_specs_for_user(
+        self,
+        job_id: str,
+        requested_by: int,
+    ) -> tuple[BatchSpec, ...]:
+        """Return persisted Batch specs in deterministic variation order."""
+
+        job = self.get_job_for_user(job_id, requested_by)
+        specs: list[BatchSpec] = []
+        for batch in sorted(
+            job["batches"],
+            key=lambda item: (
+                int(item.get("variation_index") or 1),
+                str(item.get("created_at") or ""),
+                str(item.get("batch_id") or ""),
+            ),
+        ):
+            specs.append(
+                BatchSpec(
+                    batch_id=str(batch["batch_id"]),
+                    job_id=str(batch["job_id"]),
+                    prompt=str(batch.get("prompt") or ""),
+                    negative_prompt=str(batch.get("negative_prompt") or ""),
+                    character=str(batch.get("character") or ""),
+                    loras=_deserialize_loras(batch.get("loras", [])),
+                    checkpoint=str(batch.get("checkpoint") or ""),
+                    requested_count=int(batch.get("requested_count") or 0),
+                    created_at=str(batch.get("created_at") or ""),
+                    variation_index=int(batch.get("variation_index") or 1),
+                )
+            )
+        return tuple(specs)
 
     def recover_incomplete_jobs(self) -> int:
         """Mark jobs from a previous process as failed; never resume them."""
