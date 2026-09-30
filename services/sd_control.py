@@ -211,6 +211,9 @@ class SdGenerationOptions:
     # Gallery consumer.  Generation remains fully functional when unset.
     gallery_output_root: Path | None = None
     gallery_metadata: dict[str, Any] | None = None
+    # Only the fields named here are written back to the ComfyUI workflow.
+    # Normal /generate_ai options keep the workflow's existing defaults.
+    explicit_generation_fields: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -623,6 +626,11 @@ def validate_options(options: SdGenerationOptions) -> SdGenerationOptions:
     max_height = _max_int("SD_MAX_HEIGHT", 1024)
     max_steps = _max_int("SD_MAX_STEPS", 60)
     max_cfg = _max_float("SD_MAX_CFG", 20.0)
+    allowed_generation_fields = {"width", "height", "steps", "cfg", "sampler"}
+    explicit_generation_fields = frozenset(options.explicit_generation_fields)
+    unknown_generation_fields = explicit_generation_fields - allowed_generation_fields
+    if unknown_generation_fields:
+        raise ValueError("explicit_generation_fieldsに未対応の項目があります。")
 
     prompt = options.prompt if options.preserve_prompt_text else options.prompt.strip()
     if not prompt.strip():
@@ -712,6 +720,7 @@ def validate_options(options: SdGenerationOptions) -> SdGenerationOptions:
         pose_debug_enabled=bool(options.pose_debug_enabled),
         gallery_output_root=options.gallery_output_root,
         gallery_metadata=(None if options.gallery_metadata is None else dict(options.gallery_metadata)),
+        explicit_generation_fields=explicit_generation_fields,
     )
 
 
@@ -1068,6 +1077,61 @@ def _find_save_image_nodes(workflow: dict[str, Any]) -> list[str]:
         for node_id, node in workflow.items()
         if isinstance(node, dict) and str(node.get("class_type", "")) == "SaveImage"
     ]
+
+
+def _find_unique_node_by_class(workflow: dict[str, Any], class_type: str) -> str | None:
+    node_ids = [
+        str(node_id)
+        for node_id, node in workflow.items()
+        if isinstance(node, dict) and str(node.get("class_type", "")) == class_type
+    ]
+    if len(node_ids) > 1:
+        raise RuntimeError(f"ComfyUI workflow に{class_type}ノードが複数あります。")
+    return node_ids[0] if node_ids else None
+
+
+def _apply_explicit_generation_settings(
+    workflow: dict[str, Any], options: SdGenerationOptions
+) -> None:
+    fields = options.explicit_generation_fields
+    if not fields:
+        return
+
+    latent_fields = fields & {"width", "height"}
+    if latent_fields:
+        latent_node_id = _find_unique_node_by_class(workflow, "EmptyLatentImage")
+        if latent_node_id is None:
+            raise RuntimeError("明示された生成サイズに対応するEmptyLatentImageノードが見つかりません。")
+        latent_inputs = _node_inputs(workflow, latent_node_id)
+        if latent_inputs is None:
+            raise RuntimeError("EmptyLatentImageノードのinputsが不正です。")
+        for field in latent_fields:
+            if field not in latent_inputs:
+                raise RuntimeError(f"EmptyLatentImageノードに{field}入力がありません。")
+        if "width" in latent_fields:
+            _set_node_input(workflow, latent_node_id, "width", options.width)
+        if "height" in latent_fields:
+            _set_node_input(workflow, latent_node_id, "height", options.height)
+
+    sampler_fields = fields & {"steps", "cfg", "sampler"}
+    if sampler_fields:
+        sampler_node_id = _find_unique_node_by_class(workflow, "KSampler")
+        if sampler_node_id is None:
+            raise RuntimeError("明示された生成設定に対応するKSamplerノードが見つかりません。")
+        sampler_inputs = _node_inputs(workflow, sampler_node_id)
+        if sampler_inputs is None:
+            raise RuntimeError("KSamplerノードのinputsが不正です。")
+        input_names = {"sampler": "sampler_name"}
+        for field in sampler_fields:
+            input_name = input_names.get(field, field)
+            if input_name not in sampler_inputs:
+                raise RuntimeError(f"KSamplerノードに{input_name}入力がありません。")
+        if "steps" in sampler_fields:
+            _set_node_input(workflow, sampler_node_id, "steps", options.steps)
+        if "cfg" in sampler_fields:
+            _set_node_input(workflow, sampler_node_id, "cfg", options.cfg)
+        if "sampler" in sampler_fields:
+            _set_node_input(workflow, sampler_node_id, "sampler_name", options.sampler)
 
 
 def _extract_checkpoint_name(workflow: dict[str, Any]) -> str | None:
@@ -1479,6 +1543,8 @@ def _apply_comfy_options(
             [selection.strength for selection in loras],
             options.model_family,
         )
+
+    _apply_explicit_generation_settings(workflow, options)
 
     _set_node_input(workflow, positive_node_id, "text", positive_prompt)
     _set_node_input(workflow, negative_node_id, "text", options.negative_prompt or "")

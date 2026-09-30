@@ -312,6 +312,11 @@ def build_batch_image_options(
             pose_reference_content_type=None,
             gallery_output_root=get_gallery_images_root(),
             gallery_metadata=metadata,
+            explicit_generation_fields=frozenset(
+                field
+                for field in ("width", "height", "steps", "cfg", "sampler")
+                if field in config
+            ),
         )
     except BatchImageConfigurationError:
         raise

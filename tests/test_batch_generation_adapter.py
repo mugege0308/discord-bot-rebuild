@@ -68,6 +68,10 @@ class BatchGenerationAdapterTests(unittest.TestCase):
         self.assertIsNone(options.reference_image_bytes)
         self.assertIsNone(options.pose_reference_bytes)
         self.assertFalse(options.gallery_metadata["selection_ai"])
+        self.assertEqual(
+            frozenset({"width", "height", "steps", "cfg", "sampler"}),
+            options.explicit_generation_fields,
+        )
 
     def test_three_lora_slots_are_resolved_and_triggers_are_deduplicated(self):
         loras = self.loras()

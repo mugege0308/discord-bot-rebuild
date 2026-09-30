@@ -28,6 +28,9 @@ def _workflow(checkpoints: int = 1) -> dict:
                 "positive": ["positive", 0],
                 "negative": ["negative", 0],
                 "seed": 123,
+                "steps": 20,
+                "cfg": 5.0,
+                "sampler_name": "euler_ancestral",
             },
             "class_type": "KSampler",
         },
@@ -148,6 +151,71 @@ class ComfyCheckpointSelectionTestCase(unittest.TestCase):
 
         self.assertEqual(result["unrelated"], unrelated_before)
         self.assertEqual(result["checkpoint_0"]["inputs"]["other"], checkpoint_other_before)
+
+
+class ComfyGenerationSettingsTestCase(unittest.TestCase):
+    def _workflow_with_generation_nodes(self) -> dict:
+        workflow = _workflow()
+        workflow["latent"] = {
+            "inputs": {"width": 1024, "height": 1024, "batch_size": 1},
+            "class_type": "EmptyLatentImage",
+        }
+        workflow["sampler"]["inputs"]["latent_image"] = ["latent", 0]
+        return workflow
+
+    def test_explicit_generation_settings_are_applied_to_matching_nodes(self):
+        workflow = self._workflow_with_generation_nodes()
+        result, _, _ = _apply_comfy_options(
+            workflow,
+            SdGenerationOptions(
+                prompt="positive",
+                negative_prompt="negative",
+                width=512,
+                height=512,
+                steps=12,
+                cfg=5.0,
+                sampler="euler_ancestral",
+                explicit_generation_fields=frozenset({"width", "height", "steps", "cfg", "sampler"}),
+            ),
+        )
+        self.assertEqual(result["latent"]["inputs"]["width"], 512)
+        self.assertEqual(result["latent"]["inputs"]["height"], 512)
+        self.assertEqual(result["sampler"]["inputs"]["steps"], 12)
+        self.assertEqual(result["sampler"]["inputs"]["cfg"], 5.0)
+        self.assertEqual(result["sampler"]["inputs"]["sampler_name"], "euler_ancestral")
+
+    def test_unspecified_generation_settings_keep_workflow_defaults(self):
+        workflow = self._workflow_with_generation_nodes()
+        result, _, _ = _apply_comfy_options(
+            workflow,
+            SdGenerationOptions(prompt="positive", negative_prompt="negative"),
+        )
+        self.assertEqual(result["latent"]["inputs"]["width"], 1024)
+        self.assertEqual(result["latent"]["inputs"]["height"], 1024)
+        self.assertEqual(result["sampler"]["inputs"]["steps"], 20)
+        self.assertEqual(result["sampler"]["inputs"]["cfg"], 5.0)
+        self.assertEqual(result["sampler"]["inputs"]["sampler_name"], "euler_ancestral")
+
+    def test_explicit_settings_fail_when_matching_node_is_missing(self):
+        with self.assertRaisesRegex(RuntimeError, "EmptyLatentImage"):
+            _apply_comfy_options(
+                _workflow(),
+                SdGenerationOptions(
+                    prompt="positive",
+                    negative_prompt="negative",
+                    width=512,
+                    explicit_generation_fields=frozenset({"width"}),
+                ),
+            )
+
+    def test_unknown_explicit_generation_field_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "explicit_generation_fields"):
+            validate_options(
+                SdGenerationOptions(
+                    prompt="positive",
+                    explicit_generation_fields=frozenset({"scheduler"}),
+                )
+            )
 
     def test_animagine_filename_prefix_is_applied_to_single_save_node(self):
         workflow = _workflow()
