@@ -310,6 +310,7 @@ _worker = BatchGenerationWorker()
 _worker_tasks: dict[str, asyncio.Task[object]] = {}
 _review_tasks: dict[str, asyncio.Task[object]] = {}
 _watch_tasks: dict[str, asyncio.Task[object]] = {}
+_gallery_followup_tasks: dict[str, asyncio.Task[object]] = {}
 _shutting_down = False
 
 
@@ -329,6 +330,20 @@ def _watch_task_done(job_id: str, task: asyncio.Task[object]) -> None:
     error = task.exception()
     if error is not None:
         logger.error("Batch progress watcher failed: job=%s error=%s", job_id, error, exc_info=error)
+
+
+def _gallery_followup_task_done(job_id: str, task: asyncio.Task[object]) -> None:
+    _gallery_followup_tasks.pop(job_id, None)
+    if task.cancelled():
+        return
+    error = task.exception()
+    if error is not None:
+        logger.error(
+            "Batch Gallery follow-up failed: job=%s error=%s",
+            job_id,
+            error,
+            exc_info=error,
+        )
 
 
 def _generation_task_done(job_id: str, requested_by: int, task: asyncio.Task[object]) -> None:
@@ -382,6 +397,9 @@ async def shutdown() -> None:
     _worker.shutdown()
     for task in list(_watch_tasks.values()):
         task.cancel()
+    watch_tasks = list(_watch_tasks.values())
+    if watch_tasks:
+        await asyncio.gather(*watch_tasks, return_exceptions=True)
     generation_tasks = list(_worker_tasks.values())
     if generation_tasks:
         await asyncio.gather(*generation_tasks, return_exceptions=True)
@@ -390,10 +408,16 @@ async def shutdown() -> None:
     review_tasks = list(_review_tasks.values())
     if review_tasks:
         await asyncio.gather(*review_tasks, return_exceptions=True)
+    for task in list(_gallery_followup_tasks.values()):
+        task.cancel()
+    gallery_followup_tasks = list(_gallery_followup_tasks.values())
+    if gallery_followup_tasks:
+        await asyncio.gather(*gallery_followup_tasks, return_exceptions=True)
     await shutdown_gallery_review_queue()
     _worker_tasks.clear()
     _review_tasks.clear()
     _watch_tasks.clear()
+    _gallery_followup_tasks.clear()
 
 
 def _review_state_callback(job_id: str, requested_by: int):
@@ -537,6 +561,76 @@ async def _terminal_gallery_context(
     return status, summary, error_text
 
 
+async def _send_gallery_followup(
+    interaction: discord.Interaction,
+    job_id: str,
+) -> None:
+    """Send optional Gallery information after the terminal Batch notice.
+
+    This task is deliberately one-shot.  Gallery review ingestion/retry stays
+    in ``gallery_review_queue``; this task only attempts to add a link/summary
+    without delaying or changing the already-published generation result.
+    """
+
+    try:
+        job = await asyncio.to_thread(
+            manager.get_job_for_user,
+            job_id,
+            interaction.user.id,
+        )
+        status, summary, gallery_error = await _terminal_gallery_context(
+            job_id,
+            start=int(job.get("completed_count") or 0) > 0,
+        )
+        if status is None and summary is None:
+            if gallery_error:
+                logger.warning(
+                    "Gallery follow-up unavailable: job=%s error=%s",
+                    job_id,
+                    gallery_error,
+                )
+            return
+        view = _build_gallery_view(interaction.user.id, job_id, status)
+        await interaction.followup.send(
+            _format_job(
+                job,
+                heading="Gallery情報",
+                summary=summary,
+                gallery_error=gallery_error,
+            ),
+            view=view,
+            ephemeral=True,
+            wait=True,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.warning(
+            "Could not publish Batch Gallery follow-up: job=%s",
+            job_id,
+            exc_info=True,
+        )
+
+
+def _schedule_gallery_followup(
+    interaction: discord.Interaction,
+    job_id: str,
+) -> None:
+    if _shutting_down:
+        return
+    existing = _gallery_followup_tasks.get(job_id)
+    if existing is not None and not existing.done():
+        return
+    task = asyncio.create_task(
+        _send_gallery_followup(interaction, job_id),
+        name=f"batch-gallery-followup-{job_id}",
+    )
+    _gallery_followup_tasks[job_id] = task
+    task.add_done_callback(
+        lambda completed: _gallery_followup_task_done(job_id, completed)
+    )
+
+
 async def _publish_progress(
     interaction: discord.Interaction,
     message: discord.Message | None,
@@ -566,6 +660,7 @@ async def _watch_job(
 
     last_signature = ""
     last_edit = 0.0
+    completion_published = False
     try:
         for _ in range(7200):
             await asyncio.sleep(PROGRESS_POLL_SECONDS)
@@ -578,7 +673,12 @@ async def _watch_job(
             review_pending = (
                 bool(job.get("auto_review_enabled"))
                 and int(job.get("completed_count") or 0) > 0
-                and review_status in {"not_requested", "queued", "starting", "running"}
+                and review_status in {
+                    "not_requested",
+                    "queued",
+                    "starting",
+                    "running",
+                }
             )
             signature = ":".join(
                 str(job.get(key) or "")
@@ -592,32 +692,27 @@ async def _watch_job(
                 )
             )
             now = time.monotonic()
-            if terminal and not review_pending:
-                gallery_status, summary, gallery_error = await _terminal_gallery_context(
-                    job_id,
-                    start=int(job.get("completed_count") or 0) > 0,
-                )
-                view = _build_gallery_view(
-                    interaction.user.id,
-                    job_id,
-                    gallery_status,
-                )
+            if terminal:
                 heading = "大量生成完了"
                 if status == "failed":
                     heading = "大量生成失敗"
                 elif status == "cancelled":
                     heading = "大量生成をキャンセルしました"
-                progress_message = await _publish_progress(
-                    interaction,
-                    progress_message,
-                    _format_job(
-                        job,
-                        heading=heading,
-                        summary=summary,
-                        gallery_error=gallery_error,
-                    ),
-                    view=view,
-                )
+                if not completion_published:
+                    progress_message = await _publish_progress(
+                        interaction,
+                        progress_message,
+                        _format_job(job, heading=heading),
+                    )
+                    completion_published = True
+                if review_pending:
+                    # The result is already announced.  Wait only for the
+                    # existing review queue's terminal state before asking
+                    # for optional Gallery context; no Gallery API call is
+                    # made from this polling loop.
+                    await asyncio.sleep(PROGRESS_POLL_SECONDS)
+                    continue
+                _schedule_gallery_followup(interaction, job_id)
                 return
             if signature != last_signature and now - last_edit >= PROGRESS_EDIT_INTERVAL_SECONDS:
                 heading = "大量生成中"

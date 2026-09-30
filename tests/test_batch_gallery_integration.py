@@ -65,6 +65,18 @@ class BatchGalleryReviewTests(unittest.IsolatedAsyncioTestCase):
 
 
 class BatchProgressMessageTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        generate_batch._shutting_down = False
+        generate_batch._gallery_followup_tasks.clear()
+
+    async def asyncTearDown(self):
+        tasks = list(generate_batch._gallery_followup_tasks.values())
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        generate_batch._gallery_followup_tasks.clear()
+
     async def test_terminal_watcher_publishes_gallery_summary_and_link(self):
         interaction = SimpleNamespace(user=SimpleNamespace(id=123), followup=SimpleNamespace(send=AsyncMock()))
         message = Mock()
@@ -87,9 +99,103 @@ class BatchProgressMessageTests(unittest.IsolatedAsyncioTestCase):
         ):
             await generate_batch._watch_job(interaction, "job-1", message)
 
+            followup = generate_batch._gallery_followup_tasks["job-1"]
+            await followup
+
         publish.assert_awaited_once()
-        self.assertIn("Gallery: 2枚", publish.call_args.args[2])
-        self.assertIsNotNone(publish.call_args.kwargs["view"])
+        self.assertNotIn("Gallery: 2枚", publish.call_args.args[2])
+        interaction.followup.send.assert_awaited_once()
+        self.assertIn("Gallery: 2枚", interaction.followup.send.call_args.args[0])
+        self.assertIsNotNone(interaction.followup.send.call_args.kwargs["view"])
+
+    async def test_completion_is_published_before_delayed_gallery_summary(self):
+        interaction = SimpleNamespace(user=SimpleNamespace(id=123), followup=SimpleNamespace(send=AsyncMock()))
+        message = Mock()
+        release_gallery = asyncio.Event()
+
+        async def delayed_gallery(*args, **kwargs):
+            await release_gallery.wait()
+            return None, {"total": 2, "ai_scored": 0}, ""
+
+        with (
+            patch.object(generate_batch, "PROGRESS_POLL_SECONDS", 0),
+            patch.object(generate_batch.manager, "get_job_for_user", return_value=_job(auto_review=False)),
+            patch.object(generate_batch, "_terminal_gallery_context", side_effect=delayed_gallery),
+            patch.object(generate_batch, "_publish_progress", new=AsyncMock(return_value=message)) as publish,
+        ):
+            await generate_batch._watch_job(interaction, "job-1", message)
+            publish.assert_awaited_once()
+            self.assertIn("状態: **completed**", publish.call_args.args[2])
+            self.assertNotIn("Gallery:", publish.call_args.args[2])
+            self.assertFalse(interaction.followup.send.await_count)
+
+            release_gallery.set()
+            await generate_batch._gallery_followup_tasks["job-1"]
+
+        interaction.followup.send.assert_awaited_once()
+        self.assertIn("Gallery: 2枚", interaction.followup.send.call_args.args[0])
+
+    async def test_gallery_timeout_does_not_change_completion_or_send_retry(self):
+        interaction = SimpleNamespace(user=SimpleNamespace(id=123), followup=SimpleNamespace(send=AsyncMock()))
+        message = Mock()
+        with (
+            patch.object(generate_batch, "PROGRESS_POLL_SECONDS", 0),
+            patch.object(generate_batch.manager, "get_job_for_user", return_value=_job(auto_review=False)),
+            patch.object(
+                generate_batch,
+                "_terminal_gallery_context",
+                new=AsyncMock(return_value=(None, None, "summary timeout")),
+            ),
+            patch.object(generate_batch, "_publish_progress", new=AsyncMock(return_value=message)) as publish,
+        ):
+            await generate_batch._watch_job(interaction, "job-1", message)
+            await generate_batch._gallery_followup_tasks["job-1"]
+
+        publish.assert_awaited_once()
+        self.assertIn("状態: **completed**", publish.call_args.args[2])
+        interaction.followup.send.assert_not_awaited()
+
+    async def test_gallery_followup_notification_failure_is_best_effort(self):
+        interaction = SimpleNamespace(
+            user=SimpleNamespace(id=123),
+            followup=SimpleNamespace(send=AsyncMock(side_effect=RuntimeError("Discord unavailable"))),
+        )
+        message = Mock()
+        status = SimpleNamespace(
+            urls=SimpleNamespace(local="http://127.0.0.1:8765/", tailscale=()),
+        )
+        with (
+            patch.object(generate_batch.manager, "get_job_for_user", return_value=_job(auto_review=False)),
+            patch.object(
+                generate_batch,
+                "_terminal_gallery_context",
+                new=AsyncMock(return_value=(status, {"total": 2, "ai_scored": 0}, "")),
+            ),
+        ):
+            generate_batch._schedule_gallery_followup(interaction, "job-1")
+            await generate_batch._gallery_followup_tasks["job-1"]
+
+        interaction.followup.send.assert_awaited_once()
+
+    async def test_shutdown_cancels_pending_gallery_followup(self):
+        interaction = SimpleNamespace(user=SimpleNamespace(id=123), followup=SimpleNamespace(send=AsyncMock()))
+        release_gallery = asyncio.Event()
+
+        async def blocked_gallery(*args, **kwargs):
+            await release_gallery.wait()
+            return None, {"total": 1}, ""
+
+        with (
+            patch.object(generate_batch.manager, "get_job_for_user", return_value=_job(auto_review=False)),
+            patch.object(generate_batch, "_terminal_gallery_context", side_effect=blocked_gallery),
+            patch.object(generate_batch._worker, "shutdown"),
+            patch.object(generate_batch, "shutdown_gallery_review_queue", new=AsyncMock()),
+        ):
+            generate_batch._schedule_gallery_followup(interaction, "job-1")
+            await asyncio.sleep(0)
+            await generate_batch.shutdown()
+
+        self.assertFalse(generate_batch._gallery_followup_tasks)
 
 
 if __name__ == "__main__":
