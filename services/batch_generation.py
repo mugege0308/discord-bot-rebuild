@@ -53,6 +53,7 @@ JOB_CANCELLED = "cancelled"
 TERMINAL_JOB_STATES = frozenset({JOB_COMPLETED, JOB_FAILED, JOB_CANCELLED})
 ACTIVE_JOB_STATES = frozenset({JOB_QUEUED, JOB_RUNNING})
 VALID_JOB_STATES = ACTIVE_JOB_STATES | TERMINAL_JOB_STATES
+VALID_REVIEW_STATES = frozenset({"not_requested", "queued", "starting", "running", "completed", "failed"})
 
 VARIATION_COMPOSITIONS = ("portrait", "upper body", "cowboy shot", "full body")
 VARIATION_ANGLES = ("front view", "three-quarter view", "side view")
@@ -406,6 +407,7 @@ class BatchGenerationManager:
                         cancel_requested INTEGER NOT NULL DEFAULT 0,
                         review_status TEXT NOT NULL DEFAULT 'not_requested',
                         review_job_id TEXT NOT NULL DEFAULT '',
+                        review_error TEXT NOT NULL DEFAULT '',
                         error TEXT NOT NULL DEFAULT '',
                         config_json TEXT NOT NULL DEFAULT '{}'
                     );
@@ -432,6 +434,16 @@ class BatchGenerationManager:
                         ON generation_batches(job_id, created_at);
                     """
                 )
+                job_columns = {
+                    str(row[1])
+                    for row in connection.execute(
+                        "PRAGMA table_info(generation_jobs)"
+                    ).fetchall()
+                }
+                if "review_error" not in job_columns:
+                    connection.execute(
+                        "ALTER TABLE generation_jobs ADD COLUMN review_error TEXT NOT NULL DEFAULT ''"
+                    )
                 columns = {
                     str(row[1])
                     for row in connection.execute(
@@ -538,6 +550,7 @@ class BatchGenerationManager:
             "cancel_requested": bool(row["cancel_requested"]),
             "review_status": row["review_status"],
             "review_job_id": row["review_job_id"],
+            "review_error": row["review_error"],
             "error": row["error"],
             "variation_count": int(config.get("variation_count") or 0),
             "images_per_variation": int(
@@ -698,6 +711,38 @@ class BatchGenerationManager:
                 "UPDATE generation_jobs SET status = ?, finished_at = ?, error = ?, "
                 "current_batch_id = '', current_prompt = '' WHERE job_id = ?",
                 (status, _now_iso(), _stored_error_text(error) if error else "", job_id.strip()),
+            )
+        return self.get_job_for_user(job_id, requested_by)
+
+    def update_review_status(
+        self,
+        job_id: str,
+        requested_by: int,
+        *,
+        status: str,
+        review_job_id: str = "",
+        error: str = "",
+    ) -> dict[str, Any]:
+        """Persist optional Gallery review state without changing job state.
+
+        Gallery is an optional consumer: a review failure is recorded in its
+        own field and never turns a successfully generated Batch into a
+        failed job or changes its image counters.
+        """
+
+        if status not in VALID_REVIEW_STATES:
+            raise ValueError("review状態が不正です。")
+        self._require_owned_row(job_id, requested_by)
+        with self._db_lock, _db_connection() as connection:
+            connection.execute(
+                "UPDATE generation_jobs SET review_status = ?, review_job_id = ?, review_error = ? "
+                "WHERE job_id = ?",
+                (
+                    status,
+                    str(review_job_id or ""),
+                    _stored_error_text(error) if error else "",
+                    job_id.strip(),
+                ),
             )
         return self.get_job_for_user(job_id, requested_by)
 

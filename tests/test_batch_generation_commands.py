@@ -83,14 +83,24 @@ class BatchCommandCallbackTests(unittest.IsolatedAsyncioTestCase):
             patch.object(generate_batch.manager, "create_job", return_value="job-1") as create_job,
             patch.object(generate_batch, "_build_specs") as build_specs,
             patch.object(generate_batch, "start_job", return_value=True) as start_job,
+            patch.object(generate_batch, "_start_progress_watch") as start_watch,
             patch.object(generate_batch.manager, "get_job_for_user", return_value=job),
             patch.object(generate_batch, "_save_last_batch_request"),
         ):
-            await callback(interaction, "test-character", total_count=2)
+            await callback(
+                interaction,
+                "test-character",
+                total_count=2,
+                auto_review_enabled=True,
+            )
 
         create_job.assert_called_once()
+        self.assertTrue(create_job.call_args.args[0].auto_review_enabled)
         build_specs.assert_called_once()
         start_job.assert_called_once_with("job-1", 123)
+        start_watch.assert_called_once()
+        self.assertIs(interaction, start_watch.call_args.args[0])
+        self.assertEqual("job-1", start_watch.call_args.args[1])
         interaction.response.defer.assert_awaited_once()
         self.assertIn("job-1", interaction.followup.send.await_args.args[0])
 
@@ -148,6 +158,7 @@ class BatchCommandCallbackTests(unittest.IsolatedAsyncioTestCase):
             patch.object(generate_batch.manager, "repeat_job", return_value="job-2") as repeat_job,
             patch.object(generate_batch, "_build_specs") as build_specs,
             patch.object(generate_batch, "start_job", return_value=True) as start_job,
+            patch.object(generate_batch, "_start_progress_watch"),
             patch.object(generate_batch, "_save_last_batch_request"),
             patch.object(
                 generate_batch.manager,

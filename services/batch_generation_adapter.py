@@ -20,6 +20,7 @@ from services.batch_generation import (
     manager as batch_manager,
 )
 from services.image_generation_profiles import get_image_generation_profile
+from services.gallery_control import get_gallery_images_root
 from services.sd_control import (
     GeneratedImage,
     SdGenerationOptions,
@@ -309,6 +310,7 @@ def build_batch_image_options(
             reference_mode="none",
             pose_reference_bytes=None,
             pose_reference_content_type=None,
+            gallery_output_root=get_gallery_images_root(),
             gallery_metadata=metadata,
         )
     except BatchImageConfigurationError:

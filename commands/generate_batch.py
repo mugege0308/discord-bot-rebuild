@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from pathlib import Path
+import time
 from typing import Any
 
 import discord
@@ -31,6 +31,17 @@ from services.generate_ai_last_settings import (
     get_last_model_key,
     get_last_settings,
     save_last_batch_settings,
+)
+from services.gallery_control import (
+    GalleryStatus,
+    gallery_job_url,
+    get_gallery_job_summary,
+    get_gallery_status,
+    start_gallery,
+)
+from services.gallery_review_queue import (
+    enqueue_gallery_review,
+    shutdown_gallery_review_queue,
 )
 from services.image_generation_profiles import (
     DEFAULT_IMAGE_GENERATION_MODEL_KEY,
@@ -67,6 +78,8 @@ RATING_CHOICES = [
     app_commands.Choice(name="NSFW", value="nsfw"),
     app_commands.Choice(name="Explicit", value="explicit"),
 ]
+PROGRESS_POLL_SECONDS = 5
+PROGRESS_EDIT_INTERVAL_SECONDS = 10
 
 
 def _lora_choices(lora_type: str) -> list[app_commands.Choice[str]]:
@@ -240,6 +253,7 @@ def _save_last_batch_request(request: BatchGenerationRequest) -> None:
                 "variation_enabled": request.variation_enabled,
                 "variation_count": request.effective_variation_count,
                 "images_per_variation": request.effective_images_per_variation,
+                "auto_review_enabled": request.auto_review_enabled,
                 "rating": request.rating,
             },
         )
@@ -247,7 +261,13 @@ def _save_last_batch_request(request: BatchGenerationRequest) -> None:
         logger.warning("Could not save last Batch settings.", exc_info=True)
 
 
-def _format_job(job: dict[str, Any], *, heading: str = "大量生成ジョブ") -> str:
+def _format_job(
+    job: dict[str, Any],
+    *,
+    heading: str = "大量生成ジョブ",
+    summary: dict[str, Any] | None = None,
+    gallery_error: str = "",
+) -> str:
     status = str(job.get("status") or "unknown")
     completed = int(job.get("completed_count") or 0)
     failed = int(job.get("failed_count") or 0)
@@ -262,25 +282,75 @@ def _format_job(job: dict[str, Any], *, heading: str = "大量生成ジョブ") 
     current = str(job.get("current_batch_id") or "")
     if current:
         lines.append(f"現在のbatch: `{current}`")
+    review_status = str(job.get("review_status") or "not_requested")
+    if review_status != "not_requested":
+        review_job_id = str(job.get("review_job_id") or "")
+        suffix = f" ({review_job_id})" if review_job_id else ""
+        lines.append(f"Gallery AIレビュー: {review_status}{suffix}")
+    if summary is not None:
+        lines.append(
+            "Gallery: "
+            f"{int(summary.get('total') or 0)}枚 / "
+            f"AI評価済み {int(summary.get('ai_scored') or 0)}枚"
+        )
     if status == "cancelled":
         lines.append("現在処理中の1枚が終わった後、未処理分を停止しました。")
     error = str(job.get("error") or "").strip()
     if error:
         lines.append(f"エラー: {error[:360]}")
+    review_error = str(job.get("review_error") or "").strip()
+    if review_error:
+        lines.append(f"Galleryレビュー: {review_error[:360]}")
+    if gallery_error:
+        lines.append(f"Galleryリンク/summaryを取得できませんでした。/gallery open を試してください。")
     return "\n".join(lines)
 
 
 _worker = BatchGenerationWorker()
 _worker_tasks: dict[str, asyncio.Task[object]] = {}
+_review_tasks: dict[str, asyncio.Task[object]] = {}
+_watch_tasks: dict[str, asyncio.Task[object]] = {}
+_shutting_down = False
 
 
-def _task_done(job_id: str, task: asyncio.Task[object]) -> None:
+def _review_task_done(job_id: str, task: asyncio.Task[object]) -> None:
+    _review_tasks.pop(job_id, None)
+    if task.cancelled():
+        return
+    error = task.exception()
+    if error is not None:
+        logger.error("Batch Gallery review task failed: job=%s error=%s", job_id, error, exc_info=error)
+
+
+def _watch_task_done(job_id: str, task: asyncio.Task[object]) -> None:
+    _watch_tasks.pop(job_id, None)
+    if task.cancelled():
+        return
+    error = task.exception()
+    if error is not None:
+        logger.error("Batch progress watcher failed: job=%s error=%s", job_id, error, exc_info=error)
+
+
+def _generation_task_done(job_id: str, requested_by: int, task: asyncio.Task[object]) -> None:
     _worker_tasks.pop(job_id, None)
     if task.cancelled():
         return
     error = task.exception()
     if error is not None:
         logger.error("Batch worker task failed: job=%s error=%s", job_id, error, exc_info=error)
+        return
+    if _shutting_down:
+        return
+    review_task = asyncio.create_task(
+        _post_generation_review(job_id, requested_by),
+        name=f"batch-gallery-review-{job_id}",
+    )
+    _review_tasks[job_id] = review_task
+    review_task.add_done_callback(lambda completed: _review_task_done(job_id, completed))
+
+
+async def _run_generation_job(job_id: str, requested_by: int) -> object:
+    return await asyncio.to_thread(_worker.run_job, job_id, requested_by)
 
 
 def start_job(job_id: str, requested_by: int) -> bool:
@@ -290,11 +360,13 @@ def start_job(job_id: str, requested_by: int) -> bool:
     if existing is not None and not existing.done():
         return False
     task = asyncio.create_task(
-        asyncio.to_thread(_worker.run_job, job_id, requested_by),
+        _run_generation_job(job_id, requested_by),
         name=f"batch-generation-command-{job_id}",
     )
     _worker_tasks[job_id] = task
-    task.add_done_callback(lambda completed: _task_done(job_id, completed))
+    task.add_done_callback(
+        lambda completed: _generation_task_done(job_id, requested_by, completed)
+    )
     return True
 
 
@@ -305,11 +377,281 @@ def recover_incomplete_jobs() -> int:
 async def shutdown() -> None:
     """Stop command-launched workers after the current image returns."""
 
+    global _shutting_down
+    _shutting_down = True
     _worker.shutdown()
-    tasks = list(_worker_tasks.values())
-    if tasks:
-        await asyncio.gather(*tasks, return_exceptions=True)
+    for task in list(_watch_tasks.values()):
+        task.cancel()
+    generation_tasks = list(_worker_tasks.values())
+    if generation_tasks:
+        await asyncio.gather(*generation_tasks, return_exceptions=True)
+    for task in list(_review_tasks.values()):
+        task.cancel()
+    review_tasks = list(_review_tasks.values())
+    if review_tasks:
+        await asyncio.gather(*review_tasks, return_exceptions=True)
+    await shutdown_gallery_review_queue()
     _worker_tasks.clear()
+    _review_tasks.clear()
+    _watch_tasks.clear()
+
+
+def _review_state_callback(job_id: str, requested_by: int):
+    def callback(state: str, details: dict[str, Any]) -> None:
+        normalized = "running" if state == "starting" else state
+        try:
+            manager.update_review_status(
+                job_id,
+                requested_by,
+                status=normalized,
+                review_job_id=str(details.get("review_job_id") or ""),
+                error=str(details.get("error") or "") if normalized == "failed" else "",
+            )
+        except Exception:
+            logger.warning("Could not persist Batch Gallery review state: job=%s state=%s", job_id, state, exc_info=True)
+
+    return callback
+
+
+async def _post_generation_review(job_id: str, requested_by: int) -> None:
+    """Start optional Gallery review after generation without changing job state."""
+
+    try:
+        job = await asyncio.to_thread(manager.get_job_for_user, job_id, requested_by)
+        if not job.get("auto_review_enabled") or int(job.get("completed_count") or 0) <= 0:
+            if job.get("auto_review_enabled") and int(job.get("completed_count") or 0) <= 0:
+                await asyncio.to_thread(
+                    manager.update_review_status,
+                    job_id,
+                    requested_by,
+                    status="failed",
+                    error="AI評価対象の生成画像がありません。",
+                )
+            return
+        expected = int(job["completed_count"])
+        await asyncio.to_thread(
+            manager.update_review_status,
+            job_id,
+            requested_by,
+            status="queued",
+        )
+        future = enqueue_gallery_review(
+            job_id,
+            expected,
+            on_state=_review_state_callback(job_id, requested_by),
+        )
+        result = await future
+        if str(result.get("status") or "") == "completed":
+            await asyncio.to_thread(
+                manager.update_review_status,
+                job_id,
+                requested_by,
+                status="completed",
+                review_job_id=str(result.get("review_job_id") or ""),
+            )
+        else:
+            await asyncio.to_thread(
+                manager.update_review_status,
+                job_id,
+                requested_by,
+                status="failed",
+                review_job_id=str(result.get("review_job_id") or ""),
+                error=str(result.get("error") or "Gallery AIレビューに失敗しました。"),
+            )
+    except asyncio.CancelledError:
+        raise
+    except Exception as error:
+        logger.warning("Batch Gallery review was skipped: job=%s error=%s", job_id, error, exc_info=True)
+        try:
+            await asyncio.to_thread(
+                manager.update_review_status,
+                job_id,
+                requested_by,
+                status="failed",
+                error=str(error),
+            )
+        except Exception:
+            logger.warning("Could not persist Batch Gallery review failure: job=%s", job_id, exc_info=True)
+
+
+class BatchGalleryView(discord.ui.View):
+    def __init__(self, owner_id: int, job_id: str, url: str) -> None:
+        super().__init__(timeout=24 * 60 * 60)
+        self.owner_id = owner_id
+        self.job_id = job_id
+        self.add_item(
+            discord.ui.Button(
+                label="GalleryでBatchを見る",
+                style=discord.ButtonStyle.link,
+                url=gallery_job_url(url, job_id),
+            )
+        )
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message(
+                "このボタンは実行者本人だけが使えます。", ephemeral=True
+            )
+            return False
+        return True
+
+
+def _build_gallery_view(
+    owner_id: int,
+    job_id: str,
+    status: GalleryStatus | None,
+) -> BatchGalleryView | None:
+    if status is None:
+        return None
+    urls = status.urls
+    url = urls.tailscale[0] if urls.tailscale else urls.local
+    return BatchGalleryView(owner_id, job_id, url) if url else None
+
+
+async def _terminal_gallery_context(
+    job_id: str,
+    *,
+    start: bool,
+) -> tuple[GalleryStatus | None, dict[str, Any] | None, str]:
+    status: GalleryStatus | None = None
+    error_text = ""
+    try:
+        if start:
+            started = await asyncio.to_thread(start_gallery)
+            status = started.status
+        else:
+            status = await asyncio.to_thread(get_gallery_status)
+    except Exception as error:
+        error_text = str(error)
+        logger.warning("Could not prepare Gallery link for Batch job=%s: %s", job_id, error)
+        try:
+            status = await asyncio.to_thread(get_gallery_status)
+        except Exception:
+            logger.warning("Could not read Gallery status for Batch job=%s", job_id, exc_info=True)
+    summary: dict[str, Any] | None = None
+    try:
+        summary = await asyncio.to_thread(get_gallery_job_summary, job_id)
+    except Exception as error:
+        error_text = error_text or str(error)
+        logger.warning("Could not read Gallery summary for Batch job=%s: %s", job_id, error)
+    return status, summary, error_text
+
+
+async def _publish_progress(
+    interaction: discord.Interaction,
+    message: discord.Message | None,
+    content: str,
+    *,
+    view: discord.ui.View | None = None,
+) -> discord.Message | None:
+    if message is not None:
+        try:
+            await message.edit(content=content, view=view)
+            return message
+        except Exception:
+            logger.warning("Could not edit Batch progress message.", exc_info=True)
+    try:
+        return await interaction.followup.send(content, view=view, ephemeral=True, wait=True)
+    except Exception:
+        logger.warning("Could not send Batch progress message.", exc_info=True)
+        return message
+
+
+async def _watch_job(
+    interaction: discord.Interaction,
+    job_id: str,
+    progress_message: discord.Message | None,
+) -> None:
+    """Edit one acknowledgement message and publish one terminal summary."""
+
+    last_signature = ""
+    last_edit = 0.0
+    try:
+        for _ in range(7200):
+            await asyncio.sleep(PROGRESS_POLL_SECONDS)
+            job = await asyncio.to_thread(
+                manager.get_job_for_user, job_id, interaction.user.id
+            )
+            status = str(job.get("status") or "unknown")
+            terminal = status in {"completed", "failed", "cancelled"}
+            review_status = str(job.get("review_status") or "not_requested")
+            review_pending = (
+                bool(job.get("auto_review_enabled"))
+                and int(job.get("completed_count") or 0) > 0
+                and review_status in {"not_requested", "queued", "starting", "running"}
+            )
+            signature = ":".join(
+                str(job.get(key) or "")
+                for key in (
+                    "status",
+                    "completed_count",
+                    "failed_count",
+                    "current_batch_id",
+                    "review_status",
+                    "review_job_id",
+                )
+            )
+            now = time.monotonic()
+            if terminal and not review_pending:
+                gallery_status, summary, gallery_error = await _terminal_gallery_context(
+                    job_id,
+                    start=int(job.get("completed_count") or 0) > 0,
+                )
+                view = _build_gallery_view(
+                    interaction.user.id,
+                    job_id,
+                    gallery_status,
+                )
+                heading = "大量生成完了"
+                if status == "failed":
+                    heading = "大量生成失敗"
+                elif status == "cancelled":
+                    heading = "大量生成をキャンセルしました"
+                progress_message = await _publish_progress(
+                    interaction,
+                    progress_message,
+                    _format_job(
+                        job,
+                        heading=heading,
+                        summary=summary,
+                        gallery_error=gallery_error,
+                    ),
+                    view=view,
+                )
+                return
+            if signature != last_signature and now - last_edit >= PROGRESS_EDIT_INTERVAL_SECONDS:
+                heading = "大量生成中"
+                if terminal and review_pending:
+                    heading = "生成完了・Gallery AIレビュー中"
+                progress_message = await _publish_progress(
+                    interaction,
+                    progress_message,
+                    _format_job(job, heading=heading),
+                )
+                last_signature = signature
+                last_edit = now
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.warning("Batch progress watcher stopped: job=%s", job_id, exc_info=True)
+    finally:
+        _watch_tasks.pop(job_id, None)
+
+
+def _start_progress_watch(
+    interaction: discord.Interaction,
+    job_id: str,
+    progress_message: discord.Message | None,
+) -> None:
+    existing = _watch_tasks.get(job_id)
+    if existing is not None and not existing.done():
+        return
+    task = asyncio.create_task(
+        _watch_job(interaction, job_id, progress_message),
+        name=f"batch-progress-{job_id}",
+    )
+    _watch_tasks[job_id] = task
+    task.add_done_callback(lambda completed: _watch_task_done(job_id, completed))
 
 
 def _resolve_target(job_id: str, user_id: int) -> str | None:
@@ -352,6 +694,7 @@ def setup(client: discord.Client) -> None:
         additional_lora="未指定時は前回値。なしで解除",
         rating="未指定時は前回Batch→/generate_ai→Auto",
         variation_enabled="variationを使うか",
+        auto_review_enabled="生成完了後、このjobだけGallery AIレビュー。未指定時は前回値",
     )
     async def generate_batch_create(
         interaction: discord.Interaction,
@@ -367,6 +710,7 @@ def setup(client: discord.Client) -> None:
         additional_lora: app_commands.Choice[str] | None = None,
         rating: app_commands.Choice[str] | None = None,
         variation_enabled: bool | None = None,
+        auto_review_enabled: bool | None = None,
     ) -> None:
         if await reject_if_unavailable(interaction):
             return
@@ -396,6 +740,11 @@ def setup(client: discord.Client) -> None:
                 resolved_images = images_per_prompt if images_per_prompt is not None else int(previous.get("images_per_variation") or DEFAULT_IMAGES_PER_VARIATION)
                 resolved_variations = int(previous["variation_count"]) if total_count is None and images_per_prompt is None and previous.get("variation_count") else None
             resolved_variation = variation_enabled if variation_enabled is not None else bool(previous.get("variation_enabled", True))
+            resolved_auto_review = (
+                auto_review_enabled
+                if auto_review_enabled is not None
+                else bool(previous.get("auto_review_enabled", False))
+            )
             effective_text = request_text if request_text is not None else str(previous.get("request_text") or "")
             request = BatchGenerationRequest(
                 requested_by=interaction.user.id,
@@ -408,6 +757,7 @@ def setup(client: discord.Client) -> None:
                 loras=loras,
                 request_text=effective_text,
                 variation_enabled=resolved_variation,
+                auto_review_enabled=resolved_auto_review,
                 rating=resolved_rating,
             )
             job_id = await asyncio.to_thread(manager.create_job, request)
@@ -431,7 +781,12 @@ def setup(client: discord.Client) -> None:
             logger.exception("Unexpected /generate_batch create failure.")
             await interaction.followup.send("大量生成ジョブの作成に失敗しました。Botログを確認してください。", ephemeral=True)
             return
-        await interaction.followup.send(_format_job(job, heading="大量生成ジョブを受け付けました"), ephemeral=True)
+        progress_message = await interaction.followup.send(
+            _format_job(job, heading="大量生成ジョブを受け付けました"),
+            ephemeral=True,
+            wait=True,
+        )
+        _start_progress_watch(interaction, job_id, progress_message)
 
     @batch_group.command(name="defaults", description="Batchの前回設定を明示的に保存します。")
     @app_commands.choices(
@@ -517,7 +872,12 @@ def setup(client: discord.Client) -> None:
         except (ValueError, BatchJobError) as error:
             await interaction.followup.send(f"再生成を開始できませんでした。\n{error}", ephemeral=True)
             return
-        await interaction.followup.send(_format_job(job, heading="同じ設定のBatchを受け付けました"), ephemeral=True)
+        progress_message = await interaction.followup.send(
+            _format_job(job, heading="同じ設定のBatchを受け付けました"),
+            ephemeral=True,
+            wait=True,
+        )
+        _start_progress_watch(interaction, new_job_id, progress_message)
 
     @batch_group.command(name="status", description="自分のBatch jobの進捗を表示します。")
     @app_commands.describe(job_id="省略時は自分の最新job")
@@ -534,7 +894,20 @@ def setup(client: discord.Client) -> None:
         except (BatchJobNotFoundError, BatchJobOwnershipError) as error:
             await interaction.followup.send(str(error), ephemeral=True)
             return
-        await interaction.followup.send(_format_job(job), ephemeral=True)
+        gallery_status = None
+        summary = None
+        gallery_error = ""
+        if str(job.get("status") or "") in {"completed", "failed", "cancelled"}:
+            gallery_status, summary, gallery_error = await _terminal_gallery_context(
+                target,
+                start=False,
+            )
+        view = _build_gallery_view(interaction.user.id, target, gallery_status)
+        await interaction.followup.send(
+            _format_job(job, summary=summary, gallery_error=gallery_error),
+            view=view,
+            ephemeral=True,
+        )
 
     @batch_group.command(name="cancel", description="現在の画像完了後に未処理Batchを停止します。")
     @app_commands.describe(job_id="省略時は自分の最新job")
