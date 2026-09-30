@@ -80,6 +80,13 @@ RATING_CHOICES = [
 ]
 PROGRESS_POLL_SECONDS = 5
 PROGRESS_EDIT_INTERVAL_SECONDS = 10
+# Gallery's async summary endpoint can return the last committed index while
+# a background filesystem scan is still running.  This wait belongs only to
+# the optional Gallery follow-up; the Batch completion notice is published
+# before it starts.
+GALLERY_SUMMARY_WAIT_SECONDS = 45.0
+GALLERY_SUMMARY_INITIAL_BACKOFF_SECONDS = 1.0
+GALLERY_SUMMARY_MAX_BACKOFF_SECONDS = 5.0
 
 
 def _lora_choices(lora_type: str) -> list[app_commands.Choice[str]]:
@@ -536,6 +543,7 @@ async def _terminal_gallery_context(
     job_id: str,
     *,
     start: bool,
+    expected_count: int = 0,
 ) -> tuple[GalleryStatus | None, dict[str, Any] | None, str]:
     status: GalleryStatus | None = None
     error_text = ""
@@ -552,13 +560,69 @@ async def _terminal_gallery_context(
             status = await asyncio.to_thread(get_gallery_status)
         except Exception:
             logger.warning("Could not read Gallery status for Batch job=%s", job_id, exc_info=True)
-    summary: dict[str, Any] | None = None
-    try:
-        summary = await asyncio.to_thread(get_gallery_job_summary, job_id)
-    except Exception as error:
-        error_text = error_text or str(error)
-        logger.warning("Could not read Gallery summary for Batch job=%s: %s", job_id, error)
+    summary, summary_error = await _get_gallery_summary_for_batch(
+        job_id,
+        expected_count=expected_count,
+    )
+    if summary_error:
+        error_text = error_text or summary_error
     return status, summary, error_text
+
+
+async def _get_gallery_summary_for_batch(
+    job_id: str,
+    *,
+    expected_count: int,
+) -> tuple[dict[str, Any] | None, str]:
+    """Read a Batch summary without making Gallery part of Batch completion.
+
+    ``/api/images/summary`` is intentionally backed by Gallery's last indexed
+    state.  A successful response with ``total=0`` therefore means
+    "not indexed yet" when the Batch already produced images; it is not a
+    valid terminal summary.  Retry only this optional lookup for a bounded
+    period.  A Batch with no successful images is never made to wait for an
+    index that cannot appear.
+    """
+
+    expected = max(int(expected_count or 0), 0)
+    deadline = time.monotonic() + GALLERY_SUMMARY_WAIT_SECONDS
+    delay = GALLERY_SUMMARY_INITIAL_BACKOFF_SECONDS
+    last_error = ""
+
+    while True:
+        try:
+            summary = await asyncio.to_thread(get_gallery_job_summary, job_id)
+            total = int(summary.get("total") or 0)
+            if expected == 0 or total >= expected:
+                return summary, ""
+            # The endpoint responded successfully, but its committed index
+            # is behind the Batch result.  Do not expose this stale summary as
+            # a completed Gallery result.
+            last_error = f"Gallery索引の反映待ちです ({total}/{expected})。"
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            last_error = str(error)
+
+        # A genuinely empty Batch is terminal for this best-effort follow-up.
+        # Successful Batches with missing index entries get only the bounded
+        # async-sync grace period, including transient Gallery errors.
+        if expected == 0:
+            logger.warning("Could not read Gallery summary for Batch job=%s: %s", job_id, last_error)
+            return None, last_error
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            logger.warning(
+                "Gallery summary did not reach %s images before timeout: job=%s last=%s",
+                expected,
+                job_id,
+                last_error,
+            )
+            return None, last_error or "Gallery summaryの反映待ちがタイムアウトしました。"
+
+        await asyncio.sleep(min(delay, remaining))
+        delay = min(delay * 2, GALLERY_SUMMARY_MAX_BACKOFF_SECONDS)
 
 
 async def _send_gallery_followup(
@@ -581,6 +645,7 @@ async def _send_gallery_followup(
         status, summary, gallery_error = await _terminal_gallery_context(
             job_id,
             start=int(job.get("completed_count") or 0) > 0,
+            expected_count=int(job.get("completed_count") or 0),
         )
         if status is None and summary is None:
             if gallery_error:
@@ -996,6 +1061,7 @@ def setup(client: discord.Client) -> None:
             gallery_status, summary, gallery_error = await _terminal_gallery_context(
                 target,
                 start=False,
+                expected_count=int(job.get("completed_count") or 0),
             )
         view = _build_gallery_view(interaction.user.id, target, gallery_status)
         await interaction.followup.send(

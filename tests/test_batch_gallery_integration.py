@@ -155,6 +155,96 @@ class BatchProgressMessageTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("状態: **completed**", publish.call_args.args[2])
         interaction.followup.send.assert_not_awaited()
 
+    async def test_async_summary_zero_is_retried_until_batch_images_are_indexed(self):
+        status = SimpleNamespace(
+            urls=SimpleNamespace(local="http://127.0.0.1:8765/", tailscale=()),
+        )
+        with (
+            patch.object(generate_batch, "get_gallery_status", return_value=status),
+            patch.object(
+                generate_batch,
+                "get_gallery_job_summary",
+                side_effect=[{"total": 0, "ai_scored": 0}, {"total": 1, "ai_scored": 0}],
+            ) as summary,
+            patch.object(generate_batch, "GALLERY_SUMMARY_WAIT_SECONDS", 0.1),
+            patch.object(generate_batch, "GALLERY_SUMMARY_INITIAL_BACKOFF_SECONDS", 0.001),
+            patch.object(generate_batch, "GALLERY_SUMMARY_MAX_BACKOFF_SECONDS", 0.002),
+        ):
+            actual_status, actual_summary, error = await generate_batch._terminal_gallery_context(
+                "job-1",
+                start=False,
+                expected_count=1,
+            )
+
+        self.assertIs(actual_status, status)
+        self.assertEqual({"total": 1, "ai_scored": 0}, actual_summary)
+        self.assertEqual("", error)
+        self.assertEqual(2, summary.call_count)
+
+    async def test_async_summary_deadline_does_not_block_batch_result(self):
+        with (
+            patch.object(generate_batch, "get_gallery_status", return_value=None),
+            patch.object(
+                generate_batch,
+                "get_gallery_job_summary",
+                return_value={"total": 0, "ai_scored": 0},
+            ) as summary,
+            patch.object(generate_batch, "GALLERY_SUMMARY_WAIT_SECONDS", 0.01),
+            patch.object(generate_batch, "GALLERY_SUMMARY_INITIAL_BACKOFF_SECONDS", 0.001),
+            patch.object(generate_batch, "GALLERY_SUMMARY_MAX_BACKOFF_SECONDS", 0.002),
+        ):
+            actual_status, actual_summary, error = await generate_batch._terminal_gallery_context(
+                "job-1",
+                start=False,
+                expected_count=1,
+            )
+
+        self.assertIsNone(actual_status)
+        self.assertIsNone(actual_summary)
+        self.assertTrue(error)
+        self.assertGreaterEqual(summary.call_count, 2)
+
+    async def test_empty_batch_does_not_wait_for_gallery_index(self):
+        with (
+            patch.object(generate_batch, "get_gallery_status", return_value=None),
+            patch.object(
+                generate_batch,
+                "get_gallery_job_summary",
+                return_value={"total": 0, "ai_scored": 0},
+            ) as summary,
+        ):
+            _, actual_summary, error = await generate_batch._terminal_gallery_context(
+                "job-1",
+                start=False,
+                expected_count=0,
+            )
+
+        self.assertEqual({"total": 0, "ai_scored": 0}, actual_summary)
+        self.assertEqual("", error)
+        summary.assert_called_once_with("job-1")
+
+    async def test_gallery_summary_errors_are_bounded_and_best_effort(self):
+        with (
+            patch.object(generate_batch, "get_gallery_status", return_value=None),
+            patch.object(
+                generate_batch,
+                "get_gallery_job_summary",
+                side_effect=RuntimeError("Gallery stopped"),
+            ) as summary,
+            patch.object(generate_batch, "GALLERY_SUMMARY_WAIT_SECONDS", 0.01),
+            patch.object(generate_batch, "GALLERY_SUMMARY_INITIAL_BACKOFF_SECONDS", 0.001),
+            patch.object(generate_batch, "GALLERY_SUMMARY_MAX_BACKOFF_SECONDS", 0.002),
+        ):
+            _, actual_summary, error = await generate_batch._terminal_gallery_context(
+                "job-1",
+                start=False,
+                expected_count=1,
+            )
+
+        self.assertIsNone(actual_summary)
+        self.assertIn("Gallery stopped", error)
+        self.assertGreaterEqual(summary.call_count, 2)
+
     async def test_gallery_followup_notification_failure_is_best_effort(self):
         interaction = SimpleNamespace(
             user=SimpleNamespace(id=123),
