@@ -84,7 +84,7 @@ class BatchGenerationAdapterTests(unittest.TestCase):
             options = build_batch_image_options(request, spec)
         self.assertEqual(loras, options.loras)
         self.assertEqual(
-            "char trigger, extra trigger, style trigger, existing text",
+            "char trigger, extra trigger, solo, safe, style trigger, existing text, masterpiece, high score, great score, absurdres",
             options.prompt,
         )
         self.assertEqual(3, len(options.gallery_metadata["loras"]))
@@ -142,7 +142,10 @@ class BatchGenerationAdapterTests(unittest.TestCase):
             self.request(base_prompt="", request_text="standing outdoors"),
             self.spec(prompt=""),
         )
-        self.assertEqual("test-character, standing outdoors", options.prompt)
+        self.assertEqual(
+            "solo, safe, test-character, standing outdoors, masterpiece, high score, great score, absurdres",
+            options.prompt,
+        )
 
     def test_generation_calls_existing_backend_once_with_count_one(self):
         generated = object()

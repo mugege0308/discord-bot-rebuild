@@ -19,6 +19,7 @@ class ImageGenerationProfile:
     positive_prefix: str | None = None
     positive_suffix: str | None = None
     negative_default: str | None = None
+    system_positive_tags: tuple[str, ...] = ()
     width: int | None = None
     height: int | None = None
     steps: int | None = None
@@ -36,6 +37,7 @@ IMAGE_GENERATION_PROFILES: dict[str, ImageGenerationProfile] = {
         checkpoint=COMFY_CHECKPOINTS["animagine"],
         prompt_designer_instruction=Path("shogou_chan_prompt_designer_instruction.md"),
         filename_prefix="Shogou_AnimagineXL",
+        system_positive_tags=("masterpiece", "high score", "great score", "absurdres"),
     ),
     "animagine_adult": ImageGenerationProfile(
         model_key="animagine_adult",
@@ -45,6 +47,7 @@ IMAGE_GENERATION_PROFILES: dict[str, ImageGenerationProfile] = {
         filename_prefix="Shogou_AnimagineXL_Adult",
         is_adult=True,
         prompt_designer_addendum=Path("shogou_chan_prompt_designer_instruction_animagine_adult.md"),
+        system_positive_tags=("masterpiece", "high score", "great score", "absurdres"),
     ),
     "janku": ImageGenerationProfile(
         model_key="janku",

@@ -44,6 +44,39 @@ class _FakeGenerationService:
         )
 
 
+class _MultiImageService(GenerationService):
+    def __init__(self, *, failure_at: int | None = None) -> None:
+        self.prompt_call_count = 0
+        self.failure_at = failure_at
+
+        def prompt_resolver(*_args, **_kwargs):
+            self.prompt_call_count += 1
+            return ShogouPromptResult(
+                positive="1girl, portrait, safe",
+                negative="low quality",
+            )
+
+        super().__init__(
+            prompt_resolver=prompt_resolver
+        )
+        self.submit_calls = []
+
+    def submit_generation(self, request, *, prepared):
+        self.submit_calls.append((request, prepared))
+        if self.failure_at == len(self.submit_calls):
+            raise RuntimeError("slot failed")
+        return SimpleNamespace(
+            requested_seed=request.seed,
+            images=(
+                GeneratedImage(
+                    path=Path(f"C:/private/outputs/image-{len(self.submit_calls)}.png"),
+                    batch_index=0,
+                    seed=100 + len(self.submit_calls),
+                ),
+            ),
+        )
+
+
 class GenerationApiTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.service = _FakeGenerationService()
@@ -148,19 +181,40 @@ class GenerationApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("api-job-1", metadata["job_id"])
         self.assertEqual(-1, metadata["requested_seed"])
         self.assertEqual(
-            {"1girl", "portrait", "black hair", "blue eyes"},
+            {
+                "1girl",
+                "solo",
+                "safe",
+                "portrait",
+                "masterpiece",
+                "high score",
+                "great score",
+                "absurdres",
+                "black hair",
+                "blue eyes",
+            },
             {token.strip() for token in metadata["positive"].split(",")},
         )
         self.assertEqual("黒髪、青い目", metadata["appearance_text"])
         self.assertEqual({"preset": "square", "width": 1024, "height": 1024}, metadata["size"])
         self.assertNotIn("C:\\", str(metadata))
 
+        variation_metadata = _build_gallery_metadata(
+            "api-job-1",
+            request,
+            prepared,
+            variation_index=2,
+            variation_tags=("upper body", "three-quarter view"),
+        )
+        self.assertEqual(2, variation_metadata["variation_index"])
+        self.assertEqual(["upper body", "three-quarter view"], variation_metadata["variation_tags"])
+
     async def test_invalid_model_rating_lora_and_count_are_rejected(self):
         cases = [
             ({"freeform_character": "x", "model_key": "not-a-model"}, "model"),
             ({"freeform_character": "x", "rating": "not-a-rating"}, "rating"),
             ({"freeform_character": "x", "loras": [{"key": "not-a-lora", "lora_type": "style", "strength": 0.5}]}, "lora"),
-            ({"freeform_character": "x", "count": 2}, "count"),
+            ({"freeform_character": "x", "count": 5}, "count"),
         ]
         for payload, _label in cases:
             with self.subTest(payload=payload):
@@ -199,6 +253,63 @@ class GenerationApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("failed", result["state"])
         self.assertNotIn("C:\\secret", result["error_summary"])
         self.assertNotIn("Traceback", result["error_summary"])
+
+    async def test_count_four_auto_resolves_once_and_tracks_each_variation(self):
+        await self.client.close()
+        service = _MultiImageService()
+        self.app = create_generation_app(service=service)
+        self.server = TestServer(self.app)
+        self.client = TestClient(self.server)
+        await self.client.start_server()
+
+        response = await self.client.post(
+            "/api/generation/jobs",
+            json={
+                "freeform_character": "かわいい女の子",
+                "explicit_tags": ["closed mouth"],
+                "request_text": "portrait",
+                "model_key": "animagine",
+                "rating": "safe",
+                "count": 4,
+                "variation": "auto",
+                "seed": 100,
+            },
+        )
+        self.assertEqual(202, response.status)
+        created = await response.json()
+        result = await self._wait_for_terminal(created["job_id"])
+
+        self.assertEqual("completed", result["state"])
+        self.assertEqual(4, result["total_count"])
+        self.assertEqual(4, result["completed_count"])
+        self.assertEqual(0, result["failed_count"])
+        self.assertEqual(4, len(result["output"]["images"]))
+        self.assertEqual(1, service.prompt_call_count)
+        self.assertEqual(4, len(service.submit_calls))
+        self.assertEqual([100, 101, 102, 103], [item[0].seed for item in service.submit_calls])
+        self.assertFalse(
+            {"smile", "serious", "surprised", "blush"}
+            & {tag for item in result["output"]["images"] for tag in item["variation_tags"]}
+        )
+
+    async def test_count_four_keeps_partial_failure_counts(self):
+        await self.client.close()
+        service = _MultiImageService(failure_at=2)
+        self.app = create_generation_app(service=service)
+        self.server = TestServer(self.app)
+        self.client = TestClient(self.server)
+        await self.client.start_server()
+
+        response = await self.client.post(
+            "/api/generation/jobs",
+            json={"freeform_character": "girl", "count": 4, "variation": "off"},
+        )
+        created = await response.json()
+        result = await self._wait_for_terminal(created["job_id"])
+        self.assertEqual("completed", result["state"])
+        self.assertEqual(3, result["completed_count"])
+        self.assertEqual(1, result["failed_count"])
+        self.assertEqual(3, result["output"]["image_count"])
 
     def test_only_loopback_binding_is_allowed(self):
         with self.assertRaises(ValueError):

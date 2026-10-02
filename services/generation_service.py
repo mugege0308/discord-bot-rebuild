@@ -18,6 +18,7 @@ from services.appearance_resolver import (
     resolve_appearance_text,
 )
 from services.danbooru_tag_resolver import DanbooruTagResolution
+from services.generation_variation import MAX_GENERATION_COUNT
 from services.image_generation_profiles import (
     DEFAULT_IMAGE_GENERATION_MODEL_KEY,
     get_image_generation_profile,
@@ -132,6 +133,7 @@ _SYSTEM_TAG_KEYS = frozenset(
         "1girl",
         "1boy",
         "1other",
+        "solo",
         "safe",
         "sensitive",
         "nsfw",
@@ -143,6 +145,31 @@ _SYSTEM_TAG_KEYS = frozenset(
         "great score",
         "absurdres",
     }
+)
+_RATING_TAG_KEYS = frozenset({"safe", "sensitive", "nsfw", "explicit"})
+_QUALITY_TAG_KEYS = frozenset(
+    {"masterpiece", "best quality", "high quality", "high score", "great score", "absurdres"}
+)
+_MULTI_SUBJECT_HINTS = (
+    "複数",
+    "二人",
+    "ふたり",
+    "3人",
+    "三人",
+    "group",
+    "multiple",
+    "couple",
+    "two girls",
+    "two boys",
+)
+_FEMALE_SUBJECT_HINTS = (
+    "女の子",
+    "少女",
+    "女性",
+    "girl",
+    "girls",
+    "woman",
+    "female",
 )
 
 
@@ -170,6 +197,7 @@ class GenerationRequest:
     cfg: float = 7.0
     sampler: str = "Euler a"
     count: int = 1
+    variation: str = "off"
     seed: int = -1
     requester_id: int | str | None = None
     source: str = "unknown"
@@ -212,8 +240,8 @@ class GenerationRequest:
     def validate(self, *, require_prompt_input: bool = True) -> None:
         if not _normalise_text(self.model_key):
             raise PromptGeneratorError("model_keyを指定してください。")
-        if self.count < 1:
-            raise PromptGeneratorError("countは1以上で指定してください。")
+        if self.count < 1 or self.count > MAX_GENERATION_COUNT:
+            raise PromptGeneratorError(f"countは1～{MAX_GENERATION_COUNT}枚で指定してください。")
         if self.width < 256 or self.height < 256:
             raise PromptGeneratorError("画像サイズは256以上で指定してください。")
         if self.steps < 1 or self.cfg < 0:
@@ -226,6 +254,86 @@ class GenerationRequest:
 class TagProvenance:
     tag: str
     source: str
+
+
+def _positive_tokens(value: object) -> list[str]:
+    return list(_dedupe_tags(_split_tag_values((str(value or ""),))))
+
+
+def _subject_system_tags(request: GenerationRequest, tokens: Sequence[str]) -> tuple[str, ...]:
+    """Return only structural subject tags that the request supports."""
+
+    keys = {_tag_key(token) for token in tokens}
+    subject = " ".join(
+        value
+        for value in (
+            _normalise_text(request.character_preset),
+            _normalise_text(request.freeform_character),
+        )
+        if value
+    ).casefold()
+    multi_subject = any(hint.casefold() in subject for hint in _MULTI_SUBJECT_HINTS)
+
+    result: list[str] = []
+    if "1girl" in keys:
+        result.append("1girl")
+    elif "1boy" in keys:
+        result.append("1boy")
+    elif "1other" in keys:
+        result.append("1other")
+    elif not multi_subject and any(hint.casefold() in subject for hint in _FEMALE_SUBJECT_HINTS):
+        result.append("1girl")
+
+    if "solo" in keys:
+        result.append("solo")
+    elif subject and not multi_subject and not any(
+        key in keys for key in ("2girls", "2boys", "multiple girls", "multiple boys")
+    ):
+        result.append("solo")
+    return tuple(result)
+
+
+def _finalize_positive(
+    request: GenerationRequest,
+    profile: Any,
+    positive: object,
+) -> tuple[str, tuple[TagProvenance, ...]]:
+    """Apply deterministic system tags after the LLM/resolver merge."""
+
+    tokens = _positive_tokens(positive)
+    explicit_keys = {_tag_key(tag) for tag in request.explicit_tags}
+    subject_tags = _subject_system_tags(request, tokens)
+    subject_keys = {_tag_key(tag) for tag in subject_tags}
+
+    requested_rating = _normalise_text(request.rating).casefold()
+    rating_tags = (
+        (requested_rating,)
+        if requested_rating and requested_rating != PROMPT_RATING_AUTO
+        else ()
+    )
+    requested_rating_keys = {_tag_key(tag) for tag in rating_tags}
+
+    existing_quality = tuple(token for token in tokens if _tag_key(token) in _QUALITY_TAG_KEYS)
+    quality_tags = _dedupe_tags((*existing_quality, *getattr(profile, "system_positive_tags", ())))
+    quality_keys = {_tag_key(tag) for tag in quality_tags}
+
+    body: list[str] = []
+    for token in tokens:
+        key = _tag_key(token)
+        if key in subject_keys or key in quality_keys:
+            continue
+        if key in _RATING_TAG_KEYS and requested_rating != PROMPT_RATING_AUTO and key not in explicit_keys:
+            continue
+        body.append(token)
+
+    final_tokens = _dedupe_tags((*subject_tags, *rating_tags, *body, *quality_tags))
+    system_keys = subject_keys | requested_rating_keys | quality_keys
+    system_provenance = tuple(
+        TagProvenance(tag, "system")
+        for tag in final_tokens
+        if _tag_key(tag) in system_keys
+    )
+    return ", ".join(final_tokens), system_provenance
 
 
 @dataclass(frozen=True)
@@ -449,17 +557,20 @@ class GenerationService:
         if loras is None:
             resolve_loras = lora_resolver or resolve_saved_lora_selections
             loras = tuple(resolve_loras(request.loras, model_family=profile.model_family))
-        positive = positive_override if positive_override is not None else resolved.prompt_result.positive
-        positive = apply_lora_triggers(str(positive or "").strip(), loras)
+        positive_source = positive_override if positive_override is not None else resolved.prompt_result.positive
+        positive, system_provenance = _finalize_positive(request, profile, positive_source)
+        positive = apply_lora_triggers(positive, loras)
         negative = (
             negative_prompt_override
             if negative_prompt_override is not None
             else resolved.prompt_result.negative
         )
-        if negative is None:
-            negative = get_negative_prompt(None)
+        if not _normalise_text(negative):
+            negative = get_negative_prompt(profile.negative_default)
+        else:
+            negative = get_negative_prompt(str(negative))
 
-        prepared_provenance = list(resolved.provenance)
+        prepared_provenance = [*resolved.provenance, *system_provenance]
         source_overrides: dict[str, str] = {}
         for selection in loras:
             trigger = _normalise_text(selection.trigger)
@@ -506,6 +617,7 @@ class GenerationService:
         prepared_result = replace(
             resolved.prompt_result,
             positive=positive,
+            negative=str(negative),
             tag_provenance=tuple(
                 f"{item.tag} -> {item.source}"
                 for item in dict.fromkeys(prepared_provenance)

@@ -105,6 +105,12 @@ class GenerationServiceCharacterizationTests(unittest.TestCase):
         appearance.assert_called_once_with("黒髪ロング、赤目")
 
     def test_unconfigured_appearance_is_not_promoted_from_free_text(self):
+        unconfigured = lambda text: AppearanceResolution(
+            input_text=text,
+            unresolved=(text,),
+            resolver="unconfigured",
+        )
+        service = GenerationService(appearance_resolver=unconfigured)
         request = GenerationRequest(
             freeform_character="かわいい女の子",
             appearance_text="銀髪のボブ、青い目、色白",
@@ -112,7 +118,7 @@ class GenerationServiceCharacterizationTests(unittest.TestCase):
             source="gallery",
         )
 
-        resolved = self.service.resolve_request(request)
+        resolved = service.resolve_request(request)
 
         self.assertNotIn("銀髪のボブ", resolved.prompt_result.positive)
         self.assertEqual((), resolved.appearance_tags)
@@ -166,6 +172,73 @@ class GenerationServiceCharacterizationTests(unittest.TestCase):
 
 
 class GenerationServicePreparationTests(unittest.TestCase):
+    def test_finalization_restores_required_animagine_tags_and_default_negative(self):
+        appearance = Mock(
+            return_value=AppearanceResolution(
+                input_text="黒髪、青い目",
+                tags=("black hair", "blue eyes"),
+            )
+        )
+        service = GenerationService(
+            prompt_resolver=Mock(return_value=_prompt_result(positive="portrait", negative="  ")),
+            appearance_resolver=appearance,
+        )
+        request = GenerationRequest(
+            freeform_character="かわいい女の子",
+            explicit_tags=("portrait",),
+            appearance_text="黒髪、青い目",
+            request_text="simple safe portrait, plain background",
+            model_key="animagine",
+            rating="safe",
+            source="generation_api",
+        )
+
+        prepared = service.prepare_generation(request)
+        positive = {token.strip() for token in prepared.options.prompt.split(",")}
+
+        self.assertTrue(
+            {
+                "1girl",
+                "solo",
+                "safe",
+                "portrait",
+                "masterpiece",
+                "high score",
+                "great score",
+                "absurdres",
+                "black hair",
+                "blue eyes",
+            }.issubset(positive)
+        )
+        self.assertTrue(prepared.options.negative_prompt.strip())
+        self.assertEqual(prepared.options.negative_prompt, prepared.resolved.prompt_result.negative)
+        provenance = {(item.tag, item.source) for item in prepared.resolved.provenance}
+        for tag in ("1girl", "solo", "safe", "masterpiece", "high score", "great score", "absurdres"):
+            self.assertIn((tag, "system"), provenance)
+        self.assertIn(("black hair", "appearance_resolver"), provenance)
+
+    def test_finalization_deduplicates_existing_system_tags_and_keeps_nonempty_negative(self):
+        service = GenerationService(
+            prompt_resolver=Mock(
+                return_value=_prompt_result(
+                    positive="1girl, solo, safe, portrait, masterpiece, masterpiece, high score",
+                    negative="custom negative",
+                )
+            )
+        )
+        request = GenerationRequest(
+            freeform_character="かわいい女の子",
+            request_text="portrait",
+            model_key="animagine",
+            rating="safe",
+        )
+
+        prepared = service.prepare_generation(request)
+        tokens = [token.strip() for token in prepared.options.prompt.split(",")]
+
+        self.assertEqual(len(tokens), len({token.casefold() for token in tokens}))
+        self.assertEqual("custom negative", prepared.options.negative_prompt)
+
     def test_no_lora_safe_and_explicit_seed_are_preserved(self):
         request = GenerationRequest(
             freeform_character="かわいい女の子",

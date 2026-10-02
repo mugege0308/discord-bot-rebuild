@@ -149,6 +149,20 @@ def _default_store() -> DanbooruTagStore:
     return DanbooruTagStore(configured_path or DEFAULT_DANBOORU_DB_PATH)
 
 
+def get_appearance_resolver_status() -> dict[str, object]:
+    """Return safe runtime readiness information without exposing the DB path."""
+
+    try:
+        ready = _default_store().available
+    except (OSError, ValueError):
+        ready = False
+    return {
+        "ready": bool(ready),
+        "resolver": "appearance_resolver",
+        "source": "danbooru_general_db",
+    }
+
+
 def resolve_appearance_text(
     text: str,
     *,
@@ -217,5 +231,6 @@ def resolve_appearance_text(
 __all__ = [
     "AppearanceResolution",
     "appearance_tag_category",
+    "get_appearance_resolver_status",
     "resolve_appearance_text",
 ]

@@ -24,8 +24,16 @@ from typing import Any, Mapping
 
 from aiohttp import ContentTypeError, web
 
+from services.appearance_resolver import get_appearance_resolver_status
 from services.character_tag_dictionary import list_characters
 from services.generation_service import GenerationRequest, GenerationService, PreparedGeneration
+from services.generation_variation import (
+    MAX_GENERATION_COUNT,
+    VARIATION_AUTO,
+    VARIATION_OFF,
+    merge_variation_tags,
+    plan_variation_slots,
+)
 from services.gallery_control import get_gallery_images_root
 from services.image_composition import IMAGE_SIZE_SPECS
 from services.image_generation_profiles import (
@@ -60,6 +68,7 @@ _ALLOWED_REQUEST_KEYS = frozenset(
         "loras",
         "size",
         "count",
+        "variation",
         "seed",
     }
 )
@@ -106,6 +115,11 @@ class _Job:
     progress: float = 0.0
     error_summary: str | None = None
     output_metadata: dict[str, Any] | None = None
+    total_count: int = 1
+    completed_count: int = 0
+    failed_count: int = 0
+    variation: str = VARIATION_OFF
+    output_items: list[dict[str, Any]] = field(default_factory=list)
 
 
 class _JobStore:
@@ -174,6 +188,21 @@ def _parse_seed(value: object) -> int:
     return value
 
 
+def _parse_count(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= MAX_GENERATION_COUNT:
+        raise GenerationApiError(f"countは1～{MAX_GENERATION_COUNT}枚で指定してください。")
+    return value
+
+
+def _parse_variation(value: object, *, count: int) -> str:
+    if value is None:
+        return VARIATION_OFF
+    if not isinstance(value, str) or value.casefold() not in {VARIATION_OFF, VARIATION_AUTO}:
+        raise GenerationApiError("variationはoffまたはautoで指定してください。")
+    mode = value.casefold()
+    return VARIATION_OFF if count == 1 else mode
+
+
 def _parse_loras(value: object, *, model_family: str | None) -> tuple[dict[str, object], ...]:
     if value is None:
         return ()
@@ -237,9 +266,8 @@ def _build_request(payload: Mapping[str, object]) -> GenerationRequest:
     size = size.casefold()
     size_spec = IMAGE_SIZE_SPECS[size]
 
-    count = payload.get("count", 1)
-    if isinstance(count, bool) or not isinstance(count, int) or count != 1:
-        raise GenerationApiError("Phase 2ではcount=1だけ指定できます。")
+    count = _parse_count(payload.get("count", 1))
+    variation = _parse_variation(payload.get("variation"), count=count)
 
     loras = _parse_loras(payload.get("loras"), model_family=profile.model_family)
     generation_request = GenerationRequest(
@@ -255,6 +283,7 @@ def _build_request(payload: Mapping[str, object]) -> GenerationRequest:
         width=size_spec.width,
         height=size_spec.height,
         count=count,
+        variation=variation,
         seed=_parse_seed(payload.get("seed")),
         source="generation_api",
     )
@@ -300,6 +329,9 @@ def _build_gallery_metadata(
     job_id: str,
     request: GenerationRequest,
     prepared: PreparedGeneration,
+    *,
+    variation_index: int = 1,
+    variation_tags: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     """Build the sidecar contract without exposing local paths or secrets."""
 
@@ -317,6 +349,10 @@ def _build_gallery_metadata(
     return {
         "source": "generation_api",
         "job_id": job_id,
+        "parent_job_id": job_id,
+        "variation_index": variation_index,
+        "variation_tags": list(variation_tags),
+        "variation": request.variation,
         "model": str(options.model_key or request.model_key),
         "rating": request.rating,
         "positive": options.prompt,
@@ -339,12 +375,25 @@ def _build_gallery_metadata(
 
 
 def _job_response(job: _Job) -> dict[str, Any]:
+    output = dict(job.output_metadata or {})
+    output.setdefault("image_count", len(job.output_items))
+    output.setdefault("images", list(job.output_items))
+    output.setdefault("image_identifiers", [item.get("filename") for item in job.output_items if item.get("filename")])
+    output.setdefault("gallery_job_id", job.job_id)
+    output["total_count"] = job.total_count
+    output["completed_count"] = job.completed_count
+    output["failed_count"] = job.failed_count
     return {
         "job_id": job.job_id,
         "state": job.state,
         "progress": job.progress,
         "error_summary": job.error_summary,
-        "output": job.output_metadata,
+        "total_count": job.total_count,
+        "completed_count": job.completed_count,
+        "failed_count": job.failed_count,
+        "current_index": job.completed_count + job.failed_count,
+        "variation": job.variation,
+        "output": output,
     }
 
 
@@ -382,6 +431,7 @@ class GenerationApi:
             await asyncio.gather(*tasks, return_exceptions=True)
 
     async def health(self, _request: web.Request) -> web.Response:
+        appearance_status = get_appearance_resolver_status()
         return web.json_response(
             {
                 "service_ready": True,
@@ -389,6 +439,7 @@ class GenerationApi:
                     "LMSTUDIO_API_URL", "LM_STUDIO_API_URL", "LOCAL_LLM_API_URL"
                 ),
                 "comfyui_url_configured": _is_configured("SD_API_URL"),
+                "appearance_resolver": appearance_status,
             }
         )
 
@@ -451,6 +502,8 @@ class GenerationApi:
             return _json_error("リクエストが大きすぎます。", 413)
 
         job = self.jobs.create(generation_request)
+        job.total_count = generation_request.count
+        job.variation = generation_request.variation
         task = asyncio.create_task(self._run_job(job.job_id))
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
@@ -470,33 +523,144 @@ class GenerationApi:
             # Keep generation serial with the existing sd_control lock and
             # make a later request visibly queued instead of blocking HTTP.
             async with self._generation_lock:
-                self.jobs.update(job_id, state="resolving", progress=0.1)
-                prepared = await asyncio.to_thread(self.service.prepare_generation, job.request)
-                if isinstance(prepared, PreparedGeneration):
-                    gallery_metadata = _build_gallery_metadata(job_id, job.request, prepared)
-                    prepared = replace(
-                        prepared,
-                        options=replace(
-                            prepared.options,
-                            gallery_output_root=get_gallery_images_root(),
-                            gallery_metadata=gallery_metadata,
+                self.jobs.update(job_id, state="resolving", progress=0.05)
+                if job.total_count == 1:
+                    prepared = await asyncio.to_thread(self.service.prepare_generation, job.request)
+                    if isinstance(prepared, PreparedGeneration):
+                        gallery_metadata = _build_gallery_metadata(job_id, job.request, prepared)
+                        prepared = replace(
+                            prepared,
+                            options=replace(
+                                prepared.options,
+                                gallery_output_root=get_gallery_images_root(),
+                                gallery_metadata=gallery_metadata,
+                            ),
+                        )
+                    self.jobs.update(job_id, state="generating", progress=0.5)
+                    result = await asyncio.to_thread(
+                        self.service.submit_generation,
+                        job.request,
+                        prepared=prepared,
+                    )
+                    items = _safe_image_metadata(result)["images"]
+                    self.jobs.update(
+                        job_id,
+                        state="completed",
+                        progress=1.0,
+                        completed_count=len(items),
+                        output_items=items,
+                        output_metadata={
+                            **_safe_image_metadata(result),
+                            "gallery_job_id": job_id,
+                            "total_count": 1,
+                            "completed_count": len(items),
+                            "failed_count": 0,
+                        },
+                    )
+                    return
+
+                resolution_request = replace(job.request, count=1)
+                resolved = await asyncio.to_thread(self.service.resolve_request, resolution_request)
+                slots = plan_variation_slots(
+                    job.total_count,
+                    job.variation,
+                    explicit_tags=resolution_request.explicit_tags,
+                    resolved_prompt_tags=resolved.prompt_result.resolved_prompt_tags,
+                    resolved_danbooru_tags=resolved.prompt_result.danbooru_resolved_prompt_tags,
+                )
+                outputs: list[dict[str, Any]] = []
+                errors: list[str] = []
+                for slot in slots:
+                    current_index = len(outputs) + len(errors) + 1
+                    self.jobs.update(
+                        job_id,
+                        state="generating",
+                        progress=(current_index - 1) / job.total_count,
+                    )
+                    variation_request = replace(
+                        resolution_request,
+                        seed=(
+                            -1
+                            if resolution_request.seed < 0
+                            else (resolution_request.seed + slot.index - 1) % (2**32)
                         ),
                     )
-                self.jobs.update(job_id, state="generating", progress=0.5)
-                result = await asyncio.to_thread(
-                    self.service.submit_generation,
-                    job.request,
-                    prepared=prepared,
+                    variation_resolved = replace(resolved, request=variation_request)
+                    variation_positive = merge_variation_tags(
+                        resolved.prompt_result.positive,
+                        slot.tags,
+                    )
+                    try:
+                        prepared = await asyncio.to_thread(
+                            self.service.prepare_generation,
+                            variation_request,
+                            resolved=variation_resolved,
+                            positive_override=variation_positive,
+                        )
+                        if not isinstance(prepared, PreparedGeneration):
+                            raise RuntimeError("生成準備結果が不正です。")
+                        gallery_metadata = _build_gallery_metadata(
+                            job_id,
+                            variation_request,
+                            prepared,
+                            variation_index=slot.index,
+                            variation_tags=slot.tags,
+                        )
+                        prepared = replace(
+                            prepared,
+                            options=replace(
+                                prepared.options,
+                                gallery_output_root=get_gallery_images_root(),
+                                gallery_metadata=gallery_metadata,
+                            ),
+                        )
+                        result = await asyncio.to_thread(
+                            self.service.submit_generation,
+                            variation_request,
+                            prepared=prepared,
+                        )
+                        items = _safe_image_metadata(result)["images"]
+                        if not items:
+                            raise RuntimeError("画像が生成されませんでした。")
+                        for item in items:
+                            item["variation_index"] = slot.index
+                            item["variation_tags"] = list(slot.tags)
+                        outputs.extend(items)
+                        self.jobs.update(
+                            job_id,
+                            completed_count=len(outputs),
+                            failed_count=len(errors),
+                            output_items=outputs,
+                        )
+                    except Exception as exc:  # noqa: BLE001 - one slot must not hide other results
+                        logger.exception("Generation variation failed: job_id=%s index=%s", job_id, slot.index)
+                        errors.append(_safe_error_summary(exc))
+                        self.jobs.update(
+                            job_id,
+                            completed_count=len(outputs),
+                            failed_count=len(errors),
+                            error_summary=errors[-1],
+                            output_items=outputs,
+                        )
+                final_state = "completed" if outputs else "failed"
+                self.jobs.update(
+                    job_id,
+                    state=final_state,
+                    progress=1.0,
+                    completed_count=len(outputs),
+                    failed_count=len(errors),
+                    output_items=outputs,
+                    output_metadata={
+                        "image_count": len(outputs),
+                        "images": outputs,
+                        "image_identifiers": [item.get("filename") for item in outputs if item.get("filename")],
+                        "gallery_job_id": job_id,
+                        "total_count": job.total_count,
+                        "completed_count": len(outputs),
+                        "failed_count": len(errors),
+                        "errors": errors[:4],
+                    },
                 )
-            self.jobs.update(
-                job_id,
-                state="completed",
-                progress=1.0,
-                output_metadata={
-                    **_safe_image_metadata(result),
-                    "gallery_job_id": job_id,
-                },
-            )
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - worker boundary must be sanitized
