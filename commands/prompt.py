@@ -62,6 +62,7 @@ from services.image_generation_profiles import (
     DEFAULT_IMAGE_GENERATION_MODEL_KEY,
     get_image_generation_profile,
 )
+from services.generation_service import GenerationRequest, GenerationService
 from services.gallery_control import get_gallery_images_root
 from services.lora_catalog import get_comfy_lora_choice_specs
 from services.saved_references import get_reference, read_reference_bytes
@@ -1738,15 +1739,22 @@ async def _build_shogou_prompt_result(
     requested_rating: str = PROMPT_RATING_AUTO,
 ) -> ShogouPromptResult | None:
     try:
-        result = await asyncio.to_thread(
-            generate_shogou_prompt_result,
-            text,
-            interaction.user.id,
-            reference_id,
-            model_key,
-            requested_rating,
+        generation_request = GenerationRequest(
+            request_text=text,
+            model_key=model_key,
+            rating=requested_rating,
+            requester_id=interaction.user.id,
+            source=f"discord.{label_prefix}",
+            reference_id=reference_id,
             enable_generic_danbooru=(label_prefix == "generate_ai"),
         )
+        generation_service = GenerationService()
+        result = await asyncio.to_thread(
+            generation_service.resolve_request,
+            generation_request,
+            prompt_resolver=generate_shogou_prompt_result,
+        )
+        result = result.prompt_result
         logger.info(
             "%s result received: positive_length=%s negative_length=%s blocked=%s",
             label_prefix,

@@ -15,7 +15,7 @@ from services.image_generation_profiles import (
 from services.memory import append_memory_to_system_prompt
 from services.prompt_generator import (
     PromptGeneratorError,
-    _post_chat_completion,
+    post_prompt_designer_completion as _post_chat_completion,
 )
 from services.prompt_tag_resolver import (
     PromptTagResolution,
@@ -91,6 +91,7 @@ class ShogouPromptResult:
     danbooru_character_resolved_tag_ids: tuple[str, ...] = field(default_factory=tuple)
     danbooru_character_resolved_tags: tuple[str, ...] = field(default_factory=tuple)
     danbooru_character_resolution: DanbooruCharacterResolution | None = None
+    confirmed_character_appearance_tags: tuple[str, ...] = field(default_factory=tuple)
     character_appearance_suppressed_tags: tuple[str, ...] = field(default_factory=tuple)
     raw_llm_positive: str = ""
     raw_summary: str = ""
@@ -463,7 +464,7 @@ def generate_shogou_prompt_result(
             text,
             temperature=0.35,
             response_format=SHOGOU_RESPONSE_FORMAT,
-            max_tokens=1200,
+            max_tokens=512,
         )
     except TypeError:
         raw_content = _post_chat_completion(system_prompt, text, temperature=0.35)
@@ -622,6 +623,7 @@ def generate_shogou_prompt_result(
         danbooru_character_resolved_tag_ids=tuple(str(tag_id) for tag_id in character_resolution.selected_tag_ids) if character_resolution else (),
         danbooru_character_resolved_tags=character_resolution.selected_prompt_tags if character_resolution else (),
         danbooru_character_resolution=character_resolution,
+        confirmed_character_appearance_tags=confirmed_appearance_tags,
         character_appearance_suppressed_tags=tuple(
             dict.fromkeys(
                 appearance.removed_tags

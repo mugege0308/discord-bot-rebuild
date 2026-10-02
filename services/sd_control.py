@@ -21,6 +21,7 @@ import requests
 from PIL import Image
 
 from services.pc_control import get_shutdown_delay_seconds, is_windows, schedule_shutdown
+from services.comfy_lora_resolver import resolve_comfy_lora_names
 from services.lora_catalog import (
     COMFY_STYLES,
     ComfyStyle,
@@ -1283,6 +1284,12 @@ def _configure_lora_loaders(
 
     if not selections:
         return
+    # Catalog names are filesystem-facing values.  ComfyUI validates the
+    # loader input against /object_info, so resolve every selection before
+    # mutating the workflow and preserve the exact accepted API strings.
+    resolved_lora_names = resolve_comfy_lora_names(
+        selection.lora_name for selection in selections
+    )
     existing_ids = _find_lora_loader_node_ids(workflow)
     loader_ids = existing_ids[:1]
     while len(loader_ids) < len(selections):
@@ -1330,13 +1337,13 @@ def _configure_lora_loaders(
 
     previous_model = base_model
     previous_clip = base_clip
-    for loader_id, selection in zip(loader_ids, selections):
+    for loader_id, selection, resolved_name in zip(loader_ids, selections, resolved_lora_names):
         inputs = _node_inputs(workflow, loader_id)
         if inputs is None:
             raise RuntimeError(f"LoRA Loaderノードのinputsが不正です: {loader_id}")
         inputs.update(
             {
-                "lora_name": selection.lora_name,
+                "lora_name": resolved_name,
                 "strength_model": selection.strength,
                 "strength_clip": selection.strength,
                 "model": list(previous_model),
@@ -2019,6 +2026,7 @@ def _download_comfy_images(
     gallery_output_root: Path | None = None,
     gallery_metadata: dict[str, Any] | None = None,
     prompt_id: str | None = None,
+    actual_seed: int | None = None,
 ) -> list[Path]:
     outputs = history.get("outputs")
     if not isinstance(outputs, dict):
@@ -2059,6 +2067,9 @@ def _download_comfy_images(
                 payload.setdefault("source_image", filename)
                 payload.setdefault("batch_index", batch_index)
                 payload.setdefault("generated_at", datetime.now(JST).isoformat(timespec="seconds"))
+                if actual_seed is not None:
+                    payload["actual_seed"] = actual_seed
+                    payload["seed"] = actual_seed
                 _write_gallery_metadata_sidecar(output_path, payload)
                 source_path = _resolve_gallery_output_path(
                     gallery_output_root, filename, subfolder, str(image_type)
@@ -2169,6 +2180,7 @@ def _generate_comfy_images_with_metadata(options: SdGenerationOptions) -> list[G
                 gallery_output_root=options.gallery_output_root,
                 gallery_metadata=options.gallery_metadata,
                 prompt_id=prompt_id,
+                actual_seed=seed_value,
             )
 
             for path in paths:

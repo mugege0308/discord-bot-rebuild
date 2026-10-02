@@ -46,11 +46,10 @@ class ImageGenerationProfileTestCase(unittest.TestCase):
 
     def test_animagine_instruction_makes_summary_and_assumptions_model_neutral(self):
         instruction = load_shogou_instruction("animagine")
-        for prohibited_subject in ("生成モデル名", "checkpoint名", "Prompt Designer名"):
-            self.assertIn(prohibited_subject, instruction)
-        self.assertIn("使用する生成モデルを推測・説明しない", instruction)
-        self.assertIn("画像内容だけ", instruction)
-        self.assertIn("実際に補完した条件や解決した矛盾だけ", instruction)
+        self.assertIn("`summary` は採用した生成内容の日本語一文", instruction)
+        self.assertIn("`assumptions` は採用した補完・矛盾解決だけの配列", instruction)
+        self.assertIn("summary・assumptionsへ戻さない", instruction)
+        self.assertIn("requested rating、resolved tags、tag IDs", instruction)
 
     def test_janku_instruction_contains_required_positive_and_negative_policy(self):
         instruction = load_shogou_instruction("janku")

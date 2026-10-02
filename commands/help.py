@@ -222,3 +222,47 @@
             "以前のメンションコマンドは旧方式だよ。これからは / コマンドか操作パネルを使ってね。",
         ]
     )
+
+
+DISCORD_MESSAGE_LIMIT = 2000
+
+
+def split_discord_message(content: str, limit: int = DISCORD_MESSAGE_LIMIT) -> list[str]:
+    """Split a message without exceeding Discord's content limit."""
+    if not isinstance(content, str):
+        raise TypeError("content must be a string")
+    if not 1 <= limit <= DISCORD_MESSAGE_LIMIT:
+        raise ValueError(f"limit must be between 1 and {DISCORD_MESSAGE_LIMIT}")
+    if not content:
+        return [""]
+
+    chunks: list[str] = []
+    current = ""
+
+    def flush() -> None:
+        nonlocal current
+        if current:
+            chunks.append(current)
+            current = ""
+
+    for line in content.splitlines(keepends=True):
+        if len(line) <= limit and len(current) + len(line) <= limit:
+            current += line
+            continue
+
+        flush()
+        remainder = line
+        while len(remainder) > limit:
+            window = remainder[:limit]
+            break_at = max(
+                (window.rfind(character) + 1 for character in " \t,、。.!！?？:：;；"),
+                default=0,
+            )
+            if break_at <= 0:
+                break_at = limit
+            chunks.append(remainder[:break_at])
+            remainder = remainder[break_at:]
+        current = remainder
+
+    flush()
+    return chunks or [""]

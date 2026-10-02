@@ -4,14 +4,21 @@ import os
 import re
 from collections import Counter
 from datetime import datetime
+from pathlib import Path
 
 import discord
 from discord import app_commands
 from dotenv import load_dotenv
 
+# Load deployment-local, non-secret settings before importing modules that
+# build static catalogs or slash-command choices at import time.  The default
+# ``override=False`` behavior preserves values supplied by the parent process.
+load_dotenv(dotenv_path=Path(__file__).with_name(".env"))
+
 import daily_log
 from commands import health
 from commands import blue_archive
+from commands import character_dictionary
 from commands import character_generate
 from commands import claude
 from commands import claude_remote
@@ -23,9 +30,10 @@ from commands import image_feedback
 from commands import lora
 from commands import memory
 from commands import prompt
+from commands import generate_ai_diagnostics
 from commands import references
 from commands import voice
-from commands.help import handle_help
+from commands.help import handle_help, split_discord_message
 from commands.memo import handle_memo
 from commands.ping import handle_ping
 from commands.today import build_today_summary
@@ -131,6 +139,14 @@ REQUIRED_SLASH_COMMANDS = {
     "dev_task",
     "dev_task_status",
     "dev_task_stop",
+    "character_list",
+    "character_info",
+    "character_search",
+    "character_missing",
+    "character_validate",
+    "generate_ai_debug",
+    "generate_ai_debug_detail",
+    "generate_ai_settings_reset",
     "vc_join",
     "vc_leave",
     "vc_say",
@@ -266,6 +282,7 @@ client = SecretaryClient()
 daily_log.setup(client)
 health.setup(client)
 blue_archive.setup(client)
+character_dictionary.setup(client)
 claude.setup(client)
 claude_remote.setup(client)
 dev_task.setup(client)
@@ -278,6 +295,7 @@ image_feedback.setup(client)
 lora.setup(client)
 memory.setup(client)
 prompt.setup(client)
+generate_ai_diagnostics.setup(client)
 voice.setup(client)
 
 
@@ -408,7 +426,10 @@ async def on_message(message: discord.Message) -> None:
 @client.tree.command(name="help", description="使える機能を表示します。")
 async def slash_help(interaction: discord.Interaction) -> None:
     response = handle_help(bot_mention(), user_id=interaction.user.id)
-    await interaction.response.send_message(response)
+    chunks = split_discord_message(response)
+    await interaction.response.send_message(chunks[0])
+    for chunk in chunks[1:]:
+        await interaction.followup.send(chunk)
 
 
 @client.tree.command(name="ping", description="Botが起きているか確認します。")
@@ -974,7 +995,6 @@ async def slash_jockie_shuffle_saved(interaction: discord.Interaction, name: str
 
 
 def main() -> None:
-    load_dotenv()
     token = os.getenv("DISCORD_BOT_TOKEN")
 
     if not token:

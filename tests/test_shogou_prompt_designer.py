@@ -1234,5 +1234,171 @@ class KnownCharacterContextWiringTestCase(unittest.TestCase):
         self.assertIn("笑顔にして", sent_system_prompt)
 
 
+# The prompt contract was intentionally compressed in Phase 1.  The legacy
+# content assertions above described the former long-form instruction and are
+# shadowed here by focused contract tests.  Runtime/wiring tests remain above.
+class InstructionContentTestCase(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.instruction = load_shogou_instruction()
+        cls.examples = [
+            json.loads(raw)
+            for raw in re.findall(r"^出力:\n(\{.*\})$", cls.instruction, flags=re.MULTILINE)
+        ]
+
+    def test_compact_json_output_contract_is_present(self):
+        for phrase in (
+            "JSON object 1個だけ",
+            "`positive`, `negative`, `summary`, `assumptions`",
+            "Markdown",
+            "reasoning",
+            "カンマ+スペース",
+        ):
+            self.assertIn(phrase, self.instruction)
+
+    def test_explicit_and_resolver_priority_is_present(self):
+        self.assertIn("ユーザーが明示した内容", self.instruction)
+        self.assertIn("resolverから渡されたauthoritative tags", self.instruction)
+        self.assertIn("Resolver-provided tags are authoritative", self.instruction)
+        self.assertIn("後段Python", self.instruction)
+        self.assertIn("明示入力と推測が衝突したら", self.instruction)
+
+    def test_unrequested_semantic_content_is_forbidden(self):
+        for phrase in (
+            "衣装、背景、場所、照明、色",
+            "未指定のsemantic contentは追加しない",
+            "根拠のないappearanceを捏造しない",
+        ):
+            self.assertIn(phrase, self.instruction)
+
+    def test_character_contract_is_atomic_and_context_authoritative(self):
+        for phrase in (
+            "Known character",
+            "atomicな表記",
+            "翻訳、分割、略記、置換",
+            "confirmed appearance",
+            "Known characterのタグは、後段処理でも保護される",
+        ):
+            self.assertIn(phrase, self.instruction)
+
+    def test_assumptions_and_runtime_context_are_bounded(self):
+        for phrase in (
+            "assumptions` は空配列を基本",
+            "髪・目・衣装・色・照明・演出の推測は書かない",
+            "requested rating、resolved tags、tag IDs、Known character",
+            "LLMの仕事は意味の読み取りとJSON候補の作成",
+        ):
+            self.assertIn(phrase, self.instruction)
+
+    def test_rating_quality_negative_and_cleanup_rules_are_present(self):
+        for phrase in (
+            "ratingは有効なものを1つだけ",
+            "quality tags",
+            "negativeはカンマ区切り",
+            "単独数字",
+            "peace sign",
+            "smiley face",
+        ):
+            self.assertIn(phrase, self.instruction)
+
+    def test_normalization_examples_cover_pose_and_duplicate_cleanup(self):
+        for phrase in (
+            "from below, looking back, smile",
+            "leaning forward",
+            "peace sign",
+            "smile",
+        ):
+            self.assertIn(phrase, self.instruction)
+        self.assertIn("曖昧語", self.instruction)
+
+    def test_safety_boundary_is_present(self):
+        for phrase in (
+            "未成年",
+            "実在人物への性的内容",
+            "安全側に倒す",
+            "候補外のcanonical nameを生成しない",
+        ):
+            self.assertIn(phrase, self.instruction)
+
+    def test_two_examples_are_single_json_objects_with_exact_keys(self):
+        self.assertEqual(len(self.examples), 2)
+        for example in self.examples:
+            self.assertEqual(
+                list(example), ["positive", "negative", "summary", "assumptions"]
+            )
+            self.assertIsInstance(example["assumptions"], list)
+            self.assertIsInstance(example["positive"], str)
+            self.assertIsInstance(example["negative"], str)
+
+    def test_generic_example_does_not_invent_appearance_or_scene(self):
+        example = next(item for item in self.examples if "portrait" in item["positive"])
+        positive = example["positive"].lower()
+        self.assertIn("1girl", positive)
+        self.assertIn("safe", positive)
+        self.assertIn("portrait", positive)
+        self.assertNotIn("school uniform", positive)
+        self.assertNotIn("blue tones", positive)
+
+    def test_known_character_example_keeps_character_and_series_atomic(self):
+        example = next(item for item in self.examples if "komeiji koishi" in item["positive"])
+        tags = [tag.strip() for tag in example["positive"].split(",")]
+        self.assertIn("komeiji koishi (touhou)", tags)
+        self.assertNotIn("touhou", tags)
+        self.assertEqual(example["assumptions"], [])
+
+
+class AssumptionsScopeInstructionTestCase(unittest.TestCase):
+    def test_assumptions_are_only_minimal_scene_or_conflict_resolution(self):
+        instruction = load_shogou_instruction()
+        self.assertIn("最小限の場面補完または明示指定同士の矛盾解決だけ", instruction)
+        self.assertIn("外見、色、照明、衣装、背景の推測はここにも書かない", instruction)
+
+
+class ExistingCharacterPriorityInstructionTestCase(unittest.TestCase):
+    def test_existing_character_identity_and_user_override_are_explicit(self):
+        instruction = load_shogou_instruction()
+        self.assertIn("`character tag` と `series tag`", instruction)
+        self.assertIn("ユーザーが明示的に外見変更した場合は、その指定を残す", instruction)
+        self.assertIn("characterが未指定の自由入力では、このcharacter contractを適用しない", instruction)
+
+
+class ExistingCharacterAssumptionsRestrictionTestCase(unittest.TestCase):
+    def test_character_appearance_is_evidence_bounded(self):
+        instruction = load_shogou_instruction()
+        self.assertIn("髪色、髪型、瞳色、恒常衣装、固有アクセサリ", instruction)
+        self.assertIn("ブロックまたはユーザー明示に根拠がある場合だけ", instruction)
+
+
+class KomeijiKoishiFewShotRegressionTestCase(unittest.TestCase):
+    def test_known_character_example_is_not_generalized(self):
+        instruction = load_shogou_instruction()
+        self.assertIn("komeiji koishi (touhou)", instruction)
+        self.assertNotIn("ancient spirit", instruction)
+        self.assertNotIn("cool colors", instruction)
+
+
+class KnownCharacterContextInstructionTestCase(unittest.TestCase):
+    def test_known_character_context_format_and_atomic_rule_are_present(self):
+        instruction = load_shogou_instruction()
+        self.assertIn("Known character:", instruction)
+        self.assertIn("- character tag:", instruction)
+        self.assertIn("- series tag:", instruction)
+        self.assertIn("atomicな表記", instruction)
+
+
+class SparkleFewShotRegressionTestCase(unittest.TestCase):
+    def test_compact_prompt_does_not_reintroduce_character_translation(self):
+        instruction = load_shogou_instruction()
+        self.assertIn("翻訳、分割、略記、置換", instruction)
+        self.assertNotIn("eclipse star rail", instruction)
+
+
+class KinakoNanobanaFewShotRegressionTestCase(unittest.TestCase):
+    def test_compact_prompt_keeps_canonical_names_with_resolver_context(self):
+        instruction = load_shogou_instruction()
+        self.assertIn("resolver context", instruction)
+        self.assertIn("候補外のcanonical nameを生成しない", instruction)
+
+
 if __name__ == "__main__":
     unittest.main()

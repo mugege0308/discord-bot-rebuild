@@ -1,0 +1,210 @@
+from __future__ import annotations
+
+import asyncio
+import os
+import tempfile
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
+
+from aiohttp.test_utils import TestClient, TestServer
+
+from services.generation_api import (
+    GenerationApiConfig,
+    _build_gallery_metadata,
+    create_generation_app,
+)
+from services.generation_service import GenerationRequest, GenerationService
+from services.sd_control import GeneratedImage
+from services.shogou_prompt_designer import ShogouPromptResult
+
+
+class _FakeGenerationService:
+    def __init__(self, *, failure: Exception | None = None) -> None:
+        self.failure = failure
+        self.requests = []
+
+    def prepare_generation(self, request):
+        self.requests.append(request)
+        return SimpleNamespace(request=request)
+
+    def submit_generation(self, request, *, prepared):
+        if self.failure is not None:
+            raise self.failure
+        return SimpleNamespace(
+            requested_seed=request.seed,
+            images=(
+                GeneratedImage(
+                    path=Path(r"C:\private\outputs\image.png"),
+                    batch_index=0,
+                    seed=12345,
+                ),
+            ),
+        )
+
+
+class GenerationApiTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.service = _FakeGenerationService()
+        self.app = create_generation_app(service=self.service)
+        self.server = TestServer(self.app)
+        self.client = TestClient(self.server)
+        await self.client.start_server()
+
+    async def asyncTearDown(self):
+        await self.client.close()
+
+    async def _wait_for_terminal(self, job_id: str) -> dict:
+        for _ in range(100):
+            response = await self.client.get(f"/api/generation/jobs/{job_id}")
+            payload = await response.json()
+            if payload["state"] in {"completed", "failed"}:
+                return payload
+            await asyncio.sleep(0.01)
+        self.fail("job did not reach a terminal state")
+
+    async def test_health_does_not_probe_or_expose_urls(self):
+        with patch.dict(
+            os.environ,
+            {"LMSTUDIO_API_URL": "http://127.0.0.1:1234/v1", "SD_API_URL": "http://127.0.0.1:8188"},
+            clear=False,
+        ):
+            response = await self.client.get("/api/generation/health")
+        self.assertEqual(response.status, 200)
+        payload = await response.json()
+        self.assertTrue(payload["service_ready"])
+        self.assertTrue(payload["lm_studio_configured"])
+        self.assertTrue(payload["comfyui_url_configured"])
+        self.assertNotIn("127.0.0.1:8188", str(payload))
+
+    async def test_options_expose_safe_catalog_values_only(self):
+        response = await self.client.get("/api/generation/options")
+        self.assertEqual(response.status, 200)
+        payload = await response.json()
+        self.assertIn("animagine", {item["key"] for item in payload["models"]})
+        self.assertEqual({"square", "portrait", "landscape"}, {item["key"] for item in payload["sizes"]})
+        self.assertIn("style", payload["loras"])
+        self.assertIn("character_presets", payload)
+        self.assertNotIn("source_path", str(payload))
+        self.assertNotIn("metadata_path", str(payload))
+
+    async def test_valid_request_is_async_and_preserves_input_layers(self):
+        response = await self.client.post(
+            "/api/generation/jobs",
+            json={
+                "freeform_character": "かわいい女の子",
+                "explicit_tags": ["from side", "upper body", "closed mouth"],
+                "appearance_text": "黒髪ロング、赤目",
+                "request_text": "白背景、少し微笑む",
+                "model_key": "animagine",
+                "rating": "safe",
+                "size": "portrait",
+                "count": 1,
+                "seed": 42,
+            },
+        )
+        self.assertEqual(response.status, 202)
+        created = await response.json()
+        self.assertEqual("queued", created["state"])
+        result = await self._wait_for_terminal(created["job_id"])
+        self.assertEqual("completed", result["state"])
+        request = self.service.requests[0]
+        self.assertEqual(("from side", "upper body", "closed mouth"), request.explicit_tags)
+        self.assertEqual("黒髪ロング、赤目", request.appearance_text)
+        self.assertEqual("白背景、少し微笑む", request.request_text)
+        self.assertEqual(768, request.width)
+        self.assertEqual(1024, request.height)
+        self.assertEqual(42, request.seed)
+        self.assertEqual("image.png", result["output"]["images"][0]["filename"])
+        self.assertEqual(["image.png"], result["output"]["image_identifiers"])
+        self.assertEqual(created["job_id"], result["output"]["gallery_job_id"])
+        self.assertNotIn("C:\\private", str(result))
+
+    def test_gallery_metadata_keeps_request_layers_and_seed_contract(self):
+        service = GenerationService(
+            prompt_resolver=lambda *_args, **_kwargs: ShogouPromptResult(
+                positive="1girl, portrait, black hair, blue eyes",
+                negative="low quality",
+            )
+        )
+        request = GenerationRequest(
+            freeform_character="かわいい女の子",
+            explicit_tags=("portrait",),
+            appearance_text="黒髪、青い目",
+            request_text="simple safe portrait",
+            rating="safe",
+            size_preset="square",
+            width=1024,
+            height=1024,
+            seed=-1,
+            source="generation_api",
+        )
+        prepared = service.prepare_generation(request)
+
+        metadata = _build_gallery_metadata("api-job-1", request, prepared)
+
+        self.assertEqual("generation_api", metadata["source"])
+        self.assertEqual("api-job-1", metadata["job_id"])
+        self.assertEqual(-1, metadata["requested_seed"])
+        self.assertEqual(
+            {"1girl", "portrait", "black hair", "blue eyes"},
+            {token.strip() for token in metadata["positive"].split(",")},
+        )
+        self.assertEqual("黒髪、青い目", metadata["appearance_text"])
+        self.assertEqual({"preset": "square", "width": 1024, "height": 1024}, metadata["size"])
+        self.assertNotIn("C:\\", str(metadata))
+
+    async def test_invalid_model_rating_lora_and_count_are_rejected(self):
+        cases = [
+            ({"freeform_character": "x", "model_key": "not-a-model"}, "model"),
+            ({"freeform_character": "x", "rating": "not-a-rating"}, "rating"),
+            ({"freeform_character": "x", "loras": [{"key": "not-a-lora", "lora_type": "style", "strength": 0.5}]}, "lora"),
+            ({"freeform_character": "x", "count": 2}, "count"),
+        ]
+        for payload, _label in cases:
+            with self.subTest(payload=payload):
+                response = await self.client.post("/api/generation/jobs", json=payload)
+                self.assertEqual(response.status, 400)
+
+    async def test_raw_workflow_and_path_fields_are_not_an_api_input(self):
+        response = await self.client.post(
+            "/api/generation/jobs",
+            json={
+                "freeform_character": "x",
+                "workflow": {"20": {"inputs": {"lora_name": "C:\\secret\\a.safetensors"}}},
+            },
+        )
+        self.assertEqual(response.status, 400)
+
+    async def test_oversized_payload_is_rejected(self):
+        body = b"{" + (b"x" * 70000) + b"}"
+        response = await self.client.post(
+            "/api/generation/jobs",
+            data=body,
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(response.status, 413)
+
+    async def test_generation_failure_is_sanitized(self):
+        await self.client.close()
+        self.service = _FakeGenerationService(failure=RuntimeError(r"failed at C:\\secret\\workflow.json"))
+        self.app = create_generation_app(service=self.service)
+        self.server = TestServer(self.app)
+        self.client = TestClient(self.server)
+        await self.client.start_server()
+        response = await self.client.post("/api/generation/jobs", json={"freeform_character": "x"})
+        created = await response.json()
+        result = await self._wait_for_terminal(created["job_id"])
+        self.assertEqual("failed", result["state"])
+        self.assertNotIn("C:\\secret", result["error_summary"])
+        self.assertNotIn("Traceback", result["error_summary"])
+
+    def test_only_loopback_binding_is_allowed(self):
+        with self.assertRaises(ValueError):
+            GenerationApiConfig(host="0.0.0.0")
+        self.assertEqual("127.0.0.1", GenerationApiConfig(host="localhost").host)
+
+
+if __name__ == "__main__":
+    unittest.main()

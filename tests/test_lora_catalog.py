@@ -17,6 +17,8 @@ from services.lora_catalog import (
 from services.lora_paths import (
     get_comfy_lora_root,
     get_lora_manager_outputs_dir,
+    DEFAULT_COMFY_LORA_ROOT,
+    DEFAULT_LORA_MANAGER_OUTPUTS_DIR,
     metadata_path_for_lora,
 )
 from services.lora_training import LORA_TYPE_CHARACTER, LORA_TYPE_STYLE
@@ -156,6 +158,85 @@ class LoraCatalogTestCase(unittest.TestCase):
             self.assertEqual(get_lora_manager_outputs_dir(), Path("custom-outputs"))
             self.assertEqual(get_comfy_lora_root(), Path("custom-loras"))
         self.assertEqual(DEFAULT_STYLE_WORKFLOW, Path("workflows") / "comfy_workflow_lora.json")
+
+    def test_legacy_environment_resolves_project_outputs_and_recognized_comfy_layout(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manager_root = root / "manager"
+            manager_outputs = manager_root / "outputs"
+            manager_outputs.mkdir(parents=True)
+            kohya_root = root / "kohya"
+            comfy_root = kohya_root / "models" / "Lora"
+            comfy_root.mkdir(parents=True)
+            with mock.patch.dict(
+                os.environ,
+                {"LORA_MANAGER_ROOT": str(manager_root), "LORA_KOHYA_ROOT": str(kohya_root)},
+                clear=True,
+            ):
+                self.assertEqual(get_lora_manager_outputs_dir(), manager_outputs)
+                self.assertEqual(get_comfy_lora_root(), comfy_root)
+
+    def test_new_environment_takes_precedence_over_legacy_environment(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            new_outputs = root / "new-outputs"
+            new_outputs.mkdir()
+            legacy_outputs = root / "legacy" / "outputs"
+            legacy_outputs.mkdir(parents=True)
+            new_comfy = root / "new-comfy"
+            new_comfy.mkdir()
+            legacy_comfy = root / "legacy-kohya" / "models" / "Lora"
+            legacy_comfy.mkdir(parents=True)
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "LORA_MANAGER_OUTPUTS_DIR": str(new_outputs),
+                    "LORA_MANAGER_ROOT": str(legacy_outputs.parent),
+                    "COMFY_LORA_ROOT": str(new_comfy),
+                    "LORA_KOHYA_ROOT": str(legacy_comfy.parents[1]),
+                },
+                clear=True,
+            ):
+                self.assertEqual(get_lora_manager_outputs_dir(), new_outputs)
+                self.assertEqual(get_comfy_lora_root(), new_comfy)
+
+    def test_invalid_legacy_paths_fall_back_without_treating_kohya_as_comfy_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            invalid_manager = root / "missing-manager"
+            invalid_kohya = root / "missing-kohya"
+            with mock.patch.dict(
+                os.environ,
+                {"LORA_MANAGER_ROOT": str(invalid_manager), "LORA_KOHYA_ROOT": str(invalid_kohya)},
+                clear=True,
+            ):
+                self.assertEqual(get_lora_manager_outputs_dir(), DEFAULT_LORA_MANAGER_OUTPUTS_DIR)
+                self.assertEqual(get_comfy_lora_root(), DEFAULT_COMFY_LORA_ROOT)
+
+    def test_legacy_manager_output_catalog_preserves_all_categories(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manager_root = root / "manager"
+            outputs = manager_root / "outputs"
+            _write_model(
+                outputs,
+                "character/hutao.safetensors",
+                {"name": "Hu Tao", "lora_type": "character", "trigger_tag": "hu tao"},
+            )
+            _write_model(outputs, "style/soft.safetensors", {"lora_type": "style"})
+            _write_model(outputs, "additional/detail.safetensors", {"lora_type": "additional"})
+            with mock.patch.dict(os.environ, {"LORA_MANAGER_ROOT": str(manager_root)}, clear=True):
+                styles = build_comfy_styles()
+            self.assertEqual(styles["hutao"].lora_type, "character")
+            self.assertEqual(styles["soft"].lora_type, "style")
+            self.assertEqual(styles["detail"].lora_type, "additional")
+
+    def test_prompt_and_batch_use_the_shared_catalog_choice_helper(self):
+        from commands import generate_batch, prompt
+        from services import lora_catalog
+
+        self.assertIs(prompt.get_comfy_lora_choice_specs, lora_catalog.get_comfy_lora_choice_specs)
+        self.assertIs(generate_batch.get_comfy_lora_choice_specs, lora_catalog.get_comfy_lora_choice_specs)
 
     def test_model_family_missing_metadata_is_compatible(self):
         self.assertTrue(model_family_compatible(None, "sdxl"))

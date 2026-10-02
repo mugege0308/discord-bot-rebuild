@@ -1,8 +1,9 @@
 """Discord commands for the persisted, sequential Batch worker.
 
-The command layer only resolves user input, persists a small set of Batch
-specs, and hands the job to :mod:`services.batch_generation_worker`.  Prompt
-construction and image generation remain in the existing Batch adapter.
+The command layer resolves user input, prepares one shared Prompt Designer
+result for the Batch specs, and hands the job to
+:mod:`services.batch_generation_worker`.  Image generation remains in the
+existing Batch adapter.
 """
 
 from __future__ import annotations
@@ -26,6 +27,7 @@ from services.batch_generation import (
     recover_incomplete_jobs as recover_persisted_jobs,
 )
 from services.batch_generation_worker import BatchGenerationWorker
+from services.batch_prompt import prepare_batch_prompt
 from services.generate_ai_last_settings import (
     get_last_batch_settings,
     get_last_model_key,
@@ -213,17 +215,12 @@ def _resolve_rating(
         return validate_requested_prompt_rating("auto", is_adult=profile.is_adult)
 
 
-def _base_prompt(character: str, request_text: str) -> str:
-    values = [str(character or "").strip(), str(request_text or "").strip()]
-    return ", ".join(value for value in values if value)
-
-
 def _build_specs(job_id: str, request: BatchGenerationRequest, *, checkpoint: str) -> None:
     """Persist the variation specs consumed by the 3C-11c worker."""
 
-    base_prompt = _base_prompt(request.character, request.request_text) or request.base_prompt.strip()
-    if not base_prompt:
-        raise ValueError("characterまたはrequest_textを指定してください。")
+    prepared = prepare_batch_prompt(request)
+    base_prompt = prepared.positive.strip()
+    base_negative_prompt = prepared.negative.strip()
     variation_count = request.effective_variation_count if request.variation_enabled else 1
     patterns = build_variation_patterns(variation_count) if request.variation_enabled else ((),)
     remaining = request.total_count
@@ -237,7 +234,7 @@ def _build_specs(job_id: str, request: BatchGenerationRequest, *, checkpoint: st
             job_id,
             request.requested_by,
             prompt=prompt,
-            negative_prompt=request.base_negative_prompt,
+            negative_prompt=base_negative_prompt,
             character=request.character,
             loras=request.loras,
             checkpoint=checkpoint,

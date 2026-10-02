@@ -19,17 +19,17 @@ from services.batch_generation import (
     BatchSpec,
     manager as batch_manager,
 )
+from services.generation_service import GenerationRequest, GenerationService
 from services.image_generation_profiles import get_image_generation_profile
 from services.gallery_control import get_gallery_images_root
 from services.sd_control import (
     GeneratedImage,
     SdGenerationOptions,
-    apply_lora_triggers,
     generate_images_with_metadata,
     lora_selections_to_dicts,
     resolve_saved_lora_selections,
 )
-from services.shogou_prompt_designer import validate_requested_prompt_rating
+from services.shogou_prompt_designer import ShogouPromptResult, validate_requested_prompt_rating
 
 
 MAX_SEED = 2**32
@@ -252,7 +252,6 @@ def build_batch_image_options(
             positive = ", ".join(part for part in explicit_parts if part)
         if not positive:
             raise ValueError("Batch promptが空です。")
-        positive = apply_lora_triggers(positive, loras)
         negative = str(spec.negative_prompt or request.base_negative_prompt or "")
         config = request.generation_config
         if not isinstance(config, dict):
@@ -288,36 +287,37 @@ def build_batch_image_options(
             "pose_reference": False,
             "loras": list(lora_selections_to_dicts(loras)),
         }
-        return SdGenerationOptions(
-            prompt=positive,
-            negative_prompt=negative,
+        generation_request = GenerationRequest(
+            freeform_character=request.character,
+            request_text=request.request_text,
             model_key=profile.model_key,
-            model_family=profile.model_family,
-            filename_prefix=profile.filename_prefix,
-            model_selection_explicit=True,
-            preserve_prompt_text=True,
-            count=1,
+            rating=request.rating,
+            loras=loras,
             width=width,
             height=height,
             steps=steps,
             cfg=cfg,
             sampler=sampler.strip(),
+            count=1,
             seed=seed,
-            loras=loras,
-            reference_image_bytes=None,
-            reference_image_content_type=None,
-            reference_strength=None,
-            reference_mode="none",
-            pose_reference_bytes=None,
-            pose_reference_content_type=None,
-            gallery_output_root=get_gallery_images_root(),
-            gallery_metadata=metadata,
+            requester_id=request.requested_by,
+            source="discord.batch",
+            model_selection_explicit=True,
             explicit_generation_fields=frozenset(
                 field
                 for field in ("width", "height", "steps", "cfg", "sampler")
                 if field in config
             ),
         )
+        prompt_snapshot = ShogouPromptResult(positive=positive, negative=negative)
+        prepared = GenerationService().prepare_generation(
+            generation_request,
+            prompt_result=prompt_snapshot,
+            resolved_loras=loras,
+            gallery_output_root=get_gallery_images_root(),
+            gallery_metadata=metadata,
+        )
+        return prepared.options
     except BatchImageConfigurationError:
         raise
     except Exception as exc:

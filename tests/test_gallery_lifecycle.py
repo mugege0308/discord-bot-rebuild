@@ -138,13 +138,22 @@ class GallerySidecarTests(unittest.TestCase):
                     history,
                     1,
                     gallery_output_root=authoritative,
-                    gallery_metadata={"job_id": "job-1", "reference_mode": "pose"},
+                    gallery_metadata={
+                        "job_id": "job-1",
+                        "reference_mode": "pose",
+                        "requested_seed": -1,
+                    },
                     prompt_id="prompt-1",
+                    actual_seed=12345,
                 )
 
             self.assertEqual(1, len(paths))
             sidecar = paths[0].with_name(paths[0].name + ".metadata.json")
-            self.assertEqual("job-1", json.loads(sidecar.read_text(encoding="utf-8"))["job_id"])
+            metadata = json.loads(sidecar.read_text(encoding="utf-8"))
+            self.assertEqual("job-1", metadata["job_id"])
+            self.assertEqual(-1, metadata["requested_seed"])
+            self.assertEqual(12345, metadata["actual_seed"])
+            self.assertEqual(12345, metadata["seed"])
             self.assertTrue((authoritative / "Comfy_00001.png.metadata.json").is_file())
 
 

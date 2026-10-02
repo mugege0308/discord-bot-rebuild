@@ -21,6 +21,7 @@ logger = logging.getLogger("secretary-bot.prompt_generator")
 INSTRUCTION_FILE = Path("fixed_template_llm_instruction.md")
 DEFAULT_TIMEOUT_SECONDS = 30
 DEFAULT_MODEL = "local-model"
+DEFAULT_PROMPT_DESIGNER_MAX_TOKENS = 512
 TIMEOUT_MESSAGE = "LM Studioから応答がありませんでした"
 
 
@@ -30,6 +31,10 @@ class PromptGeneratorError(Exception):
 
 class PromptGeneratorTimeout(PromptGeneratorError):
     pass
+
+
+class PromptDesignerNativeUnavailable(PromptGeneratorError):
+    """The LM Studio native Prompt Designer endpoint cannot be used."""
 
 
 def _get_lmstudio_api_url() -> str:
@@ -76,7 +81,13 @@ def load_system_prompt() -> str:
     return INSTRUCTION_FILE.read_text(encoding="utf-8")
 
 
-def _post_chat_completion(system_prompt: str, user_input: str, temperature: float = 0.35) -> str:
+def _post_chat_completion(
+    system_prompt: str,
+    user_input: str,
+    temperature: float = 0.35,
+    *,
+    max_tokens: int = 1200,
+) -> str:
     api_url = _get_lmstudio_api_url()
     if not api_url:
         raise PromptGeneratorError("LMSTUDIO_API_URL が未設定です。`.env` に LM Studio のURLを設定してください。")
@@ -90,7 +101,7 @@ def _post_chat_completion(system_prompt: str, user_input: str, temperature: floa
             {"role": "user", "content": user_input},
         ],
         "temperature": temperature,
-        "max_tokens": 1200,
+        "max_tokens": max_tokens,
     }
 
     logger.info(
@@ -131,6 +142,114 @@ def _post_chat_completion(system_prompt: str, user_input: str, temperature: floa
         logger.error("LM Studio response content empty: %r", response_json)
         raise PromptGeneratorError("LM Studioの返答が空でした。")
     return content
+
+
+def _native_chat_url(base_url: str) -> str:
+    stripped = base_url.rstrip("/")
+    if stripped.endswith("/v1"):
+        stripped = stripped[:-3].rstrip("/")
+    return f"{stripped}/api/v1/chat"
+
+
+def _extract_native_prompt_text(response_json: object) -> str:
+    if not isinstance(response_json, dict):
+        raise PromptDesignerNativeUnavailable("native response is not an object")
+    output = response_json.get("output")
+    if not isinstance(output, list):
+        raise PromptDesignerNativeUnavailable("native response has no output array")
+    for item in output:
+        if not isinstance(item, dict) or item.get("type") != "message":
+            continue
+        content = item.get("content")
+        if isinstance(content, str) and content.strip():
+            return content
+    raise PromptDesignerNativeUnavailable("native response has no assistant message")
+
+
+def _post_native_prompt_designer_completion(
+    system_prompt: str,
+    user_input: str,
+    *,
+    temperature: float,
+    max_tokens: int,
+) -> str:
+    api_url = _get_lmstudio_api_url()
+    if not api_url:
+        raise PromptDesignerNativeUnavailable("LM Studio URL is not configured")
+
+    request_url = _native_chat_url(api_url)
+    payload: dict[str, Any] = {
+        "model": _get_lmstudio_text_model(),
+        "system_prompt": system_prompt,
+        "input": user_input,
+        "reasoning": "off",
+        "temperature": temperature,
+        "max_output_tokens": max_tokens,
+        "store": False,
+    }
+    logger.info(
+        "Prompt Designer native request start: url=%s model=%s reasoning=off "
+        "system_prompt_length=%s user_input_length=%s max_output_tokens=%s timeout=%s",
+        _safe_url_label(api_url),
+        payload["model"],
+        len(system_prompt),
+        len(user_input),
+        max_tokens,
+        DEFAULT_TIMEOUT_SECONDS,
+    )
+    started_at = time.monotonic()
+    try:
+        response = requests.post(request_url, json=payload, timeout=DEFAULT_TIMEOUT_SECONDS)
+        elapsed = time.monotonic() - started_at
+        response.raise_for_status()
+        response_json = response.json()
+        content = _extract_native_prompt_text(response_json)
+        logger.info("Prompt Designer native response received: status=%s elapsed=%.2fs", response.status_code, elapsed)
+        return content
+    except (requests.Timeout, requests.RequestException, ValueError, TypeError, PromptDesignerNativeUnavailable) as exc:
+        logger.warning(
+            "Prompt Designer native request unavailable; fallback is allowed: error_type=%s",
+            type(exc).__name__,
+        )
+        raise PromptDesignerNativeUnavailable from exc
+
+
+def post_prompt_designer_completion(
+    system_prompt: str,
+    user_input: str,
+    temperature: float = 0.35,
+    *,
+    response_format: object | None = None,
+    max_tokens: int = DEFAULT_PROMPT_DESIGNER_MAX_TOKENS,
+) -> str:
+    """Call LM Studio's native reasoning-controlled endpoint for Prompt Designer.
+
+    ``response_format`` is accepted for compatibility with the existing
+    resolver callback contract.  The native endpoint returns assistant text;
+    the existing Prompt Designer JSON parser remains the source of truth.
+    A valid native assistant message is never resent merely because its JSON
+    content later fails Prompt Designer validation.
+    """
+
+    del response_format
+    try:
+        return _post_native_prompt_designer_completion(
+            system_prompt,
+            user_input,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+    except PromptDesignerNativeUnavailable as exc:
+        logger.warning(
+            "Prompt Designer falling back to OpenAI-compatible LM Studio endpoint: error_type=%s",
+            type(exc).__name__,
+        )
+        return _post_chat_completion(
+            system_prompt,
+            user_input,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
 
 
 def generate_sd_prompt_result(user_input: str, user_id: int | None = None, reference_id: int | None = None) -> PromptTemplateResult:

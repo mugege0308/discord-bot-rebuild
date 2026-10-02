@@ -108,8 +108,16 @@ class LoraGenerationTestCase(unittest.TestCase):
         self.catalog_backup = dict(COMFY_STYLES)
         COMFY_STYLES.clear()
         COMFY_STYLES.update(self.catalog)
+        # Workflow unit tests use synthetic catalog names; the resolver itself
+        # is covered by tests/test_comfy_lora_resolver.py.
+        self.resolver_patch = mock.patch(
+            "services.sd_control.resolve_comfy_lora_names",
+            side_effect=lambda names: tuple(names),
+        )
+        self.resolver_patch.start()
 
     def tearDown(self):
+        self.resolver_patch.stop()
         COMFY_STYLES.clear()
         COMFY_STYLES.update(self.catalog_backup)
 
@@ -179,6 +187,22 @@ class LoraGenerationTestCase(unittest.TestCase):
             result["6"]["inputs"]["text"],
             "character_trigger, style_trigger, 1girl",
         )
+
+    def test_workflow_uses_exact_comfy_candidate_without_changing_strength_or_trigger(self):
+        selection = resolve_lora_selections(character_key="character", model_family="sdxl")[0]
+        with mock.patch(
+            "services.sd_control.resolve_comfy_lora_names",
+            return_value=(r"character\character.safetensors",),
+        ):
+            result, _, _ = _apply_comfy_options(
+                _workflow(),
+                SdGenerationOptions(prompt="1girl", loras=(selection,)),
+            )
+
+        self.assertEqual(result["20"]["inputs"]["lora_name"], r"character\character.safetensors")
+        self.assertEqual(result["20"]["inputs"]["strength_model"], selection.strength)
+        self.assertEqual(result["20"]["inputs"]["strength_clip"], selection.strength)
+        self.assertEqual(result["6"]["inputs"]["text"], "character_trigger, 1girl")
 
     def test_existing_trigger_and_atomic_tag_are_not_duplicated(self):
         selection = resolve_lora_selections(character_key="character", model_family="sdxl")[0]
