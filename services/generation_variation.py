@@ -112,6 +112,7 @@ def plan_variation_slots(
     explicit_tags: Sequence[str] = (),
     resolved_prompt_tags: Sequence[str] = (),
     resolved_danbooru_tags: Sequence[str] = (),
+    reference_mode: str = "none",
     dictionary: PromptTagDictionary | None = None,
 ) -> tuple[VariationSlot, ...]:
     """Build bounded slots without changing identity, appearance, or LoRAs."""
@@ -131,6 +132,15 @@ def plan_variation_slots(
         resolved_danbooru_tags,
         dictionary=prompt_dictionary,
     )
+    normalized_reference_mode = _key(reference_mode or "none")
+    if normalized_reference_mode == "pose":
+        # The pose reference owns the pose and its framing.  Expression may
+        # still vary, but auto variation must not replace the supplied pose.
+        locked = frozenset((*locked, "basic_pose", "framing"))
+    elif normalized_reference_mode == "composition":
+        # IP-Adapter composition owns the camera/framing relationship.  Keep
+        # the reference stable and vary only the remaining safe dimensions.
+        locked = frozenset((*locked, "framing", "camera_horizontal", "basic_pose"))
     candidates: list[tuple[str, tuple[str, ...]]] = []
     for category, ids in _PLANNER_IDS.items():
         if category in locked:

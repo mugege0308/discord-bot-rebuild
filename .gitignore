@@ -17,6 +17,7 @@ data/image_memory/
 data/sd_outputs/
 data/sd_selection_batches/
 data/dev_tasks/
+data/generation_references/
 
 outputs/
 work/

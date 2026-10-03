@@ -2027,6 +2027,9 @@ def _download_comfy_images(
     gallery_metadata: dict[str, Any] | None = None,
     prompt_id: str | None = None,
     actual_seed: int | None = None,
+    pose_backend: str | None = None,
+    pose_reference_profile: str | None = None,
+    pose_profile_reason: str | None = None,
 ) -> list[Path]:
     outputs = history.get("outputs")
     if not isinstance(outputs, dict):
@@ -2070,6 +2073,10 @@ def _download_comfy_images(
                 if actual_seed is not None:
                     payload["actual_seed"] = actual_seed
                     payload["seed"] = actual_seed
+                if pose_backend:
+                    payload["pose_backend"] = pose_backend
+                    payload["pose_reference_profile"] = pose_reference_profile or "unknown"
+                    payload["pose_profile_reason"] = pose_profile_reason or ""
                 _write_gallery_metadata_sidecar(output_path, payload)
                 source_path = _resolve_gallery_output_path(
                     gallery_output_root, filename, subfolder, str(image_type)
@@ -2181,6 +2188,9 @@ def _generate_comfy_images_with_metadata(options: SdGenerationOptions) -> list[G
                 gallery_metadata=options.gallery_metadata,
                 prompt_id=prompt_id,
                 actual_seed=seed_value,
+                pose_backend=pose_backend,
+                pose_reference_profile=(None if pose_result is None else pose_result.get("profile")),
+                pose_profile_reason=(None if pose_result is None else pose_result.get("profile_reason")),
             )
 
             for path in paths:

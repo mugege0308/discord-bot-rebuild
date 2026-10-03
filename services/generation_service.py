@@ -207,8 +207,10 @@ class GenerationRequest:
     preserve_prompt_text: bool = True
     model_selection_explicit: bool = False
     explicit_generation_fields: frozenset[str] = frozenset()
-    # Reserved request-level extension points.  They are intentionally not
-    # interpreted by Phase 1; Reference/Pose adapters can use them later.
+    # Reference/Pose is carried as a small, typed-by-contract mapping so the
+    # public API can keep the image itself behind an opaque asset id while the
+    # service receives validated bytes.  Expected keys are mode, image_id,
+    # image_bytes, content_type, width, height, strength and fit.
     reference: Mapping[str, Any] | None = None
     pose: Mapping[str, Any] | None = None
 
@@ -594,6 +596,36 @@ class GenerationService:
                 prepared_provenance.append(TagProvenance(clean, source))
                 known_provenance_keys.add(key)
 
+        reference_values = dict(request.reference or {})
+        reference_mode = str(reference_values.get("mode") or "none").strip().casefold()
+        reference_bytes = reference_values.get("image_bytes")
+        reference_content_type = reference_values.get("content_type")
+        reference_strength = reference_values.get("strength")
+        reference_fit = str(reference_values.get("fit") or "contain").strip().casefold()
+        reference_options: dict[str, Any] = {}
+        if reference_mode != "none":
+            if not isinstance(reference_bytes, bytes) or not reference_bytes:
+                raise PromptGeneratorError("参考画像が読み込めませんでした。")
+            if reference_mode == "composition":
+                reference_options = {
+                    "reference_image_bytes": reference_bytes,
+                    "reference_image_content_type": reference_content_type,
+                    "reference_strength": reference_strength,
+                    "reference_mode": reference_mode,
+                }
+            elif reference_mode == "pose":
+                reference_options = {
+                    "pose_reference_bytes": reference_bytes,
+                    "pose_reference_content_type": reference_content_type,
+                    "pose_reference_width": reference_values.get("width"),
+                    "pose_reference_height": reference_values.get("height"),
+                    "pose_strength": 0.7 if reference_strength is None else reference_strength,
+                    "pose_fit_mode": reference_fit,
+                    "reference_mode": reference_mode,
+                }
+            else:
+                raise PromptGeneratorError("reference modeが不正です。")
+
         options = SdGenerationOptions(
             prompt=positive,
             negative_prompt=str(negative),
@@ -613,6 +645,7 @@ class GenerationService:
             gallery_output_root=gallery_output_root,
             gallery_metadata=(None if gallery_metadata is None else dict(gallery_metadata)),
             explicit_generation_fields=request.explicit_generation_fields,
+            **reference_options,
         )
         prepared_result = replace(
             resolved.prompt_result,

@@ -34,6 +34,18 @@ class GenerationVariationTests(unittest.TestCase):
         self.assertFalse({"portrait", "upper body", "cowboy shot", "full body"} & all_tags)
         self.assertFalse({"smile", "serious", "surprised", "blush"} & all_tags)
 
+    def test_pose_reference_locks_pose_and_framing(self):
+        slots = plan_variation_slots(4, VARIATION_AUTO, reference_mode="pose")
+        all_tags = {tag for slot in slots for tag in slot.tags}
+        self.assertFalse({"standing", "sitting", "walking", "kneeling"} & all_tags)
+        self.assertFalse({"portrait", "upper body", "cowboy shot", "full body"} & all_tags)
+
+    def test_composition_reference_locks_camera_dimensions(self):
+        slots = plan_variation_slots(4, VARIATION_AUTO, reference_mode="composition")
+        all_tags = {tag for slot in slots for tag in slot.tags}
+        self.assertFalse({"portrait", "upper body", "cowboy shot", "full body"} & all_tags)
+        self.assertFalse({"straight-on", "three-quarter view", "from side", "from behind"} & all_tags)
+
     def test_merge_replaces_only_core_exclusive_group(self):
         merged = merge_variation_tags(
             "1girl, portrait, from side, safe, masterpiece",

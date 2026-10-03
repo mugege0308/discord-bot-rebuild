@@ -27,6 +27,11 @@ from aiohttp import ContentTypeError, web
 from services.appearance_resolver import get_appearance_resolver_status
 from services.character_tag_dictionary import list_characters
 from services.generation_service import GenerationRequest, GenerationService, PreparedGeneration
+from services.generation_reference_assets import (
+    MAX_REFERENCE_IMAGE_BYTES,
+    load_reference_asset,
+    save_reference_asset,
+)
 from services.generation_variation import (
     MAX_GENERATION_COUNT,
     VARIATION_AUTO,
@@ -44,6 +49,8 @@ from services.lora_catalog import COMFY_STYLES, model_family_compatible
 from services.lora_training import LORA_TYPES, normalize_lora_type
 from services.prompt_generator import PromptGeneratorError
 from services.sd_control import resolve_saved_lora_selections
+from services.sd_control import DEFAULT_REFERENCE_STRENGTH
+from services.pose_reference import DEFAULT_POSE_STRENGTH
 from services.shogou_prompt_designer import PROMPT_RATING_CHOICES
 
 
@@ -52,6 +59,7 @@ logger = logging.getLogger("secretary-bot.generation_api")
 DEFAULT_GENERATION_API_HOST = "127.0.0.1"
 DEFAULT_GENERATION_API_PORT = 8787
 DEFAULT_MAX_BODY_BYTES = 64 * 1024
+DEFAULT_REFERENCE_UPLOAD_BYTES = MAX_REFERENCE_IMAGE_BYTES
 MAX_TEXT_LENGTH = 4000
 MAX_EXPLICIT_TAGS = 100
 MAX_LORAS = 3
@@ -70,6 +78,10 @@ _ALLOWED_REQUEST_KEYS = frozenset(
         "count",
         "variation",
         "seed",
+        "reference_mode",
+        "reference_image_id",
+        "reference_strength",
+        "reference_fit",
     }
 )
 _ALLOWED_LORA_KEYS = frozenset({"key", "lora_type", "strength"})
@@ -93,6 +105,7 @@ class GenerationApiConfig:
     host: str = DEFAULT_GENERATION_API_HOST
     port: int = DEFAULT_GENERATION_API_PORT
     max_body_bytes: int = DEFAULT_MAX_BODY_BYTES
+    reference_upload_bytes: int = DEFAULT_REFERENCE_UPLOAD_BYTES
 
     def __post_init__(self) -> None:
         host = str(self.host or "").strip().casefold()
@@ -104,6 +117,13 @@ class GenerationApiConfig:
             raise ValueError("Generation API portが不正です。")
         if isinstance(self.max_body_bytes, bool) or not isinstance(self.max_body_bytes, int) or self.max_body_bytes < 1024:
             raise ValueError("Generation APIのbody上限が不正です。")
+        if (
+            isinstance(self.reference_upload_bytes, bool)
+            or not isinstance(self.reference_upload_bytes, int)
+            or self.reference_upload_bytes < 1024
+            or self.reference_upload_bytes > MAX_REFERENCE_IMAGE_BYTES
+        ):
+            raise ValueError("参考画像uploadの上限が不正です。")
         object.__setattr__(self, "host", host)
 
 
@@ -203,6 +223,55 @@ def _parse_variation(value: object, *, count: int) -> str:
     return VARIATION_OFF if count == 1 else mode
 
 
+def _parse_reference(
+    payload: Mapping[str, object],
+    *,
+    reference_upload_bytes: int,
+) -> dict[str, object] | None:
+    mode_value = payload.get("reference_mode", "none")
+    if not isinstance(mode_value, str):
+        raise GenerationApiError("reference_modeが不正です。")
+    mode = mode_value.casefold().strip()
+    if mode not in {"none", "composition", "pose"}:
+        raise GenerationApiError("reference_modeはnone / composition / poseのいずれかで指定してください。")
+    image_id = payload.get("reference_image_id")
+    strength = payload.get("reference_strength")
+    fit_value = payload.get("reference_fit", "contain")
+    if not isinstance(fit_value, str) or fit_value.casefold() not in {"contain", "cover", "stretch"}:
+        raise GenerationApiError("reference_fitはcontain / cover / stretchのいずれかで指定してください。")
+    fit = fit_value.casefold()
+    if strength is not None:
+        if isinstance(strength, bool) or not isinstance(strength, (int, float)) or not 0.0 <= float(strength) <= 1.0:
+            raise GenerationApiError("reference_strengthは0.0～1.0で指定してください。")
+        strength = float(strength)
+    if mode == "none":
+        if image_id is not None:
+            raise GenerationApiError("reference_mode=noneでは参考画像を指定できません。")
+        return None
+    if not isinstance(image_id, str) or not image_id.strip():
+        raise GenerationApiError("reference_image_idを指定してください。")
+    try:
+        asset = load_reference_asset(image_id.strip())
+    except (OSError, ValueError) as exc:
+        raise GenerationApiError("指定された参考画像を利用できません。") from exc
+    if len(asset.image_bytes) > reference_upload_bytes:
+        raise GenerationApiError("参考画像が大きすぎます。")
+    if strength is None:
+        strength = DEFAULT_POSE_STRENGTH if mode == "pose" else DEFAULT_REFERENCE_STRENGTH
+    # The mapping is internal to the adapter/service boundary.  The HTTP
+    # request and metadata retain only the opaque id, never a path.
+    return {
+        "mode": mode,
+        "image_id": asset.asset_id,
+        "image_bytes": asset.image_bytes,
+        "content_type": asset.content_type,
+        "width": asset.width,
+        "height": asset.height,
+        "strength": strength,
+        "fit": fit,
+    }
+
+
 def _parse_loras(value: object, *, model_family: str | None) -> tuple[dict[str, object], ...]:
     if value is None:
         return ()
@@ -240,7 +309,11 @@ def _parse_loras(value: object, *, model_family: str | None) -> tuple[dict[str, 
     return tuple(result)
 
 
-def _build_request(payload: Mapping[str, object]) -> GenerationRequest:
+def _build_request(
+    payload: Mapping[str, object],
+    *,
+    reference_upload_bytes: int = MAX_REFERENCE_IMAGE_BYTES,
+) -> GenerationRequest:
     unknown = set(payload) - _ALLOWED_REQUEST_KEYS
     if unknown:
         raise GenerationApiError("サポートされていない生成項目が含まれています。")
@@ -268,8 +341,13 @@ def _build_request(payload: Mapping[str, object]) -> GenerationRequest:
 
     count = _parse_count(payload.get("count", 1))
     variation = _parse_variation(payload.get("variation"), count=count)
+    reference = _parse_reference(payload, reference_upload_bytes=reference_upload_bytes)
 
     loras = _parse_loras(payload.get("loras"), model_family=profile.model_family)
+    if reference is not None and loras:
+        # Preserve the existing sd_control workflow contract: the IP-Adapter
+        # reference workflow and LoRA workflow are not combined implicitly.
+        raise GenerationApiError("Reference imageとLoRAの同時適用には対応していません。")
     generation_request = GenerationRequest(
         character_preset=_clean_text(payload.get("character_preset"), "character_preset"),
         freeform_character=_clean_text(payload.get("freeform_character"), "freeform_character"),
@@ -286,6 +364,7 @@ def _build_request(payload: Mapping[str, object]) -> GenerationRequest:
         variation=variation,
         seed=_parse_seed(payload.get("seed")),
         source="generation_api",
+        reference=reference,
     )
     try:
         generation_request.validate()
@@ -371,6 +450,10 @@ def _build_gallery_metadata(
         "explicit_tags": list(request.explicit_tags),
         "appearance_text": request.appearance_text or "",
         "request_text": request.request_text or "",
+        "reference_mode": str((request.reference or {}).get("mode") or "none"),
+        "reference_image_id": str((request.reference or {}).get("image_id") or ""),
+        "reference_strength": (request.reference or {}).get("strength"),
+        "reference_fit": str((request.reference or {}).get("fit") or "contain"),
     }
 
 
@@ -411,11 +494,14 @@ class GenerationApi:
         self.jobs = _JobStore()
         self._generation_lock = asyncio.Lock()
         self._tasks: set[asyncio.Task[None]] = set()
-        self.app = web.Application(client_max_size=self.config.max_body_bytes)
+        self.app = web.Application(
+            client_max_size=max(self.config.max_body_bytes, self.config.reference_upload_bytes)
+        )
         self.app.add_routes(
             [
                 web.get("/api/generation/health", self.health),
                 web.get("/api/generation/options", self.options),
+                web.post("/api/generation/references", self.upload_reference),
                 web.post("/api/generation/jobs", self.create_job),
                 web.get("/api/generation/jobs/{job_id}", self.get_job),
             ]
@@ -482,6 +568,15 @@ class GenerationApi:
                 ],
                 "character_presets": character_presets,
                 "loras": lora_catalog,
+                "reference": {
+                    "modes": ["none", "composition", "pose"],
+                    "fit_modes": ["contain", "cover", "stretch"],
+                    "default_strengths": {
+                        "composition": DEFAULT_REFERENCE_STRENGTH,
+                        "pose": DEFAULT_POSE_STRENGTH,
+                    },
+                    "max_upload_bytes": self.config.reference_upload_bytes,
+                },
             }
         )
 
@@ -495,7 +590,10 @@ class GenerationApi:
                 raise GenerationApiError("JSON bodyが不正です。") from exc
             if not isinstance(payload, dict):
                 raise GenerationApiError("JSON objectを指定してください。")
-            generation_request = _build_request(payload)
+            generation_request = _build_request(
+                payload,
+                reference_upload_bytes=self.config.reference_upload_bytes,
+            )
         except GenerationApiError as exc:
             return _json_error(str(exc), 400)
         except web.HTTPRequestEntityTooLarge:
@@ -508,6 +606,51 @@ class GenerationApi:
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
         return web.json_response(_job_response(job), status=202)
+
+    async def upload_reference(self, request: web.Request) -> web.Response:
+        """Accept one validated image and return only its opaque asset id."""
+
+        if request.content_length is not None and request.content_length > self.config.reference_upload_bytes:
+            return _json_error("参考画像が大きすぎます。", 413)
+        if not request.content_type.startswith("multipart/"):
+            return _json_error("multipart/form-dataが必要です。", 415)
+        try:
+            reader = await request.multipart()
+            part = await reader.next()
+            if part is None or part.name != "file":
+                raise GenerationApiError("fileフィールドに参考画像を指定してください。")
+            content_type = part.headers.get("Content-Type", "")
+            chunks: list[bytes] = []
+            total = 0
+            while not part.at_eof():
+                chunk = await part.read_chunk(size=min(1024 * 1024, self.config.reference_upload_bytes + 1))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                total += len(chunk)
+                if total > self.config.reference_upload_bytes:
+                    break
+            image_bytes = b"".join(chunks)
+            if len(image_bytes) > self.config.reference_upload_bytes:
+                raise GenerationApiError("参考画像が大きすぎます。")
+            if await reader.next() is not None:
+                raise GenerationApiError("参考画像は1枚だけ指定してください。")
+            asset = save_reference_asset(image_bytes, content_type)
+        except GenerationApiError as exc:
+            return _json_error(str(exc), 400)
+        except web.HTTPRequestEntityTooLarge:
+            return _json_error("参考画像が大きすぎます。", 413)
+        except (OSError, ValueError) as exc:
+            return _json_error(str(exc), 400)
+        return web.json_response(
+            {
+                "reference_image_id": asset.asset_id,
+                "content_type": asset.content_type,
+                "width": asset.width,
+                "height": asset.height,
+            },
+            status=201,
+        )
 
     async def get_job(self, request: web.Request) -> web.Response:
         job = self.jobs.get(request.match_info["job_id"])
@@ -567,6 +710,7 @@ class GenerationApi:
                     explicit_tags=resolution_request.explicit_tags,
                     resolved_prompt_tags=resolved.prompt_result.resolved_prompt_tags,
                     resolved_danbooru_tags=resolved.prompt_result.danbooru_resolved_prompt_tags,
+                    reference_mode=str((resolution_request.reference or {}).get("mode") or "none"),
                 )
                 outputs: list[dict[str, Any]] = []
                 errors: list[str] = []
@@ -699,6 +843,7 @@ __all__ = [
     "DEFAULT_GENERATION_API_HOST",
     "DEFAULT_GENERATION_API_PORT",
     "DEFAULT_MAX_BODY_BYTES",
+    "DEFAULT_REFERENCE_UPLOAD_BYTES",
     "GenerationApi",
     "GenerationApiConfig",
     "GenerationApiError",
