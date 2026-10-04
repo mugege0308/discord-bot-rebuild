@@ -28,6 +28,8 @@ from aiohttp import ContentTypeError, web
 from services.appearance_resolver import get_appearance_resolver_status
 from services.character_tag_dictionary import list_characters
 from services.danbooru_tag_search import (
+    TAG_SEARCH_CATEGORIES,
+    TAG_SEARCH_DEFAULT_CATEGORY,
     TAG_SEARCH_DEFAULT_LIMIT,
     TAG_SEARCH_MAX_LIMIT,
     TAG_SEARCH_MAX_QUERY_LENGTH,
@@ -605,11 +607,15 @@ class GenerationApi:
             return _json_error("limitが不正です。", 400)
         if limit < 1:
             return _json_error("limitは1以上で指定してください。", 400)
+        category = request.query.get("category", TAG_SEARCH_DEFAULT_CATEGORY).strip().casefold()
+        if category not in TAG_SEARCH_CATEGORIES:
+            return _json_error("categoryが不正です。", 400)
         try:
             result = await asyncio.to_thread(
                 search_tag_candidates,
                 query,
                 limit=min(limit, TAG_SEARCH_MAX_LIMIT),
+                category=category,
                 store=self.tag_store,
                 interpreter=self.tag_interpreter,
             )

@@ -233,32 +233,37 @@ class DanbooruTagStore:
         query: str,
         *,
         limit: int = 50,
-        allowed_categories: Sequence[str] = (GENERAL_CATEGORY,),
+        allowed_categories: Sequence[str] | None = (GENERAL_CATEGORY,),
         include_deprecated: bool = False,
     ) -> tuple[DanbooruTagCandidate, ...]:
-        """Return general active candidates using exact, alias, prefix, then FTS."""
+        """Return active candidates using exact, alias, prefix, then FTS.
+
+        ``allowed_categories=None`` means all categories from the imported
+        snapshot. The default remains ``general`` for existing resolver
+        callers.
+        """
 
         clean_query = normalize_search_text(query)
         normalized_query = normalize_tag_name(query)
         if not clean_query or limit <= 0:
             return ()
-        categories = tuple(category_name(value) for value in allowed_categories)
-        placeholders = ",".join("?" for _ in categories)
+        categories = tuple(category_name(value) for value in allowed_categories) if allowed_categories is not None else ()
+        category_clause = "1=1" if allowed_categories is None else f"category IN ({','.join('?' for _ in categories)})"
+        category_params = [] if allowed_categories is None else [*categories]
         active_clause = "1=1" if include_deprecated else "is_deprecated = 0"
         results: dict[int, DanbooruTagCandidate] = {}
 
         with self._connect() as connection:
-            params: list[object] = [*categories]
             rows = connection.execute(
                 f"""
                 SELECT tag_id, name, prompt_tag, category, post_count, is_deprecated
                 FROM tags
-                WHERE category IN ({placeholders}) AND {active_clause}
+                WHERE {category_clause} AND {active_clause}
                   AND (normalized_name = ? OR normalized_name = ?)
                 ORDER BY post_count DESC, tag_id
                 LIMIT ?
                 """,
-                [*params, normalized_query, clean_query.replace(" ", "_"), limit],
+                [*category_params, normalized_query, clean_query.replace(" ", "_"), limit],
             ).fetchall()
             for row in rows:
                 results[int(row["tag_id"])] = self._candidate_from_row(
@@ -273,11 +278,11 @@ class DanbooruTagStore:
                 JOIN tags AS t ON t.normalized_name = a.normalized_consequent
                 WHERE a.normalized_antecedent = ?
                   AND a.status = 'active'
-                  AND t.category IN ({placeholders}) AND {active_clause}
+                  AND {category_clause.replace('category', 't.category')} AND {active_clause}
                 ORDER BY t.post_count DESC, t.tag_id
                 LIMIT ?
                 """,
-                [normalized_query, *params, limit],
+                [normalized_query, *category_params, limit],
             ).fetchall()
             for row in alias_rows:
                 tag_id = int(row["tag_id"])
@@ -299,14 +304,14 @@ class DanbooruTagStore:
                 FROM tags AS t
                 LEFT JOIN tag_aliases AS a ON a.normalized_consequent = t.normalized_name
                     AND a.status = 'active'
-                WHERE t.category IN ({placeholders}) AND {active_clause}
+                WHERE {category_clause.replace('category', 't.category')} AND {active_clause}
                   AND (t.normalized_name LIKE ? OR t.prompt_tag LIKE ?
                        OR a.normalized_antecedent LIKE ?)
                 ORDER BY t.post_count DESC, t.tag_id
                 LIMIT ?
                 """,
                 [
-                    *params,
+                    *category_params,
                     f"{normalized_query}%",
                     f"{clean_query}%",
                     f"{normalized_query}%",
@@ -336,11 +341,11 @@ class DanbooruTagStore:
                     FROM tags_fts
                     JOIN tags AS t ON t.tag_id = CAST(tags_fts.tag_id AS INTEGER)
                     WHERE tags_fts MATCH ?
-                      AND t.category IN ({placeholders}) AND {active_clause}
+                      AND {category_clause.replace('category', 't.category')} AND {active_clause}
                     ORDER BY rank ASC, t.post_count DESC, t.tag_id
                     LIMIT ?
                     """,
-                    [fts_query, *params, limit],
+                    [fts_query, *category_params, limit],
                 ).fetchall()
                 for row in fts_rows:
                     tag_id = int(row["tag_id"])
