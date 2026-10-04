@@ -17,6 +17,7 @@ import logging
 import os
 import re
 import secrets
+import sqlite3
 import threading
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -26,6 +27,14 @@ from aiohttp import ContentTypeError, web
 
 from services.appearance_resolver import get_appearance_resolver_status
 from services.character_tag_dictionary import list_characters
+from services.danbooru_tag_search import (
+    TAG_SEARCH_DEFAULT_LIMIT,
+    TAG_SEARCH_MAX_LIMIT,
+    TAG_SEARCH_MAX_QUERY_LENGTH,
+    TagSearchError,
+    search_tag_candidates,
+)
+from services.danbooru_tag_store import DanbooruTagStore
 from services.generation_service import GenerationRequest, GenerationService, PreparedGeneration
 from services.generation_reference_assets import (
     MAX_REFERENCE_IMAGE_BYTES,
@@ -488,9 +497,13 @@ class GenerationApi:
         *,
         service: GenerationService | None = None,
         config: GenerationApiConfig | None = None,
+        tag_store: DanbooruTagStore | None = None,
+        tag_interpreter: object | None = None,
     ) -> None:
         self.config = config or GenerationApiConfig()
         self.service = service or GenerationService()
+        self.tag_store = tag_store or DanbooruTagStore()
+        self.tag_interpreter = tag_interpreter
         self.jobs = _JobStore()
         self._generation_lock = asyncio.Lock()
         self._tasks: set[asyncio.Task[None]] = set()
@@ -501,6 +514,7 @@ class GenerationApi:
             [
                 web.get("/api/generation/health", self.health),
                 web.get("/api/generation/options", self.options),
+                web.get("/api/generation/tags/search", self.search_tags),
                 web.post("/api/generation/references", self.upload_reference),
                 web.post("/api/generation/jobs", self.create_job),
                 web.get("/api/generation/jobs/{job_id}", self.get_job),
@@ -579,6 +593,32 @@ class GenerationApi:
                 },
             }
         )
+
+    async def search_tags(self, request: web.Request) -> web.Response:
+        query = request.query.get("q", "")
+        if len(query) > TAG_SEARCH_MAX_QUERY_LENGTH:
+            return _json_error("検索語が長すぎます。", 400)
+        raw_limit = request.query.get("limit", str(TAG_SEARCH_DEFAULT_LIMIT))
+        try:
+            limit = int(raw_limit)
+        except (TypeError, ValueError):
+            return _json_error("limitが不正です。", 400)
+        if limit < 1:
+            return _json_error("limitは1以上で指定してください。", 400)
+        try:
+            result = await asyncio.to_thread(
+                search_tag_candidates,
+                query,
+                limit=min(limit, TAG_SEARCH_MAX_LIMIT),
+                store=self.tag_store,
+                interpreter=self.tag_interpreter,
+            )
+        except TagSearchError as exc:
+            return _json_error(str(exc), 400)
+        except (OSError, RuntimeError, sqlite3.Error) as exc:
+            logger.warning("Danbooru tag search unavailable: error_type=%s", type(exc).__name__)
+            return _json_error("タグ検索を利用できません。", 503)
+        return web.json_response(result)
 
     async def create_job(self, request: web.Request) -> web.Response:
         try:
@@ -821,10 +861,17 @@ def create_generation_app(
     *,
     service: GenerationService | None = None,
     config: GenerationApiConfig | None = None,
+    tag_store: DanbooruTagStore | None = None,
+    tag_interpreter: object | None = None,
 ) -> web.Application:
     """Build the app without binding a socket; suitable for a launcher/tests."""
 
-    return GenerationApi(service=service, config=config).app
+    return GenerationApi(
+        service=service,
+        config=config,
+        tag_store=tag_store,
+        tag_interpreter=tag_interpreter,
+    ).app
 
 
 def run_generation_api(
