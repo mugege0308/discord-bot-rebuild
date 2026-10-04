@@ -368,6 +368,38 @@ class DanbooruTagStore:
             )[:limit]
         )
 
+    def find_canonical(
+        self,
+        name: str,
+        *,
+        allowed_categories: Sequence[str] = (),
+    ) -> DanbooruTagCandidate | None:
+        """Return one active canonical row for a validated external dictionary."""
+
+        normalized = normalize_tag_name(name)
+        if not normalized:
+            return None
+        categories = tuple(category_name(value) for value in allowed_categories)
+        category_clause = "1=1" if not categories else f"category IN ({','.join('?' for _ in categories)})"
+        with self._connect() as connection:
+            row = connection.execute(
+                f"""
+                SELECT tag_id, name, prompt_tag, category, post_count, is_deprecated
+                FROM tags
+                WHERE normalized_name = ? AND is_deprecated = 0 AND {category_clause}
+                LIMIT 1
+                """,
+                [normalized, *categories],
+            ).fetchone()
+        if row is None:
+            return None
+        return self._candidate_from_row(
+            row,
+            query=name,
+            match_type="canonical",
+            retrieval_score=100.0,
+        )
+
     @staticmethod
     def _fts_query(clean_query: str) -> str:
         tokens = _SEARCH_TOKEN_RE.findall(clean_query)

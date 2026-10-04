@@ -13,7 +13,15 @@ from collections import OrderedDict
 from threading import RLock
 from typing import Callable, Sequence
 
-from services.danbooru_tag_store import DanbooruTagCandidate, DanbooruTagStore
+from services.danbooru_tag_store import (
+    DEFAULT_DANBOORU_DB_PATH,
+    DanbooruTagCandidate,
+    DanbooruTagStore,
+)
+from services.danbooru_ja_dictionary import (
+    DanbooruJapaneseDictionary,
+    get_default_dictionary,
+)
 from services.prompt_generator import post_prompt_designer_completion
 
 
@@ -43,14 +51,16 @@ def _public_candidate(
     candidate: DanbooruTagCandidate,
     *,
     translation_ja: str | None = None,
+    matched_by: str | None = None,
 ) -> dict[str, object]:
-    match_type = candidate.match_type
-    if match_type.startswith("alias"):
-        matched_by = "alias"
-    elif match_type == "exact":
-        matched_by = "canonical"
-    else:
-        matched_by = "search"
+    if matched_by is None:
+        match_type = candidate.match_type
+        if match_type.startswith("alias"):
+            matched_by = "alias"
+        elif match_type == "exact":
+            matched_by = "canonical"
+        else:
+            matched_by = "search"
     return {
         "tag": candidate.name,
         "category": candidate.category,
@@ -158,11 +168,19 @@ def _parse_translation_map(raw: str, tags: Sequence[str]) -> dict[str, str]:
 def _translate_result_tags(
     tags: Sequence[str],
     interpreter: Callable[..., str],
+    dictionary: DanbooruJapaneseDictionary | None = None,
 ) -> tuple[dict[str, str], bool]:
+    dictionary_labels: dict[str, str] = {}
+    if dictionary is not None and dictionary.available:
+        for tag in tags:
+            label = dictionary.translation_for(tag)
+            if label:
+                dictionary_labels[tag] = label
     cached = _cached_translations(tags)
-    missing = [tag for tag in tags if tag not in cached]
+    translated = {**cached, **dictionary_labels}
+    missing = [tag for tag in tags if tag not in translated]
     if not missing:
-        return cached, False
+        return translated, False
     system = (
         "Return one JSON object only. Translate each supplied canonical Danbooru "
         "tag into a concise Japanese display label. Keep the exact tag keys, "
@@ -174,10 +192,9 @@ def _translate_result_tags(
         raw = interpreter(system, user, temperature=0.0, max_tokens=512)
         translated = _parse_translation_map(raw, missing)
     except Exception:  # noqa: BLE001 - translation failure must not hide results
-        return cached, True
+        return translated, True
     _store_translations(translated)
-    cached.update(translated)
-    return cached, len(translated) < len(missing)
+    return translated, len(translated) < len(missing)
 
 
 def search_tag_candidates(
@@ -187,6 +204,7 @@ def search_tag_candidates(
     category: str = TAG_SEARCH_DEFAULT_CATEGORY,
     store: DanbooruTagStore | None = None,
     interpreter: Callable[..., str] | None = None,
+    dictionary: DanbooruJapaneseDictionary | None = None,
 ) -> dict[str, object]:
     clean_query = str(query or "").strip()
     if len(clean_query) > TAG_SEARCH_MAX_QUERY_LENGTH:
@@ -205,55 +223,114 @@ def search_tag_candidates(
         return {"query": "", "category": selected_category, "interpreted_terms": [], "results": []}
 
     tag_store = store or DanbooruTagStore()
+    if dictionary is not None:
+        ja_dictionary = dictionary
+    elif tag_store.path.resolve() == DEFAULT_DANBOORU_DB_PATH.resolve():
+        ja_dictionary = get_default_dictionary()
+    else:
+        ja_dictionary = None
+    direct_dictionary_matches = ()
+    search_source = "canonical"
     if _is_japanese_or_non_ascii(clean_query):
-        translate = interpreter or post_prompt_designer_completion
-        try:
-            terms = _translate_query(clean_query, translate)
-        except Exception:  # noqa: BLE001 - translator failure is a safe empty result
-            return {
-                "query": clean_query,
-                "category": selected_category,
-                "interpreted_terms": [],
-                "results": [],
-                "warning": TAG_SEARCH_WARNING,
-            }
+        if ja_dictionary is not None:
+            direct_dictionary_matches = ja_dictionary.search(
+                clean_query,
+                category=selected_category,
+                store=tag_store,
+                limit=safe_limit,
+            )
+        if direct_dictionary_matches:
+            terms = (clean_query,)
+            search_source = "dictionary"
+        else:
+            translate = interpreter or post_prompt_designer_completion
+            try:
+                terms = _translate_query(clean_query, translate)
+            except Exception:  # noqa: BLE001 - translator failure is a safe empty result
+                return {
+                    "query": clean_query,
+                    "category": selected_category,
+                    "interpreted_terms": [],
+                    "results": [],
+                    "search_source": "llm",
+                    "lm_used": True,
+                    "warning": TAG_SEARCH_WARNING,
+                }
+            search_source = "llm"
     else:
         terms = (clean_query,)
 
-    results: list[DanbooruTagCandidate] = []
+    results: list[DanbooruTagCandidate] = [item.candidate for item in direct_dictionary_matches]
+    dictionary_labels = {item.candidate.name: item.translation_ja for item in direct_dictionary_matches if item.translation_ja}
     matched_terms: list[str] = []
     seen_ids: set[int] = set()
+    for candidate in results:
+        seen_ids.add(candidate.tag_id)
+    if direct_dictionary_matches:
+        matched_terms.append(clean_query)
     allowed_categories = None if selected_category == "all" else (selected_category,)
-    for term in terms:
-        candidates = tag_store.search(
-            term,
-            limit=safe_limit,
-            allowed_categories=allowed_categories,
-            include_deprecated=False,
-        )
-        term_had_match = False
-        for candidate in candidates:
-            term_had_match = True
-            if candidate.tag_id in seen_ids:
-                continue
-            seen_ids.add(candidate.tag_id)
-            results.append(candidate)
+    if not direct_dictionary_matches:
+        for term in terms:
+            candidates = tag_store.search(
+                term,
+                limit=safe_limit,
+                allowed_categories=allowed_categories,
+                include_deprecated=False,
+            )
+            term_had_match = False
+            for candidate in candidates:
+                term_had_match = True
+                if candidate.tag_id in seen_ids:
+                    continue
+                seen_ids.add(candidate.tag_id)
+                results.append(candidate)
+                if len(results) >= safe_limit:
+                    break
+            if term_had_match:
+                matched_terms.append(term)
             if len(results) >= safe_limit:
                 break
-        if term_had_match:
-            matched_terms.append(term)
-        if len(results) >= safe_limit:
-            break
-    translations, translation_failed = _translate_result_tags(
-        [candidate.name for candidate in results],
-        interpreter or post_prompt_designer_completion,
-    )
+        if not results and ja_dictionary is not None:
+            direct_dictionary_matches = ja_dictionary.search(
+                clean_query,
+                category=selected_category,
+                store=tag_store,
+                limit=safe_limit,
+            )
+            if direct_dictionary_matches:
+                search_source = "dictionary"
+                results = [item.candidate for item in direct_dictionary_matches]
+                dictionary_labels = {
+                    item.candidate.name: item.translation_ja
+                    for item in direct_dictionary_matches
+                    if item.translation_ja
+                }
+                seen_ids = {candidate.tag_id for candidate in results}
+                matched_terms.append(clean_query)
+        if direct_dictionary_matches and _is_japanese_or_non_ascii(clean_query):
+            translations = dictionary_labels
+            translation_failed = False
+        else:
+            translations, translation_failed = _translate_result_tags(
+                [candidate.name for candidate in results],
+                interpreter or post_prompt_designer_completion,
+                ja_dictionary,
+            )
+    else:
+        translations = dictionary_labels
+        translation_failed = False
     response: dict[str, object] = {
         "query": clean_query,
         "category": selected_category,
         "interpreted_terms": matched_terms,
+        "search_source": search_source,
+        "lm_used": search_source == "llm",
         "results": [
-            _public_candidate(candidate, translation_ja=translations.get(candidate.name))
+            _public_candidate(
+                candidate,
+                translation_ja=translations.get(candidate.name),
+                matched_by=("dictionary" if any(item.candidate.tag_id == candidate.tag_id for item in direct_dictionary_matches) else None),
+            )
             for candidate in results
         ],
     }

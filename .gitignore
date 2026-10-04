@@ -18,6 +18,7 @@ data/sd_outputs/
 data/sd_selection_batches/
 data/dev_tasks/
 data/generation_references/
+data/danbooru_ja/
 
 outputs/
 work/
