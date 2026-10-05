@@ -30,6 +30,7 @@ _CATEGORY_NAMES = {
     5: "meta",
 }
 _SEARCH_TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9_'-]*", re.IGNORECASE)
+_CHARACTER_TOKEN_RE = re.compile(r"^[a-z0-9]+(?:_[a-z0-9]+)*$", re.IGNORECASE)
 
 
 class _ReadOnlyConnection(sqlite3.Connection):
@@ -55,6 +56,19 @@ def normalize_search_text(value: str) -> str:
     normalized = unicodedata.normalize("NFKC", str(value or "")).casefold().strip()
     normalized = normalized.replace("_", " ").replace("-", " ")
     return " ".join(normalized.split())
+
+
+def _character_token_score(normalized_name: str, token: str) -> int:
+    parts = normalized_name.split("_")
+    if normalized_name == token:
+        return 92
+    if parts and parts[-1] == token:
+        return 96
+    if token in parts:
+        return 94
+    if parts and parts[0] == token:
+        return 90
+    return 0
 
 
 def category_name(value: object) -> str:
@@ -360,6 +374,83 @@ class DanbooruTagStore:
                             retrieval_score=score,
                         ),
                     )
+
+        return tuple(
+            sorted(
+                results.values(),
+                key=lambda item: (-item.retrieval_score, -math.log1p(max(item.post_count, 0)), item.name),
+            )[:limit]
+        )
+
+    def search_character_tokens(
+        self,
+        tokens: Sequence[str],
+        *,
+        limit: int = 50,
+        include_deprecated: bool = False,
+    ) -> tuple[DanbooruTagCandidate, ...]:
+        """Find character tags containing complete underscore-delimited tokens.
+
+        This intentionally does not use arbitrary substring matching.  A query
+        token such as ``sakuya`` can match ``izayoi_sakuya`` while a short token
+        such as ``ana`` cannot match every name that merely contains those
+        letters.
+        """
+
+        if limit <= 0:
+            return ()
+        normalized_tokens: list[str] = []
+        seen_tokens: set[str] = set()
+        for raw_token in tokens:
+            token = normalize_tag_name(raw_token)
+            if not token or not _CHARACTER_TOKEN_RE.fullmatch(token) or token in seen_tokens:
+                continue
+            seen_tokens.add(token)
+            normalized_tokens.append(token)
+        if not normalized_tokens:
+            return ()
+
+        active_clause = "1=1" if include_deprecated else "is_deprecated = 0"
+        results: dict[int, DanbooruTagCandidate] = {}
+        with self._connect() as connection:
+            for token in normalized_tokens:
+                rows = connection.execute(
+                    f"""
+                    SELECT tag_id, name, prompt_tag, category, post_count, is_deprecated
+                    FROM tags
+                    WHERE category = 'character' AND {active_clause}
+                      AND (
+                        normalized_name = ?
+                        OR normalized_name LIKE ? ESCAPE '\\'
+                        OR normalized_name LIKE ? ESCAPE '\\'
+                        OR normalized_name LIKE ? ESCAPE '\\'
+                      )
+                    ORDER BY post_count DESC, tag_id
+                    LIMIT ?
+                    """,
+                    [
+                        token,
+                        f"{token}\\_%",
+                        f"%\\_{token}",
+                        f"%\\_{token}\\_%",
+                        limit,
+                    ],
+                ).fetchall()
+                for row in rows:
+                    normalized_name = normalize_tag_name(str(row["name"]))
+                    score = _character_token_score(normalized_name, token)
+                    if score <= 0:
+                        continue
+                    candidate = self._candidate_from_row(
+                        row,
+                        query=token,
+                        match_type="character_token",
+                        matched_alias=token,
+                        retrieval_score=float(score),
+                    )
+                    previous = results.get(candidate.tag_id)
+                    if previous is None or candidate.retrieval_score > previous.retrieval_score:
+                        results[candidate.tag_id] = candidate
 
         return tuple(
             sorted(
