@@ -16,6 +16,7 @@ from services.prompt_tag_dictionary import (
     PromptTagEntry,
     load_prompt_tag_dictionary,
 )
+from services.prompt_conflict_resolver import classify_text_constraints
 MAX_GENERATION_COUNT = 8
 VARIATION_OFF = "off"
 VARIATION_AUTO = "auto"
@@ -82,6 +83,7 @@ def locked_categories(
     explicit_tags: Sequence[str] = (),
     resolved_prompt_tags: Sequence[str] = (),
     resolved_danbooru_tags: Sequence[str] = (),
+    request_text: str = "",
     *,
     dictionary: PromptTagDictionary | None = None,
 ) -> frozenset[str]:
@@ -102,6 +104,11 @@ def locked_categories(
         category = _EXPLICIT_CATEGORY_HINTS.get(_key(value))
         if category:
             categories.add(category)
+    categories.update(
+        category
+        for category in classify_text_constraints(request_text, dictionary=prompt_dictionary)
+        if category in {"framing", "camera_horizontal", "expression", "basic_pose", "gaze"}
+    )
     return frozenset(categories)
 
 
@@ -113,6 +120,7 @@ def plan_variation_slots(
     explicit_tags: Sequence[str] = (),
     resolved_prompt_tags: Sequence[str] = (),
     resolved_danbooru_tags: Sequence[str] = (),
+    request_text: str = "",
     reference_mode: str = "none",
     dictionary: PromptTagDictionary | None = None,
 ) -> tuple[VariationSlot, ...]:
@@ -138,6 +146,7 @@ def plan_variation_slots(
         explicit_tags,
         resolved_prompt_tags,
         resolved_danbooru_tags,
+        request_text,
         dictionary=prompt_dictionary,
     )
     normalized_reference_mode = _key(reference_mode or "none")

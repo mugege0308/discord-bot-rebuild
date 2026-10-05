@@ -29,6 +29,13 @@ from services.prompt_tag_resolver import (
     apply_prompt_tag_resolution,
     resolve_prompt_tags,
 )
+from services.prompt_conflict_resolver import (
+    PromptConflict,
+    PromptTagRecord,
+    SuppressedPromptTag,
+    has_non_solo_constraint,
+    resolve_prompt_tag_conflicts,
+)
 from services.sd_control import (
     GeneratedImage,
     LoraSelection,
@@ -264,6 +271,7 @@ class GenerationRequest:
 class TagProvenance:
     tag: str
     source: str
+    category: str = ""
 
 
 def _positive_tokens(value: object) -> list[str]:
@@ -279,10 +287,15 @@ def _subject_system_tags(request: GenerationRequest, tokens: Sequence[str]) -> t
         for value in (
             _normalise_text(request.character_preset),
             _normalise_text(request.freeform_character),
+            _normalise_text(request.request_text),
         )
         if value
     ).casefold()
     multi_subject = any(hint.casefold() in subject for hint in _MULTI_SUBJECT_HINTS)
+    multi_subject = multi_subject or has_non_solo_constraint(
+        tuple(tokens),
+        context_text=subject,
+    )
 
     result: list[str] = []
     if "1girl" in keys:
@@ -353,6 +366,8 @@ class ResolvedGeneration:
     explicit_tags: tuple[str, ...] = ()
     appearance_tags: tuple[str, ...] = ()
     provenance: tuple[TagProvenance, ...] = ()
+    suppressed_tags: tuple[SuppressedPromptTag, ...] = ()
+    prompt_conflicts: tuple[PromptConflict, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -547,6 +562,7 @@ class GenerationService:
         prompt_result: ShogouPromptResult | None = None,
         positive_override: str | None = None,
         negative_prompt_override: str | None = None,
+        variation_tags: Sequence[str] = (),
         resolved_loras: tuple[LoraSelection, ...] | None = None,
         lora_resolver: LoraResolver | None = None,
         gallery_output_root: Path | None = None,
@@ -568,7 +584,44 @@ class GenerationService:
             resolve_loras = lora_resolver or resolve_saved_lora_selections
             loras = tuple(resolve_loras(request.loras, model_family=profile.model_family))
         positive_source = positive_override if positive_override is not None else resolved.prompt_result.positive
-        positive, system_provenance = _finalize_positive(request, profile, positive_source)
+        base_provenance = tuple(
+            PromptTagRecord(item.tag, item.source, item.category)
+            for item in resolved.provenance
+        )
+        pre_final_conflicts = resolve_prompt_tag_conflicts(
+            positive_source,
+            explicit_tags=resolved.explicit_tags,
+            request_text=request.request_text or "",
+            character_text=" ".join(
+                value
+                for value in (request.character_preset, request.freeform_character)
+                if _normalise_text(value)
+            ),
+            base_provenance=base_provenance,
+            variation_tags=variation_tags,
+        )
+        positive, system_provenance = _finalize_positive(
+            request,
+            profile,
+            pre_final_conflicts.positive,
+        )
+        system_records = tuple(
+            PromptTagRecord(item.tag, item.source, item.category)
+            for item in system_provenance
+        )
+        final_conflicts = resolve_prompt_tag_conflicts(
+            positive,
+            explicit_tags=resolved.explicit_tags,
+            request_text=request.request_text or "",
+            character_text=" ".join(
+                value
+                for value in (request.character_preset, request.freeform_character)
+                if _normalise_text(value)
+            ),
+            base_provenance=(*base_provenance, *pre_final_conflicts.provenance, *system_records),
+            variation_tags=variation_tags,
+        )
+        positive = final_conflicts.positive
         positive = apply_lora_triggers(positive, loras)
         negative = (
             negative_prompt_override
@@ -580,7 +633,15 @@ class GenerationService:
         else:
             negative = get_negative_prompt(str(negative))
 
-        prepared_provenance = [*resolved.provenance, *system_provenance]
+        prepared_provenance = [
+            TagProvenance(item.tag, item.source, item.category)
+            for item in final_conflicts.provenance
+        ]
+        prepared_provenance.extend(
+            item
+            for item in resolved.provenance
+            if _tag_key(item.tag) not in {_tag_key(value.tag) for value in prepared_provenance}
+        )
         source_overrides: dict[str, str] = {}
         for selection in loras:
             trigger = _normalise_text(selection.trigger)
@@ -592,7 +653,13 @@ class GenerationService:
             if key in _SYSTEM_TAG_KEYS:
                 source_overrides[key] = "system"
         prepared_provenance = [
-            TagProvenance(item.tag, source_overrides.get(_tag_key(item.tag), item.source))
+            TagProvenance(
+                item.tag,
+                item.source
+                if item.source in {"user_explicit", "user_request"}
+                else source_overrides.get(_tag_key(item.tag), item.source),
+                item.category,
+            )
             for item in prepared_provenance
         ]
         known_provenance_keys = {_tag_key(item.tag) for item in prepared_provenance}
@@ -603,6 +670,13 @@ class GenerationService:
             if clean and source and key not in known_provenance_keys:
                 prepared_provenance.append(TagProvenance(clean, source))
                 known_provenance_keys.add(key)
+
+        suppressed_tags = tuple(
+            dict.fromkeys((*resolved.suppressed_tags, *pre_final_conflicts.suppressed_tags, *final_conflicts.suppressed_tags))
+        )
+        prompt_conflicts = tuple(
+            dict.fromkeys((*resolved.prompt_conflicts, *pre_final_conflicts.prompt_conflicts, *final_conflicts.prompt_conflicts))
+        )
 
         reference_values = dict(request.reference or {})
         reference_mode = str(reference_values.get("mode") or "none").strip().casefold()
@@ -668,6 +742,8 @@ class GenerationService:
             resolved,
             prompt_result=prepared_result,
             provenance=tuple(dict.fromkeys(prepared_provenance)),
+            suppressed_tags=suppressed_tags,
+            prompt_conflicts=prompt_conflicts,
         )
         return PreparedGeneration(
             request=request,

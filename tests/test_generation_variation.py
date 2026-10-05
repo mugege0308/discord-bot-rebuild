@@ -56,6 +56,18 @@ class GenerationVariationTests(unittest.TestCase):
         self.assertFalse({"portrait", "upper body", "cowboy shot", "full body"} & all_tags)
         self.assertFalse({"smile", "serious", "surprised", "blush"} & all_tags)
 
+    def test_request_text_locks_expression_pose_framing_and_camera(self):
+        slots = plan_variation_slots(
+            4,
+            VARIATION_AUTO,
+            request_text="smile, running, full body, from side",
+        )
+        all_tags = {tag for slot in slots for tag in slot.tags}
+        self.assertFalse({"smile", "serious", "surprised", "blush"} & all_tags)
+        self.assertFalse({"standing", "sitting", "walking", "kneeling"} & all_tags)
+        self.assertFalse({"portrait", "upper body", "cowboy shot", "full body"} & all_tags)
+        self.assertFalse({"straight-on", "three-quarter view", "from side", "from behind"} & all_tags)
+
     def test_pose_reference_locks_pose_and_framing(self):
         slots = plan_variation_slots(4, VARIATION_AUTO, reference_mode="pose")
         all_tags = {tag for slot in slots for tag in slot.tags}

@@ -451,6 +451,25 @@ def _build_gallery_metadata(
         }
         for selection in options.loras
     ]
+    tag_provenance = [
+        {
+            "tag": str(item.tag),
+            "source": str(item.source),
+            "category": str(item.category or ""),
+        }
+        for item in prepared.resolved.provenance
+        if str(item.tag or "").strip()
+    ]
+    suppressed_tags = [
+        item.to_dict()
+        for item in prepared.resolved.suppressed_tags
+        if str(item.tag or "").strip()
+    ]
+    prompt_conflicts = [
+        item.to_dict()
+        for item in prepared.resolved.prompt_conflicts
+        if str(item.category or "").strip()
+    ]
     return {
         "source": "generation_api",
         "job_id": job_id,
@@ -481,6 +500,9 @@ def _build_gallery_metadata(
         "reference_image_id": str((request.reference or {}).get("image_id") or ""),
         "reference_strength": (request.reference or {}).get("strength"),
         "reference_fit": str((request.reference or {}).get("fit") or "contain"),
+        "tag_provenance": tag_provenance,
+        "suppressed_tags": suppressed_tags,
+        "prompt_conflicts": prompt_conflicts,
     }
 
 
@@ -774,6 +796,7 @@ class GenerationApi:
                     explicit_tags=resolution_request.explicit_tags,
                     resolved_prompt_tags=resolved.prompt_result.resolved_prompt_tags,
                     resolved_danbooru_tags=resolved.prompt_result.danbooru_resolved_prompt_tags,
+                    request_text=resolution_request.request_text or "",
                     reference_mode=str((resolution_request.reference or {}).get("mode") or "none"),
                 )
                 outputs: list[dict[str, Any]] = []
@@ -804,6 +827,7 @@ class GenerationApi:
                             variation_request,
                             resolved=variation_resolved,
                             positive_override=variation_positive,
+                            variation_tags=slot.tags,
                         )
                         if not isinstance(prepared, PreparedGeneration):
                             raise RuntimeError("生成準備結果が不正です。")

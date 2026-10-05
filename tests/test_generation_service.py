@@ -239,6 +239,64 @@ class GenerationServicePreparationTests(unittest.TestCase):
         self.assertEqual(len(tokens), len({token.casefold() for token in tokens}))
         self.assertEqual("custom negative", prepared.options.negative_prompt)
 
+    def test_conflicts_keep_explicit_constraints_and_record_suppressed_tags(self):
+        service = GenerationService(
+            prompt_resolver=Mock(
+                return_value=_prompt_result(
+                    positive=(
+                        "1girl, solo, 2girls, hugging, smile, serious, "
+                        "running, sitting, full body, upper body, from side, three-quarter view"
+                    )
+                )
+            )
+        )
+        request = GenerationRequest(
+            explicit_tags=("2girls", "hugging", "smile", "running", "full body", "from side"),
+            request_text="safe interaction portrait",
+            model_key="animagine",
+            rating="safe",
+        )
+
+        prepared = service.prepare_generation(request)
+        positive = {token.strip() for token in prepared.options.prompt.split(",")}
+        self.assertIn("2girls", positive)
+        self.assertIn("hugging", positive)
+        self.assertIn("smile", positive)
+        self.assertIn("running", positive)
+        self.assertIn("full body", positive)
+        self.assertIn("from side", positive)
+        self.assertNotIn("solo", positive)
+        self.assertNotIn("serious", positive)
+        self.assertNotIn("sitting", positive)
+        self.assertNotIn("upper body", positive)
+        self.assertNotIn("three-quarter view", positive)
+        self.assertTrue(any(item.tag == "solo" for item in prepared.resolved.suppressed_tags))
+        provenance = {item.tag: item.source for item in prepared.resolved.provenance}
+        self.assertEqual("user_explicit", provenance["smile"])
+        self.assertEqual("system", provenance["safe"])
+
+    def test_complementary_explicit_people_keep_user_provenance_without_solo(self):
+        service = GenerationService(
+            prompt_resolver=Mock(
+                return_value=_prompt_result(positive="1girl, solo, 1boy, holding hands")
+            )
+        )
+        request = GenerationRequest(
+            explicit_tags=("1girl", "1boy", "holding hands"),
+            request_text="two people standing together",
+            model_key="animagine",
+            rating="safe",
+        )
+
+        prepared = service.prepare_generation(request)
+        positive = {token.strip() for token in prepared.options.prompt.split(",")}
+        self.assertNotIn("solo", positive)
+        self.assertTrue({"1girl", "1boy", "holding hands"}.issubset(positive))
+        provenance = {item.tag: item.source for item in prepared.resolved.provenance}
+        self.assertEqual("user_explicit", provenance["1girl"])
+        self.assertEqual("user_explicit", provenance["1boy"])
+        self.assertFalse(any(item.category == "people_count" for item in prepared.resolved.prompt_conflicts))
+
     def test_no_lora_safe_and_explicit_seed_are_preserved(self):
         request = GenerationRequest(
             freeform_character="かわいい女の子",

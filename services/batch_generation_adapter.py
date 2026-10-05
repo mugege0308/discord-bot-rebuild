@@ -10,7 +10,7 @@ send Discord messages, or enqueue Gallery work.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import math
 from typing import Any, Callable
 
@@ -316,6 +316,24 @@ def build_batch_image_options(
             resolved_loras=loras,
             gallery_output_root=get_gallery_images_root(),
             gallery_metadata=metadata,
+        )
+        metadata["tag_provenance"] = [
+            {
+                "tag": item.tag,
+                "source": item.source,
+                "category": item.category,
+            }
+            for item in prepared.resolved.provenance
+        ]
+        metadata["suppressed_tags"] = [
+            item.to_dict() for item in prepared.resolved.suppressed_tags
+        ]
+        metadata["prompt_conflicts"] = [
+            item.to_dict() for item in prepared.resolved.prompt_conflicts
+        ]
+        prepared = replace(
+            prepared,
+            options=replace(prepared.options, gallery_metadata=metadata),
         )
         return prepared.options
     except BatchImageConfigurationError:

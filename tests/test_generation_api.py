@@ -198,6 +198,9 @@ class GenerationApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("黒髪、青い目", metadata["appearance_text"])
         self.assertEqual({"preset": "square", "width": 1024, "height": 1024}, metadata["size"])
         self.assertNotIn("C:\\", str(metadata))
+        self.assertIn("tag_provenance", metadata)
+        self.assertIn("suppressed_tags", metadata)
+        self.assertIn("prompt_conflicts", metadata)
 
         variation_metadata = _build_gallery_metadata(
             "api-job-1",
