@@ -16,12 +16,34 @@ class GenerationVariationTests(unittest.TestCase):
         self.assertEqual([1, 2, 3, 4], [slot.index for slot in slots])
         self.assertTrue(all(slot.tags == () for slot in slots))
 
+    def test_off_supports_eight_sequential_slots_without_variation_tags(self):
+        slots = plan_variation_slots(8, VARIATION_OFF)
+        self.assertEqual(list(range(1, 9)), [slot.index for slot in slots])
+        self.assertTrue(all(slot.tags == () for slot in slots))
+
     def test_auto_uses_verified_core_tags_and_distributes_slots(self):
         slots = plan_variation_slots(4, VARIATION_AUTO)
         self.assertEqual(4, len(slots))
         self.assertEqual(4, len({slot.tags[0] for slot in slots}))
         self.assertTrue(all(slot.tags for slot in slots))
         self.assertNotIn("classroom", {tag for slot in slots for tag in slot.tags})
+
+    def test_auto_eight_slots_do_not_repeat_the_first_four_recipes(self):
+        slots = plan_variation_slots(8, VARIATION_AUTO)
+        self.assertEqual(list(range(1, 9)), [slot.index for slot in slots])
+        recipes = [slot.tags for slot in slots]
+        self.assertEqual(8, len(set(recipes)))
+        self.assertNotEqual(recipes[:4], recipes[4:])
+
+    def test_start_index_continues_auto_variations_at_slots_five_to_eight(self):
+        first = plan_variation_slots(4, VARIATION_AUTO)
+        continuation = plan_variation_slots(4, VARIATION_AUTO, start_index=4)
+        self.assertEqual([5, 6, 7, 8], [slot.index for slot in continuation])
+        self.assertTrue(set(slot.tags for slot in first).isdisjoint({slot.tags for slot in continuation}))
+
+    def test_start_index_is_bounded_by_eight_slot_window(self):
+        with self.assertRaises(ValueError):
+            plan_variation_slots(5, VARIATION_AUTO, start_index=4)
 
     def test_explicit_categories_are_locked(self):
         slots = plan_variation_slots(

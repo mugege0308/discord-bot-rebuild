@@ -88,6 +88,7 @@ _ALLOWED_REQUEST_KEYS = frozenset(
         "size",
         "count",
         "variation",
+        "variation_offset",
         "seed",
         "reference_mode",
         "reference_image_id",
@@ -234,6 +235,18 @@ def _parse_variation(value: object, *, count: int) -> str:
     return VARIATION_OFF if count == 1 else mode
 
 
+def _parse_variation_offset(value: object, *, count: int) -> int:
+    if value is None:
+        return 0
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise GenerationApiError("variation_offsetが不正です。")
+    if value + count > MAX_GENERATION_COUNT:
+        raise GenerationApiError(
+            f"variation_offsetとcountの合計は{MAX_GENERATION_COUNT}以下にしてください。"
+        )
+    return value
+
+
 def _parse_reference(
     payload: Mapping[str, object],
     *,
@@ -352,6 +365,7 @@ def _build_request(
 
     count = _parse_count(payload.get("count", 1))
     variation = _parse_variation(payload.get("variation"), count=count)
+    variation_offset = _parse_variation_offset(payload.get("variation_offset"), count=count)
     reference = _parse_reference(payload, reference_upload_bytes=reference_upload_bytes)
 
     loras = _parse_loras(payload.get("loras"), model_family=profile.model_family)
@@ -373,6 +387,7 @@ def _build_request(
         height=size_spec.height,
         count=count,
         variation=variation,
+        variation_offset=variation_offset,
         seed=_parse_seed(payload.get("seed")),
         source="generation_api",
         reference=reference,
@@ -443,6 +458,7 @@ def _build_gallery_metadata(
         "variation_index": variation_index,
         "variation_tags": list(variation_tags),
         "variation": request.variation,
+        "variation_offset": request.variation_offset,
         "model": str(options.model_key or request.model_key),
         "rating": request.rating,
         "positive": options.prompt,
@@ -486,6 +502,7 @@ def _job_response(job: _Job) -> dict[str, Any]:
         "completed_count": job.completed_count,
         "failed_count": job.failed_count,
         "current_index": job.completed_count + job.failed_count,
+        "variation_offset": job.request.variation_offset,
         "variation": job.variation,
         "output": output,
     }
@@ -753,6 +770,7 @@ class GenerationApi:
                 slots = plan_variation_slots(
                     job.total_count,
                     job.variation,
+                    start_index=resolution_request.variation_offset,
                     explicit_tags=resolution_request.explicit_tags,
                     resolved_prompt_tags=resolved.prompt_result.resolved_prompt_tags,
                     resolved_danbooru_tags=resolved.prompt_result.danbooru_resolved_prompt_tags,

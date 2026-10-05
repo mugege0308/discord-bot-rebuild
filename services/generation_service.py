@@ -198,6 +198,7 @@ class GenerationRequest:
     sampler: str = "Euler a"
     count: int = 1
     variation: str = "off"
+    variation_offset: int = 0
     seed: int = -1
     requester_id: int | str | None = None
     source: str = "unknown"
@@ -244,6 +245,13 @@ class GenerationRequest:
             raise PromptGeneratorError("model_keyを指定してください。")
         if self.count < 1 or self.count > MAX_GENERATION_COUNT:
             raise PromptGeneratorError(f"countは1～{MAX_GENERATION_COUNT}枚で指定してください。")
+        if (
+            isinstance(self.variation_offset, bool)
+            or not isinstance(self.variation_offset, int)
+            or self.variation_offset < 0
+            or self.variation_offset + self.count > MAX_GENERATION_COUNT
+        ):
+            raise PromptGeneratorError("variationの開始位置と枚数の組み合わせが不正です。")
         if self.width < 256 or self.height < 256:
             raise PromptGeneratorError("画像サイズは256以上で指定してください。")
         if self.steps < 1 or self.cfg < 0:

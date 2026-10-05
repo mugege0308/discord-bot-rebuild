@@ -16,7 +16,7 @@ from services.prompt_tag_dictionary import (
     PromptTagEntry,
     load_prompt_tag_dictionary,
 )
-MAX_GENERATION_COUNT = 4
+MAX_GENERATION_COUNT = 8
 VARIATION_OFF = "off"
 VARIATION_AUTO = "auto"
 VARIATION_MODES = frozenset({VARIATION_OFF, VARIATION_AUTO})
@@ -109,6 +109,7 @@ def plan_variation_slots(
     count: int,
     mode: str,
     *,
+    start_index: int = 0,
     explicit_tags: Sequence[str] = (),
     resolved_prompt_tags: Sequence[str] = (),
     resolved_danbooru_tags: Sequence[str] = (),
@@ -119,11 +120,18 @@ def plan_variation_slots(
 
     if isinstance(count, bool) or not isinstance(count, int) or not 1 <= count <= MAX_GENERATION_COUNT:
         raise ValueError(f"countは1～{MAX_GENERATION_COUNT}枚で指定してください。")
+    if isinstance(start_index, bool) or not isinstance(start_index, int) or not 0 <= start_index < MAX_GENERATION_COUNT:
+        raise ValueError("variationの開始位置が不正です。")
+    if start_index + count > MAX_GENERATION_COUNT:
+        raise ValueError("variationの開始位置と枚数の組み合わせが不正です。")
     normalized_mode = _key(mode or VARIATION_OFF)
     if normalized_mode not in VARIATION_MODES:
         raise ValueError("variationはoffまたはautoで指定してください。")
     if count == 1 or normalized_mode == VARIATION_OFF:
-        return tuple(VariationSlot(index=index) for index in range(1, count + 1))
+        return tuple(
+            VariationSlot(index=index)
+            for index in range(start_index + 1, start_index + count + 1)
+        )
 
     prompt_dictionary = dictionary or load_prompt_tag_dictionary(DEFAULT_PROMPT_TAG_PROFILE)
     locked = locked_categories(
@@ -155,10 +163,16 @@ def plan_variation_slots(
             candidates.append((category, values))
 
     slots: list[VariationSlot] = []
-    for index in range(count):
+    for local_index in range(count):
+        index = start_index + local_index
         tags: list[str] = []
-        for category, values in candidates:
-            tags.append(values[index % len(values)])
+        for category_index, (_category, values) in enumerate(candidates):
+            # Keep slots 1-4 byte-for-byte compatible with the original
+            # planner.  For slots 5-8, rotate each category independently so
+            # the second group is not a repetition of slots 1-4.
+            cycle = index // 4
+            rotation = cycle * (category_index + 1)
+            tags.append(values[(index + rotation) % len(values)])
         slots.append(VariationSlot(index=index + 1, tags=tuple(tags)))
     return tuple(slots)
 

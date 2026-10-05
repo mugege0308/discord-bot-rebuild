@@ -214,7 +214,7 @@ class GenerationApiTests(unittest.IsolatedAsyncioTestCase):
             ({"freeform_character": "x", "model_key": "not-a-model"}, "model"),
             ({"freeform_character": "x", "rating": "not-a-rating"}, "rating"),
             ({"freeform_character": "x", "loras": [{"key": "not-a-lora", "lora_type": "style", "strength": 0.5}]}, "lora"),
-            ({"freeform_character": "x", "count": 5}, "count"),
+            ({"freeform_character": "x", "count": 9}, "count"),
         ]
         for payload, _label in cases:
             with self.subTest(payload=payload):
@@ -310,6 +310,70 @@ class GenerationApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(3, result["completed_count"])
         self.assertEqual(1, result["failed_count"])
         self.assertEqual(3, result["output"]["image_count"])
+
+    async def test_count_eight_runs_sequentially_with_one_prompt_resolution(self):
+        await self.client.close()
+        service = _MultiImageService()
+        self.app = create_generation_app(service=service)
+        self.server = TestServer(self.app)
+        self.client = TestClient(self.server)
+        await self.client.start_server()
+
+        response = await self.client.post(
+            "/api/generation/jobs",
+            json={"freeform_character": "girl", "count": 8, "variation": "auto", "seed": 100},
+        )
+        self.assertEqual(202, response.status)
+        created = await response.json()
+        result = await self._wait_for_terminal(created["job_id"])
+
+        self.assertEqual("completed", result["state"])
+        self.assertEqual(8, result["total_count"])
+        self.assertEqual(8, result["completed_count"])
+        self.assertEqual(0, result["failed_count"])
+        self.assertEqual(1, service.prompt_call_count)
+        self.assertEqual(8, len(service.submit_calls))
+        self.assertEqual(list(range(100, 108)), [item[0].seed for item in service.submit_calls])
+        self.assertEqual(list(range(1, 9)), [item["variation_index"] for item in result["output"]["images"]])
+
+    async def test_variation_offset_four_continues_fixed_seed_slots_five_to_eight(self):
+        await self.client.close()
+        service = _MultiImageService()
+        self.app = create_generation_app(service=service)
+        self.server = TestServer(self.app)
+        self.client = TestClient(self.server)
+        await self.client.start_server()
+
+        response = await self.client.post(
+            "/api/generation/jobs",
+            json={
+                "freeform_character": "girl",
+                "count": 4,
+                "variation": "auto",
+                "variation_offset": 4,
+                "seed": 100,
+            },
+        )
+        self.assertEqual(202, response.status)
+        created = await response.json()
+        result = await self._wait_for_terminal(created["job_id"])
+
+        self.assertEqual(4, result["total_count"])
+        self.assertEqual(4, result["variation_offset"])
+        self.assertEqual(list(range(104, 108)), [item[0].seed for item in service.submit_calls])
+        self.assertEqual([5, 6, 7, 8], [item["variation_index"] for item in result["output"]["images"]])
+
+    async def test_count_nine_and_out_of_range_variation_offset_are_rejected(self):
+        response = await self.client.post(
+            "/api/generation/jobs",
+            json={"freeform_character": "girl", "count": 9},
+        )
+        self.assertEqual(400, response.status)
+        response = await self.client.post(
+            "/api/generation/jobs",
+            json={"freeform_character": "girl", "count": 4, "variation_offset": 5},
+        )
+        self.assertEqual(400, response.status)
 
     def test_only_loopback_binding_is_allowed(self):
         with self.assertRaises(ValueError):
