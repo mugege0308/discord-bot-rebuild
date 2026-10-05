@@ -7,6 +7,15 @@ started by importing this module.
 from __future__ import annotations
 
 import os
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+
+# Keep the standalone Backend launcher consistent with the main Bot entrypoint:
+# deployment-local .env values are loaded without overriding explicit process
+# environment values supplied by a regular launcher.
+load_dotenv(dotenv_path=Path(__file__).with_name(".env"))
 
 from services.generation_api import (
     DEFAULT_GENERATION_API_HOST,
