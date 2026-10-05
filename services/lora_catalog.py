@@ -188,6 +188,18 @@ def refresh_comfy_styles(outputs_dir: Path | None = None) -> dict[str, ComfyStyl
     return COMFY_STYLES
 
 
+def get_comfy_style(key: str | None) -> ComfyStyle | None:
+    """Look up a catalog entry without making catalog keys case-sensitive."""
+
+    normalized = str(key or "").strip().casefold()
+    if not normalized:
+        return None
+    for catalog_key, style in COMFY_STYLES.items():
+        if catalog_key.casefold() == normalized:
+            return style
+    return None
+
+
 def get_comfy_style_choice_specs() -> list[tuple[str, str]]:
     """Return display/value pairs for style entries only."""
 
@@ -233,6 +245,7 @@ __all__ = [
     "DEFAULT_STYLE_WORKFLOW",
     "build_comfy_styles",
     "get_comfy_lora_choice_specs",
+    "get_comfy_style",
     "get_comfy_lora_root",
     "get_comfy_style_choice_specs",
     "get_lora_catalog_summary",

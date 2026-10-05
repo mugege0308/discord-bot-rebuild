@@ -27,6 +27,7 @@ from services.lora_catalog import (
     ComfyStyle,
     build_comfy_styles,
     get_comfy_lora_choice_specs,
+    get_comfy_style,
     get_comfy_style_choice_specs,
     model_family_compatible,
     refresh_comfy_styles,
@@ -382,7 +383,7 @@ def resolve_style_selection(
             raise ValueError("LoRA strengthを指定するにはstyleを選択してください。")
         return None, None, None
 
-    style = COMFY_STYLES.get(normalized_key)
+    style = get_comfy_style(normalized_key)
     if style is None:
         raise ValueError(f"未登録のstyleです: {normalized_key}")
     if style.load_error:
@@ -413,7 +414,7 @@ def _resolve_one_lora_selection(
             raise ValueError("LoRA強度を指定するには、そのLoRAを選択してください。")
         return None
 
-    lora = COMFY_STYLES.get(normalized_key)
+    lora = get_comfy_style(normalized_key)
     if lora is None:
         raise ValueError(f"未登録のLoRAです: {normalized_key}")
     if lora.load_error:
@@ -513,7 +514,7 @@ def resolve_saved_lora_selections(
             raise ValueError("保存済みLoRA構成が不正です。")
         if not isinstance(key, str) or not key.strip():
             raise ValueError("保存済みLoRAのkeyが不正です。")
-        current = COMFY_STYLES.get(key.strip().casefold())
+        current = get_comfy_style(key)
         if current is None:
             raise ValueError(f"未登録のLoRAです: {key.strip()}")
         expected_type = str(lora_type or current.lora_type)

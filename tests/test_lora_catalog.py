@@ -9,6 +9,7 @@ from services.lora_catalog import (
     DEFAULT_STYLE_WORKFLOW,
     build_comfy_styles,
     get_comfy_lora_choice_specs,
+    get_comfy_style,
     get_comfy_style_choice_specs,
     get_lora_catalog_summary,
     model_family_compatible,
@@ -71,6 +72,28 @@ class LoraCatalogTestCase(unittest.TestCase):
             self.assertEqual(entry.model_family, "sdxl")
             self.assertEqual(entry.checkpoint, "animagineXL40Opt_clear.safetensors")
             self.assertTrue(entry.metadata_path.is_file())
+
+    def test_mixed_case_metadata_name_is_a_resolvable_style_key(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _write_model(
+                root,
+                "matuTake/matuTake_style_v1.safetensors",
+                {
+                    "name": "matuTake_style_v1",
+                    "lora_type": "style",
+                    "trigger_tag": "",
+                    "recommended_strength": 0.5,
+                    "model_family": "sdxl",
+                },
+            )
+            styles = build_comfy_styles(root)
+            with mock.patch("services.lora_catalog.COMFY_STYLES", styles):
+                entry = get_comfy_style("matuTake_style_v1")
+                self.assertIsNotNone(entry)
+                self.assertEqual("style", entry.lora_type)
+                self.assertEqual(0.5, entry.default_strength)
+                self.assertEqual("", entry.trigger)
 
     def test_missing_or_malformed_metadata_falls_back_to_style_entry(self):
         with tempfile.TemporaryDirectory() as directory:

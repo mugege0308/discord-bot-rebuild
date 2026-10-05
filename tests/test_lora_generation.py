@@ -161,6 +161,23 @@ class LoraGenerationTestCase(unittest.TestCase):
         self.assertEqual(result["7"]["inputs"]["clip"], ["20", 1])
         self.assertEqual(result["6"]["inputs"]["text"], "character_trigger, 1girl")
 
+    def test_mixed_case_catalog_key_is_accepted_by_lora_selection(self):
+        COMFY_STYLES["matuTake_style_v1"] = ComfyStyle(
+            display_name="matuTake_style_v1",
+            lora_name="matuTake/matuTake_style_v1.safetensors",
+            trigger="",
+            default_strength=0.5,
+            lora_type="style",
+            model_family="sdxl",
+        )
+        selections = resolve_lora_selections(
+            style_key="matuTake_style_v1",
+            model_family="sdxl",
+        )
+        self.assertEqual(1, len(selections))
+        self.assertEqual("matutake_style_v1", selections[0].key)
+        self.assertEqual(0.5, selections[0].strength)
+
     def test_multiple_loras_are_serially_connected_and_ordered(self):
         selections = resolve_lora_selections(
             character_key="character",
