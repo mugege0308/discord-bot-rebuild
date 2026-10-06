@@ -1,0 +1,20 @@
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory = $true)]
+    [string]$PythonPath,
+    [Parameter(Mandatory = $true)]
+    [string]$StdoutLog,
+    [Parameter(Mandatory = $true)]
+    [string]$StderrLog
+)
+
+$ErrorActionPreference = "Stop"
+$serverScript = Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) "generation_backend_server.py"
+
+try {
+    & $PythonPath -u $serverScript 1>> $StdoutLog 2>> $StderrLog
+    exit $LASTEXITCODE
+} catch {
+    $_ | Out-File -LiteralPath $StderrLog -Append -Encoding UTF8
+    exit 1
+}

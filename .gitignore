@@ -1,4 +1,5 @@
 .env
+.generation_backend/
 
 data/claude_process_state.json
 data/memory.json
