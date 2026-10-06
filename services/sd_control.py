@@ -74,6 +74,7 @@ from services.weather import JST
 
 logger = logging.getLogger("secretary-bot.sd_control")
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = Path("data")
 OUTPUT_DIR = DATA_DIR / "sd_outputs"
 POSE_DEBUG_DIR = DATA_DIR / "pose_debug"
@@ -837,8 +838,9 @@ def get_status_message() -> str:
 
     if backend == "comfy":
         workflow_file = _get_comfy_workflow_file()
+        resolved_workflow_file = _resolve_project_path(workflow_file)
         lines.append(f"workflow: {workflow_file}")
-        lines.append(f"workflow_exists: {'yes' if workflow_file.exists() else 'no'}")
+        lines.append(f"workflow_exists: {'yes' if resolved_workflow_file.exists() else 'no'}")
     elif available:
         try:
             response = requests.get(_api_url("/sdapi/v1/progress"), params={"skip_current_image": "true"}, timeout=5)
@@ -888,6 +890,13 @@ def _get_comfy_workflow_file(
     return Path(raw_value) if raw_value else DEFAULT_COMFY_WORKFLOW_FILE
 
 
+def _resolve_project_path(path: Path) -> Path:
+    candidate = Path(path)
+    if candidate.is_absolute():
+        return candidate
+    return PROJECT_ROOT / candidate
+
+
 def _get_node_id(name: str) -> str:
     return os.getenv(name, "").strip()
 
@@ -896,7 +905,7 @@ def _load_comfy_workflow(
     reference_enabled: bool = False,
     loras: Sequence[LoraSelection] = (),
 ) -> dict[str, Any]:
-    workflow_file = _get_comfy_workflow_file(reference_enabled, loras)
+    workflow_file = _resolve_project_path(_get_comfy_workflow_file(reference_enabled, loras))
     if not workflow_file.exists() or not workflow_file.is_file():
         raise RuntimeError(f"ComfyUI workflow file が見つからないよ: {workflow_file}")
 
@@ -1198,6 +1207,7 @@ def _extract_latent_dimensions(workflow: dict[str, Any]) -> tuple[int | None, in
 
 
 def _safe_workflow_file_hash(workflow_file: Path) -> str | None:
+    workflow_file = _resolve_project_path(workflow_file)
     try:
         data = workflow_file.read_bytes()
     except OSError:

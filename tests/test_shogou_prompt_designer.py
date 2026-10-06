@@ -1,6 +1,9 @@
 import json
+import os
 import re
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from services.prompt_generator import PromptGeneratorError
@@ -107,6 +110,30 @@ class ParseShogouPromptResponseTestCase(unittest.TestCase):
         result = parse_shogou_prompt_response("this is not json at all")
 
         self.assertTrue(result.blocked)
+
+
+class PromptInstructionPathResolutionTestCase(unittest.TestCase):
+    def test_instruction_load_does_not_depend_on_process_cwd(self):
+        original_cwd = Path.cwd()
+        with tempfile.TemporaryDirectory() as directory:
+            try:
+                os.chdir(directory)
+                instruction = load_shogou_instruction("animagine")
+            finally:
+                os.chdir(original_cwd)
+
+        self.assertIn("`positive`, `negative`, `summary`, `assumptions`", instruction)
+
+    def test_missing_instruction_keeps_safe_failure(self):
+        profile = mock.Mock(
+            prompt_designer_instruction=Path("missing-prompt-instruction.md"),
+            prompt_designer_addendum=None,
+        )
+        with mock.patch(
+            "services.shogou_prompt_designer.get_image_generation_profile",
+            return_value=profile,
+        ), self.assertRaisesRegex(PromptGeneratorError, "missing-prompt-instruction.md"):
+            load_shogou_instruction("animagine")
 
 
 class GenerateShogouPromptResultMemoryWiringTestCase(unittest.TestCase):

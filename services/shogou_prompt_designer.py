@@ -63,6 +63,7 @@ from services.generate_ai_debug import (
 logger = logging.getLogger("secretary-bot.shogou_prompt_designer")
 
 INSTRUCTION_FILE = Path("shogou_chan_prompt_designer_instruction.md")
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 REQUIRED_KEYS = ("positive", "negative", "summary", "assumptions")
 SHOGOU_RESPONSE_FORMAT = {"type": "json_schema", "json_schema": {"name": "shogou_prompt_result", "schema": {"type": "object"}}}
 PROMPT_RATING_AUTO = "auto"
@@ -170,16 +171,29 @@ def _build_grounded_summary(positive: str) -> str:
         return "生成条件を確定しました。"
     return "生成条件: " + ", ".join(visible_tags)
 
+def _resolve_prompt_instruction_path(path: Path) -> Path:
+    """Resolve bundled prompt instructions independently of the process CWD."""
+
+    candidate = Path(path)
+    if candidate.is_absolute():
+        return candidate
+    return PROJECT_ROOT / candidate
+
+
 def load_shogou_instruction(model_key: str = DEFAULT_IMAGE_GENERATION_MODEL_KEY) -> str:
     try:
         profile = get_image_generation_profile(model_key)
     except ValueError as exc:
         raise PromptGeneratorError(str(exc)) from exc
-    instruction_file = profile.prompt_designer_instruction
+    instruction_file = _resolve_prompt_instruction_path(profile.prompt_designer_instruction)
     if not instruction_file.exists():
         raise PromptGeneratorError(f"{instruction_file} が見つかりません。")
     instruction = instruction_file.read_text(encoding="utf-8")
-    addendum_file = profile.prompt_designer_addendum
+    addendum_file = (
+        _resolve_prompt_instruction_path(profile.prompt_designer_addendum)
+        if profile.prompt_designer_addendum is not None
+        else None
+    )
     if addendum_file is None:
         return instruction
     if not addendum_file.exists():

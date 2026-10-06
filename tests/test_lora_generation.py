@@ -1,4 +1,6 @@
 import math
+import os
+import tempfile
 import unittest
 from copy import deepcopy
 from pathlib import Path
@@ -10,6 +12,7 @@ from services.sd_control import (
     SdGenerationOptions,
     _apply_comfy_options,
     _get_comfy_workflow_file,
+    _load_comfy_workflow,
     apply_lora_triggers,
     effective_lora_selections,
     resolve_lora_selections,
@@ -305,6 +308,17 @@ class LoraGenerationTestCase(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "同時適用"):
             _get_comfy_workflow_file(True, (LoraSelection("x", "x", "style", "x", "", 0.5),))
+
+    def test_workflow_load_does_not_depend_on_process_cwd(self):
+        original_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as directory:
+            try:
+                os.chdir(directory)
+                workflow = _load_comfy_workflow()
+            finally:
+                os.chdir(original_cwd)
+
+        self.assertTrue(workflow)
 
 
 if __name__ == "__main__":
