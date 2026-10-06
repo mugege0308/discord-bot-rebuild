@@ -61,11 +61,23 @@ from services.image_generation_profiles import (
 from services.lora_catalog import COMFY_STYLES, model_family_compatible
 from services.lora_training import LORA_TYPES, normalize_lora_type
 from services.prompt_generator import PromptGeneratorError
-from services.sd_control import resolve_saved_lora_selections
+from services.sd_control import OUTPUT_DIR, resolve_saved_lora_selections
 from services.sd_control import DEFAULT_REFERENCE_STRENGTH
 from services.pose_reference import DEFAULT_POSE_STRENGTH
 from services.shogou_prompt_designer import PROMPT_RATING_CHOICES
 from services.image_selection import select_generated_images
+from services.overnight_generation import (
+    OVERNIGHT_ACTIVE_STATES,
+    OVERNIGHT_MAX_CONSECUTIVE_INFRA_FAILURES,
+    OVERNIGHT_MAX_RETRIES,
+    OVERNIGHT_ROUND_SIZE,
+    OVERNIGHT_TERMINAL_STATES,
+    OVERNIGHT_TOTALS,
+    OvernightJobError,
+    OvernightJobStore,
+    overnight_response,
+    utc_now_iso,
+)
 
 
 logger = logging.getLogger("secretary-bot.generation_api")
@@ -78,6 +90,7 @@ MAX_TEXT_LENGTH = 4000
 MAX_EXPLICIT_TAGS = 100
 MAX_LORAS = 3
 BULK_SELECTION_MODES = frozenset({"none", "best1", "best4"})
+_UNSET = object()
 
 _ALLOWED_REQUEST_KEYS = frozenset(
     {
@@ -199,6 +212,10 @@ class _BulkJob:
     selection_state: str = "not_requested"
     selection_error: str | None = None
     stop_requested: bool = False
+    pause_requested: bool = False
+    metadata_context: dict[str, Any] = field(default_factory=dict)
+    seed_offset: int = 0
+    requested_seed_override: object = _UNSET
     generated_paths: list[Path] = field(default_factory=list, repr=False)
 
 
@@ -213,6 +230,10 @@ class _BulkJobStore:
         total: int,
         selection_mode: str,
         variation: str,
+        *,
+        metadata_context: Mapping[str, Any] | None = None,
+        seed_offset: int = 0,
+        requested_seed_override: object = _UNSET,
     ) -> _BulkJob:
         with self._lock:
             if any(job.state in {"queued", "resolving", "generating", "selecting"} for job in self._jobs.values()):
@@ -223,6 +244,9 @@ class _BulkJobStore:
                 requested_total=total,
                 selection_mode=selection_mode,
                 variation=variation,
+                metadata_context=dict(metadata_context or {}),
+                seed_offset=int(seed_offset),
+                requested_seed_override=requested_seed_override,
             )
             self._jobs[job.bulk_id] = job
             return job
@@ -499,6 +523,8 @@ def _build_gallery_metadata(
     *,
     variation_index: int = 1,
     variation_tags: tuple[str, ...] = (),
+    metadata_overrides: Mapping[str, Any] | None = None,
+    requested_seed_override: object = _UNSET,
 ) -> dict[str, Any]:
     """Build the sidecar contract without exposing local paths or secrets."""
 
@@ -532,7 +558,7 @@ def _build_gallery_metadata(
         for item in prepared.resolved.prompt_conflicts
         if str(item.category or "").strip()
     ]
-    return {
+    metadata = {
         "source": "generation_api",
         "job_id": job_id,
         "parent_job_id": job_id,
@@ -566,6 +592,11 @@ def _build_gallery_metadata(
         "suppressed_tags": suppressed_tags,
         "prompt_conflicts": prompt_conflicts,
     }
+    if requested_seed_override is not _UNSET:
+        metadata["requested_seed"] = requested_seed_override
+    if metadata_overrides:
+        metadata.update(dict(metadata_overrides))
+    return metadata
 
 
 def _job_response(job: _Job) -> dict[str, Any]:
@@ -607,6 +638,7 @@ def _bulk_response(job: _BulkJob) -> dict[str, Any]:
         "failed_count": failed,
         "remaining_count": max(job.requested_total - completed - failed, 0),
         "stop_requested": job.stop_requested,
+        "pause_requested": job.pause_requested,
         "selection_mode": job.selection_mode,
         "variation": job.variation,
         "selection_state": job.selection_state,
@@ -640,6 +672,8 @@ class GenerationApi:
         self.tag_interpreter = tag_interpreter
         self.jobs = _JobStore()
         self.bulk_jobs = _BulkJobStore()
+        self.overnight_jobs = OvernightJobStore()
+        self._overnight_task: asyncio.Task[None] | None = None
         self._generation_lock = asyncio.Lock()
         self._tasks: set[asyncio.Task[None]] = set()
         self.app = web.Application(
@@ -656,12 +690,63 @@ class GenerationApi:
                 web.post("/api/generation/bulk-jobs", self.create_bulk_job),
                 web.get("/api/generation/bulk-jobs/{bulk_id}", self.get_bulk_job),
                 web.post("/api/generation/bulk-jobs/{bulk_id}/stop", self.stop_bulk_job),
+                web.post("/api/generation/overnight-jobs", self.create_overnight_job),
+                web.get("/api/generation/overnight-jobs/{overnight_id}", self.get_overnight_job),
+                web.post("/api/generation/overnight-jobs/{overnight_id}/pause", self.pause_overnight_job),
+                web.post("/api/generation/overnight-jobs/{overnight_id}/resume", self.resume_overnight_job),
+                web.post("/api/generation/overnight-jobs/{overnight_id}/stop", self.stop_overnight_job),
             ]
         )
         self.app.on_cleanup.append(self._cleanup)
+        self.app.on_startup.append(self._recover_overnight_jobs)
         self.app[GENERATION_API_APP_KEY] = self
 
+    async def _recover_overnight_jobs(self, _app: web.Application) -> None:
+        """Require manual recovery after a Backend restart.
+
+        A process restart must never silently replay an uncertain slot. Jobs
+        with a durable in-flight marker are therefore kept in ``paused_error``
+        so an explicit stop is required; jobs that were between slots become
+        manually resumable ``paused`` jobs.
+        """
+
+        for record in self.overnight_jobs.list_active():
+            state = str(record.get("state") or "")
+            if state == "paused":
+                continue
+            timing = dict(record.get("timing") or {})
+            timing["backend_restart_recovered_at"] = utc_now_iso()
+            if record.get("in_flight"):
+                timing["backend_restart_recovery_mode"] = "paused_error_in_flight"
+                self.overnight_jobs.update(
+                    record["job_id"],
+                    state="paused_error",
+                    selection_state="paused_error",
+                    error_summary="Backend再起動前に実行中slotがあり、重複生成を避けるため停止しました。",
+                    timing=timing,
+                )
+                logger.warning(
+                    "Overnight job paused after restart with in-flight slot: overnight_id=%s",
+                    record["job_id"],
+                )
+                continue
+            timing["backend_restart_recovery_mode"] = "paused_manual_resume"
+            self.overnight_jobs.update(
+                record["job_id"],
+                state="paused",
+                selection_state="paused",
+                pause_requested=True,
+                error_summary="Backend再起動後は自動再開せず、手動再開を待機しています。",
+                timing=timing,
+            )
+            logger.warning(
+                "Overnight job paused after restart; manual resume required: overnight_id=%s",
+                record["job_id"],
+            )
+
     async def _cleanup(self, _app: web.Application) -> None:
+        if self._overnight_task is not None:
+            self._overnight_task.cancel()
         tasks = tuple(self._tasks)
         for task in tasks:
             task.cancel()
@@ -762,6 +847,14 @@ class GenerationApi:
             return _json_error("タグ検索を利用できません。", 503)
         return web.json_response(result)
 
+    def _overnight_is_active(self) -> bool:
+        task_active = self._overnight_task is not None and not self._overnight_task.done()
+        return task_active or bool(self.overnight_jobs.list_active())
+
+    def _reject_if_overnight_active(self) -> None:
+        if self._overnight_is_active():
+            raise GenerationApiError("夜間生成実行中は通常生成と大量生成を開始できません。")
+
     async def create_job(self, request: web.Request) -> web.Response:
         try:
             if request.content_length is not None and request.content_length > self.config.max_body_bytes:
@@ -776,8 +869,10 @@ class GenerationApi:
                 payload,
                 reference_upload_bytes=self.config.reference_upload_bytes,
             )
+            self._reject_if_overnight_active()
         except GenerationApiError as exc:
-            return _json_error(str(exc), 400)
+            status = 409 if "夜間生成実行中" in str(exc) else 400
+            return _json_error(str(exc), status)
         except web.HTTPRequestEntityTooLarge:
             return _json_error("リクエストが大きすぎます。", 413)
 
@@ -820,9 +915,10 @@ class GenerationApi:
                 generation_payload,
                 reference_upload_bytes=self.config.reference_upload_bytes,
             )
+            self._reject_if_overnight_active()
             job = self.bulk_jobs.create(generation_request, raw_total, selection_mode, bulk_variation)
         except GenerationApiError as exc:
-            status = 409 if "同時に1件" in str(exc) else 400
+            status = 409 if "同時に1件" in str(exc) or "夜間生成実行中" in str(exc) else 400
             return _json_error(str(exc), status)
         except web.HTTPRequestEntityTooLarge:
             return _json_error("リクエストが大きすぎます。", 413)
@@ -897,6 +993,586 @@ class GenerationApi:
             return web.json_response(_bulk_response(job))
         self.bulk_jobs.update(job.bulk_id, stop_requested=True)
         return web.json_response(_bulk_response(job), status=202)
+
+    def _start_overnight_task(self, overnight_id: str) -> None:
+        if self._overnight_task is not None and not self._overnight_task.done():
+            return
+        task = asyncio.create_task(self._run_overnight_job(overnight_id))
+        self._overnight_task = task
+        self._tasks.add(task)
+
+        def _finished(completed: asyncio.Task[None]) -> None:
+            self._tasks.discard(completed)
+            if self._overnight_task is completed:
+                self._overnight_task = None
+
+        task.add_done_callback(_finished)
+
+    async def create_overnight_job(self, request: web.Request) -> web.Response:
+        try:
+            if request.content_length is not None and request.content_length > self.config.max_body_bytes:
+                return _json_error("リクエストが大きすぎます。", 413)
+            payload = await request.json(loads=json.loads)
+            if not isinstance(payload, dict):
+                raise GenerationApiError("JSON objectを指定してください。")
+            total_count = payload.get("total_count")
+            if isinstance(total_count, bool) or not isinstance(total_count, int) or total_count not in OVERNIGHT_TOTALS:
+                raise GenerationApiError("夜間生成は128、256、512枚だけ指定できます。")
+            self._reject_if_overnight_active()
+            snapshot = dict(payload)
+            snapshot.pop("total_count", None)
+            snapshot.pop("selection_mode", None)
+            snapshot["count"] = 1
+            snapshot["variation_offset"] = 0
+            _build_request(snapshot, reference_upload_bytes=self.config.reference_upload_bytes)
+            record = self.overnight_jobs.create(snapshot, total_count)
+        except (GenerationApiError, OvernightJobError) as exc:
+            status = 409 if "同時に1件" in str(exc) or "実行中" in str(exc) else 400
+            return _json_error(str(exc), status)
+        except (ContentTypeError, json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
+            return _json_error("JSON bodyが不正です。", 400)
+        except web.HTTPRequestEntityTooLarge:
+            return _json_error("リクエストが大きすぎます。", 413)
+        self._start_overnight_task(record["job_id"])
+        return web.json_response(overnight_response(record), status=202)
+
+    async def get_overnight_job(self, request: web.Request) -> web.Response:
+        record = self.overnight_jobs.get(request.match_info["overnight_id"])
+        if record is None:
+            return _json_error("夜間生成jobが見つかりません。", 404)
+        return web.json_response(overnight_response(record))
+
+    async def pause_overnight_job(self, request: web.Request) -> web.Response:
+        try:
+            record = self.overnight_jobs.get(request.match_info["overnight_id"])
+            if record is None:
+                return _json_error("夜間生成jobが見つかりません。", 404)
+            if record["state"] in OVERNIGHT_TERMINAL_STATES:
+                return web.json_response(overnight_response(record))
+            state = "paused" if self._overnight_task is None or self._overnight_task.done() else record["state"]
+            timing = dict(record.get("timing") or {})
+            timing.setdefault("pause_requested_at", utc_now_iso())
+            record = self.overnight_jobs.update(
+                record["job_id"], pause_requested=True, state=state, timing=timing,
+            )
+            return web.json_response(overnight_response(record), status=202)
+        except OvernightJobError as exc:
+            return _json_error(str(exc), 404)
+
+    async def resume_overnight_job(self, request: web.Request) -> web.Response:
+        try:
+            record = self.overnight_jobs.get(request.match_info["overnight_id"])
+            if record is None:
+                return _json_error("夜間生成jobが見つかりません。", 404)
+            if record["state"] in OVERNIGHT_TERMINAL_STATES:
+                return web.json_response(overnight_response(record))
+            if self._overnight_task is not None and not self._overnight_task.done():
+                return _json_error("夜間生成はすでに実行中です。", 409)
+            timing = dict(record.get("timing") or {})
+            timing["last_resumed_at"] = utc_now_iso()
+            timing["resume_count"] = int(timing.get("resume_count") or 0) + 1
+            record = self.overnight_jobs.update(
+                record["job_id"], pause_requested=False, stop_requested=False, state="running", timing=timing,
+            )
+            self._start_overnight_task(record["job_id"])
+            return web.json_response(overnight_response(record), status=202)
+        except OvernightJobError as exc:
+            return _json_error(str(exc), 404)
+
+    async def stop_overnight_job(self, request: web.Request) -> web.Response:
+        try:
+            record = self.overnight_jobs.get(request.match_info["overnight_id"])
+            if record is None:
+                return _json_error("夜間生成jobが見つかりません。", 404)
+            if record["state"] in OVERNIGHT_TERMINAL_STATES:
+                return web.json_response(overnight_response(record))
+            state = "stopping" if self._overnight_task is not None and not self._overnight_task.done() else "stopped"
+            timing = dict(record.get("timing") or {})
+            timing.setdefault("stop_requested_at", utc_now_iso())
+            if state == "stopped":
+                timing.setdefault("stopped_at", utc_now_iso())
+            record = self.overnight_jobs.update(
+                record["job_id"], stop_requested=True, state=state,
+                timing=timing,
+                finished_at=utc_now_iso() if state == "stopped" else record.get("finished_at") or "",
+            )
+            return web.json_response(overnight_response(record), status=202)
+        except OvernightJobError as exc:
+            return _json_error(str(exc), 404)
+
+    @staticmethod
+    def _overnight_error_retryable(exc: BaseException) -> bool:
+        text = str(exc).casefold()
+        deterministic = (
+            "不正", "invalid", "reference", "lora", "model", "モデル", "設定", "prompt",
+            "seed", "workflow file", "見つかりません",
+        )
+        return not any(token in text for token in deterministic)
+
+    @staticmethod
+    def _overnight_round(record: Mapping[str, Any], round_index: int) -> dict[str, Any]:
+        for item in record.get("rounds") or []:
+            if isinstance(item, dict) and int(item.get("round_index") or 0) == round_index:
+                return item
+        return {
+            "round_index": round_index,
+            "generation_started_at": "",
+            "generation_finished_at": "",
+            "selection_started_at": "",
+            "selection_finished_at": "",
+            "selection_state": "pending",
+            "selection_calls": 0,
+            "slots": [],
+            "selected": [],
+            "error": "",
+        }
+
+    @staticmethod
+    def _overnight_counts(rounds: list[dict[str, Any]]) -> tuple[int, int]:
+        generated = 0
+        failed = 0
+        for round_data in rounds:
+            for slot in round_data.get("slots") or []:
+                if slot.get("status") == "completed":
+                    generated += 1
+                elif slot.get("status") == "failed":
+                    failed += 1
+        return generated, failed
+
+    @staticmethod
+    def _overnight_slot(round_data: dict[str, Any], slot_index: int) -> dict[str, Any] | None:
+        for slot in round_data.get("slots") or []:
+            if int(slot.get("slot_in_round") or 0) == slot_index:
+                return slot
+        return None
+
+    @staticmethod
+    def _overnight_path_for_filename(filename: object) -> Path | None:
+        clean = Path(str(filename or "")).name
+        if not clean or clean != str(filename):
+            return None
+        roots: list[Path] = []
+        gallery_root = get_gallery_images_root()
+        if gallery_root is not None:
+            roots.append(gallery_root)
+        # GeneratedImage.path is an internal runtime path. The selector must
+        # be able to recover it after a restart, while browser responses still
+        # expose only safe filenames. Keep the lookup project-local and never
+        # accept a caller-supplied path.
+        roots.extend(
+            (
+                Path.cwd() / "data" / "sd_outputs",
+                OUTPUT_DIR,
+                Path(__file__).resolve().parents[1] / "data" / "sd_outputs",
+            )
+        )
+        seen: set[Path] = set()
+        for raw_root in roots:
+            try:
+                root = raw_root.expanduser().resolve()
+            except OSError:
+                continue
+            if root in seen:
+                continue
+            seen.add(root)
+            path = (root / clean).resolve()
+            try:
+                path.relative_to(root)
+            except ValueError:
+                continue
+            if path.is_file():
+                return path
+        return None
+
+    @classmethod
+    def _overnight_paths(cls, rows: list[dict[str, Any]]) -> list[Path]:
+        paths: list[Path] = []
+        for row in rows:
+            item = row.get("image") if isinstance(row, dict) else None
+            path = cls._overnight_path_for_filename((item or {}).get("filename"))
+            if path is not None:
+                paths.append(path)
+        return paths
+
+    @staticmethod
+    def _selected_rows(
+        selected_paths: list[Path],
+        source_rows: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        by_name = {
+            str((row.get("image") or {}).get("filename")): row
+            for row in source_rows
+            if (row.get("image") or {}).get("filename")
+        }
+        rows: list[dict[str, Any]] = []
+        for rank, selected_path in enumerate(selected_paths, start=1):
+            name = selected_path.name
+            source = by_name.get(name)
+            if source is None:
+                matches = [row for key, row in by_name.items() if name.endswith("_" + key)]
+                source = matches[0] if len(matches) == 1 else None
+            if source is None:
+                continue
+            image = dict(source.get("image") or {})
+            rows.append(
+                {
+                    "filename": str(image.get("filename") or ""),
+                    "rank": rank,
+                    "variation_index": source.get("variation_index"),
+                    "global_index": source.get("global_index"),
+                }
+            )
+        return rows
+
+    async def _select_overnight_paths(self, paths: list[Path]) -> tuple[list[Path], int, str | None]:
+        """Use the existing selector, chunking only when its input is large."""
+
+        if not paths:
+            return [], 0, "選別対象の画像がありません。"
+        if len(paths) <= 32:
+            result = await asyncio.to_thread(select_generated_images, paths, return_count=4)
+            if not result.used_selection:
+                return [], 1, _safe_error_summary(result.error or result.message or "画像選別AIを利用できませんでした。")
+            return list(result.selected_paths), 1, None
+        finalists: list[Path] = []
+        calls = 0
+        for start in range(0, len(paths), 32):
+            selected, used_calls, error = await self._select_overnight_paths(paths[start : start + 32])
+            calls += used_calls
+            if error:
+                return [], calls, error
+            finalists.extend(selected)
+        selected, used_calls, error = await self._select_overnight_paths(finalists)
+        return selected, calls + used_calls, error
+
+    async def _run_overnight_job(self, overnight_id: str) -> None:
+        record = self.overnight_jobs.get(overnight_id)
+        if record is None or record["state"] in OVERNIGHT_TERMINAL_STATES:
+            return
+        try:
+            if record.get("in_flight"):
+                timing = dict(record.get("timing") or {})
+                timing.setdefault("backend_restart_recovered_at", utc_now_iso())
+                timing.setdefault("backend_restart_recovery_mode", "paused_error_in_flight")
+                self.overnight_jobs.update(
+                    overnight_id,
+                    state="paused_error",
+                    error_summary="Backend再起動前に実行中slotがあり、重複生成を避けるため停止しました。",
+                    selection_state="paused_error",
+                    timing=timing,
+                )
+                return
+            request_payload = dict(record.get("request") or {})
+            request = _build_request(
+                request_payload,
+                reference_upload_bytes=self.config.reference_upload_bytes,
+            )
+            request = replace(request, count=1, variation_offset=0)
+            resolved = await asyncio.to_thread(self.service.resolve_request, request)
+            slots = plan_bulk_variation_slots(
+                OVERNIGHT_ROUND_SIZE,
+                request.variation,
+                explicit_tags=request.explicit_tags,
+                resolved_prompt_tags=resolved.prompt_result.resolved_prompt_tags,
+                resolved_danbooru_tags=resolved.prompt_result.danbooru_resolved_prompt_tags,
+                request_text=request.request_text or "",
+                reference_mode=str((request.reference or {}).get("mode") or "none"),
+            )
+            rounds = list(record.get("rounds") or [])
+            used_seeds = {
+                int((slot.get("image") or {}).get("seed"))
+                for round_data in rounds
+                for slot in (round_data.get("slots") or [])
+                if slot.get("status") == "completed" and (slot.get("image") or {}).get("seed") is not None
+            }
+            timing = dict(record.get("timing") or {})
+            timing.setdefault("overnight_started_at", record.get("started_at") or utc_now_iso())
+            consecutive_infra_failures = 0
+
+            async with self._generation_lock:
+                self.overnight_jobs.update(overnight_id, state="running", timing=timing)
+                for round_index in range(int(record["current_round"]), int(record["total_rounds"]) + 1):
+                    record = self.overnight_jobs.get(overnight_id) or record
+                    if record.get("stop_requested"):
+                        timing["stopped_at"] = utc_now_iso()
+                        self.overnight_jobs.update(
+                            overnight_id, state="stopped", finished_at=timing["stopped_at"], timing=timing, in_flight={},
+                        )
+                        return
+                    if record.get("pause_requested"):
+                        self.overnight_jobs.update(overnight_id, state="paused")
+                        return
+                    round_data = self._overnight_round(record, round_index)
+                    if not round_data.get("generation_started_at"):
+                        round_data["generation_started_at"] = utc_now_iso()
+                    rounds = [item for item in rounds if int(item.get("round_index") or 0) != round_index]
+                    rounds.append(round_data)
+                    rounds.sort(key=lambda item: int(item.get("round_index") or 0))
+                    self.overnight_jobs.update(
+                        overnight_id,
+                        current_round=round_index,
+                        current_slot=max(1, int(record.get("current_slot") or 1)),
+                        state="running",
+                        selection_state=f"round_{round_index}_generating",
+                        rounds=rounds,
+                    )
+
+                    start_slot = max(1, int(record.get("current_slot") or 1)) if round_index == int(record.get("current_round")) else 1
+                    for slot in slots:
+                        if slot.index < start_slot or self._overnight_slot(round_data, slot.index) is not None:
+                            continue
+                        record = self.overnight_jobs.get(overnight_id) or record
+                        if record.get("stop_requested"):
+                            timing["stopped_at"] = utc_now_iso()
+                            self.overnight_jobs.update(
+                                overnight_id, state="stopped", finished_at=timing["stopped_at"], timing=timing, in_flight={},
+                            )
+                            return
+                        if record.get("pause_requested"):
+                            self.overnight_jobs.update(
+                                overnight_id, state="paused", current_round=round_index,
+                                current_slot=slot.index, rounds=rounds,
+                            )
+                            return
+                        global_index = (round_index - 1) * OVERNIGHT_ROUND_SIZE + slot.index
+                        if request.seed < 0:
+                            seed = secrets.randbelow(2**32)
+                            while seed in used_seeds:
+                                seed = secrets.randbelow(2**32)
+                        else:
+                            seed = (request.seed + global_index - 1) % (2**32)
+                        variation_request = replace(request, seed=seed, count=1, variation_offset=0)
+                        in_flight = {
+                            "round_index": round_index,
+                            "slot_in_round": slot.index,
+                            "global_index": global_index,
+                            "seed": seed,
+                            "started_at": utc_now_iso(),
+                        }
+                        self.overnight_jobs.update(
+                            overnight_id,
+                            state="running",
+                            current_round=round_index,
+                            current_slot=slot.index,
+                            in_flight=in_flight,
+                        )
+                        last_error: BaseException | None = None
+                        result = None
+                        for attempt in range(OVERNIGHT_MAX_RETRIES + 1):
+                            try:
+                                variation_resolved = replace(resolved, request=variation_request)
+                                variation_positive = merge_variation_tags(
+                                    resolved.prompt_result.positive,
+                                    slot.tags,
+                                )
+                                prepared = await asyncio.to_thread(
+                                    self.service.prepare_generation,
+                                    variation_request,
+                                    resolved=variation_resolved,
+                                    positive_override=variation_positive,
+                                    variation_tags=slot.tags,
+                                )
+                                if not isinstance(prepared, PreparedGeneration):
+                                    raise RuntimeError("生成準備結果が不正です。")
+                                metadata = {
+                                    "overnight_job_id": overnight_id,
+                                    "round_index": round_index,
+                                    "slot_in_round": slot.index,
+                                    "global_index": global_index,
+                                    "round_size": OVERNIGHT_ROUND_SIZE,
+                                    "total_count": int(record["total_count"]),
+                                }
+                                gallery_metadata = _build_gallery_metadata(
+                                    overnight_id,
+                                    variation_request,
+                                    prepared,
+                                    variation_index=slot.index,
+                                    variation_tags=slot.tags,
+                                    metadata_overrides=metadata,
+                                    requested_seed_override=request.seed,
+                                )
+                                prepared = replace(
+                                    prepared,
+                                    options=replace(
+                                        prepared.options,
+                                        gallery_output_root=get_gallery_images_root(),
+                                        gallery_metadata=gallery_metadata,
+                                    ),
+                                )
+                                result = await asyncio.to_thread(
+                                    self.service.submit_generation,
+                                    variation_request,
+                                    prepared=prepared,
+                                )
+                                safe_result = _safe_image_metadata(result)
+                                items = safe_result["images"]
+                                if len(items) != 1:
+                                    raise RuntimeError("夜間生成の1slotが1枚を返しませんでした。")
+                                break
+                            except Exception as exc:  # noqa: BLE001 - bounded retry boundary
+                                last_error = exc
+                                if attempt >= OVERNIGHT_MAX_RETRIES or not self._overnight_error_retryable(exc):
+                                    break
+                                await asyncio.sleep(5 if attempt == 0 else 15)
+                        if result is None:
+                            error = _safe_error_summary(last_error or RuntimeError("画像生成に失敗しました。"))
+                            slot_row = {
+                                "slot_in_round": slot.index,
+                                "global_index": global_index,
+                                "variation_index": slot.index,
+                                "status": "failed",
+                                "attempts": (OVERNIGHT_MAX_RETRIES + 1 if last_error else 1),
+                                "error": error,
+                            }
+                            round_data.setdefault("slots", []).append(slot_row)
+                            record = self.overnight_jobs.get(overnight_id) or record
+                            rounds = [item for item in rounds if int(item.get("round_index") or 0) != round_index]
+                            rounds.append(round_data)
+                            rounds.sort(key=lambda item: int(item.get("round_index") or 0))
+                            generated, failed = self._overnight_counts(rounds)
+                            consecutive_infra_failures += 1
+                            errors = list(record.get("errors") or [])
+                            errors.append(error)
+                            if consecutive_infra_failures >= OVERNIGHT_MAX_CONSECUTIVE_INFRA_FAILURES:
+                                self.overnight_jobs.update(
+                                    overnight_id,
+                                    state="paused_error",
+                                    selection_state="paused_error",
+                                    error_summary="インフラエラーが連続したため夜間生成を一時停止しました。",
+                                    errors=errors[-20:],
+                                    generated_count=generated,
+                                    failed_count=failed,
+                                    rounds=rounds,
+                                    current_round=round_index,
+                                    current_slot=slot.index + 1,
+                                    in_flight={},
+                                )
+                                return
+                            self.overnight_jobs.update(
+                                overnight_id,
+                                errors=errors[-20:], generated_count=generated, failed_count=failed,
+                                rounds=rounds, current_round=round_index, current_slot=slot.index + 1,
+                                in_flight={}, error_summary=error,
+                            )
+                            continue
+
+                        consecutive_infra_failures = 0
+                        items = _safe_image_metadata(result)["images"]
+                        image = dict(items[0])
+                        actual_seed = image.get("seed")
+                        if actual_seed is not None:
+                            used_seeds.add(int(actual_seed))
+                        slot_row = {
+                            "slot_in_round": slot.index,
+                            "global_index": global_index,
+                            "variation_index": slot.index,
+                            "variation_tags": list(slot.tags),
+                            "status": "completed",
+                            "attempts": 1,
+                            "image": image,
+                        }
+                        round_data.setdefault("slots", []).append(slot_row)
+                        record = self.overnight_jobs.get(overnight_id) or record
+                        rounds = [item for item in rounds if int(item.get("round_index") or 0) != round_index]
+                        rounds.append(round_data)
+                        rounds.sort(key=lambda item: int(item.get("round_index") or 0))
+                        generated, failed = self._overnight_counts(rounds)
+                        self.overnight_jobs.update(
+                            overnight_id,
+                            generated_count=generated,
+                            failed_count=failed,
+                            rounds=rounds,
+                            current_round=round_index,
+                            current_slot=slot.index + 1,
+                            in_flight={},
+                            error_summary="",
+                        )
+
+                    round_data["generation_finished_at"] = utc_now_iso()
+                    round_paths = self._overnight_paths(
+                        [slot for slot in round_data.get("slots") or [] if slot.get("status") == "completed"]
+                    )
+                    round_data["selection_started_at"] = utc_now_iso()
+                    round_data["selection_state"] = "running"
+                    self.overnight_jobs.update(
+                        overnight_id, state="selecting", selection_state=f"round_{round_index}_selecting", rounds=rounds,
+                    )
+                    selected_paths, selection_calls, selection_error = await self._select_overnight_paths(round_paths)
+                    round_data["selection_finished_at"] = utc_now_iso()
+                    round_data["selection_calls"] = selection_calls
+                    source_rows = [slot for slot in round_data.get("slots") or [] if slot.get("status") == "completed"]
+                    round_data["selected"] = self._selected_rows(selected_paths, source_rows)
+                    round_data["selection_state"] = "completed" if not selection_error else "failed"
+                    round_data["error"] = selection_error or ""
+                    rounds = [item for item in rounds if int(item.get("round_index") or 0) != round_index]
+                    rounds.append(round_data)
+                    rounds.sort(key=lambda item: int(item.get("round_index") or 0))
+                    self.overnight_jobs.update(
+                        overnight_id,
+                        state="running",
+                        selection_state="rounds_running" if not selection_error else "round_selection_failed",
+                        rounds=rounds,
+                        current_round=round_index + 1,
+                        current_slot=1,
+                        error_summary=selection_error or "",
+                    )
+                    record = self.overnight_jobs.get(overnight_id) or record
+
+                record = self.overnight_jobs.get(overnight_id) or record
+                candidates = []
+                for round_data in record.get("rounds") or []:
+                    selected_rows = list(round_data.get("selected") or [])
+                    # A failed per-round selector must not discard the images
+                    # already generated.  Keep that round's completed rows as
+                    # final-selection candidates; the final selector may still
+                    # choose a Best4 from the retained images.
+                    if not selected_rows and round_data.get("selection_state") == "failed":
+                        selected_rows = [
+                            dict(slot.get("image") or {})
+                            for slot in (round_data.get("slots") or [])
+                            if slot.get("status") == "completed" and isinstance(slot.get("image"), dict)
+                        ]
+                    candidates.extend(selected_rows)
+                candidate_paths = self._overnight_paths([{"image": row} for row in candidates])
+                timing["final_selection_started_at"] = utc_now_iso()
+                self.overnight_jobs.update(
+                    overnight_id, state="selecting", selection_state="final_selecting", timing=timing,
+                )
+                final_paths, final_calls, final_error = await self._select_overnight_paths(candidate_paths)
+                timing["final_selection_finished_at"] = utc_now_iso()
+                timing["selector_calls"] = sum(
+                    int(item.get("selection_calls") or 0) for item in (record.get("rounds") or [])
+                ) + final_calls
+                final_selected = [
+                    {"filename": path.name, "rank": rank}
+                    for rank, path in enumerate(final_paths[:4], start=1)
+                ]
+                finished = utc_now_iso()
+                final_state = "completed_selection_failed" if final_error else "completed"
+                self.overnight_jobs.update(
+                    overnight_id,
+                    state=final_state,
+                    selection_state="failed" if final_error else "completed",
+                    final_selected=final_selected,
+                    error_summary=final_error or "",
+                    timing=timing,
+                    finished_at=finished,
+                    in_flight={},
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - durable worker boundary
+            logger.exception("Overnight generation failed: overnight_id=%s", overnight_id)
+            try:
+                self.overnight_jobs.update(
+                    overnight_id,
+                    state="failed",
+                    error_summary=_safe_error_summary(exc),
+                    finished_at=utc_now_iso(),
+                    in_flight={},
+                )
+            except OvernightJobError:
+                logger.exception("Could not persist overnight failure: overnight_id=%s", overnight_id)
 
     async def _run_job(self, job_id: str) -> None:
         job = self.jobs.get(job_id)
@@ -1083,6 +1759,14 @@ class GenerationApi:
                     current_index = len(outputs) + len(errors) + 1
                     if job.stop_requested:
                         break
+                    if job.pause_requested:
+                        self.bulk_jobs.update(
+                            bulk_id,
+                            state="paused",
+                            current_index=current_index,
+                            progress=(current_index - 1) / job.requested_total,
+                        )
+                        return
                     self.bulk_jobs.update(
                         bulk_id,
                         state="generating",
@@ -1095,7 +1779,7 @@ class GenerationApi:
                         seed=(
                             -1
                             if resolution_request.seed < 0
-                            else (resolution_request.seed + slot.index - 1) % (2**32)
+                            else (resolution_request.seed + job.seed_offset + slot.index - 1) % (2**32)
                         ),
                     )
                     variation_resolved = replace(resolved, request=variation_request)
@@ -1119,6 +1803,8 @@ class GenerationApi:
                             prepared,
                             variation_index=slot.index,
                             variation_tags=slot.tags,
+                            metadata_overrides=job.metadata_context,
+                            requested_seed_override=job.requested_seed_override,
                         )
                         prepared = replace(
                             prepared,
@@ -1164,6 +1850,19 @@ class GenerationApi:
                             errors=errors,
                             output_items=outputs,
                         )
+
+                if job.pause_requested and not job.stop_requested:
+                    self.bulk_jobs.update(
+                        bulk_id,
+                        state="paused",
+                        progress=1.0,
+                        current_index=len(outputs) + len(errors),
+                        completed_count=len(outputs),
+                        failed_count=len(errors),
+                        errors=errors,
+                        output_items=outputs,
+                    )
+                    return
 
                 selection_state = "not_requested"
                 selected_items: list[dict[str, Any]] = []
