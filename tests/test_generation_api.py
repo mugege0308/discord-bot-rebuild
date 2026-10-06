@@ -16,6 +16,7 @@ from services.generation_api import (
     create_generation_app,
 )
 from services.generation_service import GenerationRequest, GenerationService
+from services.image_selection import ImageSelectionResult
 from services.sd_control import GeneratedImage
 from services.shogou_prompt_designer import ShogouPromptResult
 
@@ -377,6 +378,102 @@ class GenerationApiTests(unittest.IsolatedAsyncioTestCase):
             json={"freeform_character": "girl", "count": 4, "variation_offset": 5},
         )
         self.assertEqual(400, response.status)
+
+    async def test_bulk_job_runs_sequentially_once_resolves_and_keeps_snapshot(self):
+        await self.client.close()
+        service = _MultiImageService()
+        self.app = create_generation_app(service=service)
+        self.server = TestServer(self.app)
+        self.client = TestClient(self.server)
+        await self.client.start_server()
+
+        with patch(
+            "services.generation_api.select_generated_images",
+            return_value=ImageSelectionResult(
+                [Path("C:/selector/score_0p900_01_image-1.png")],
+                True,
+                message="selected",
+            ),
+        ) as selection_mock:
+            response = await self.client.post(
+                "/api/generation/bulk-jobs",
+                json={
+                    "total_count": 16,
+                    "selection_mode": "best1",
+                    "freeform_character": "snapshot girl",
+                    "request_text": "snapshot request",
+                    "variation": "auto",
+                    "seed": 100,
+                },
+            )
+            self.assertEqual(202, response.status)
+            created = await response.json()
+            self.assertEqual(created["bulk_id"], created["job_id"])
+            result = await self._wait_for_bulk_terminal(created["bulk_id"])
+
+        self.assertEqual("completed", result["state"])
+        self.assertEqual(16, result["requested_total"])
+        self.assertEqual("auto", result["variation"])
+        self.assertEqual(16, result["completed_count"])
+        self.assertEqual(0, result["failed_count"])
+        self.assertEqual(1, service.prompt_call_count)
+        self.assertEqual(16, len(service.submit_calls))
+        self.assertTrue(all(item[0].variation == "auto" for item in service.submit_calls))
+        self.assertEqual(list(range(100, 116)), [item[0].seed for item in service.submit_calls])
+        self.assertEqual(list(range(1, 17)), [item["variation_index"] for item in result["output"]["images"]])
+        self.assertTrue(all(item["variation_tags"] for item in result["output"]["images"]))
+        self.assertEqual("completed", result["selection_state"])
+        selection_mock.assert_called_once()
+        self.assertEqual(1, len(result["output"]["selected_images"]))
+        self.assertEqual("image-1.png", result["output"]["selected_images"][0]["filename"])
+        self.assertEqual(1, result["output"]["selected_images"][0]["variation_index"])
+        self.assertTrue(result["output"]["images"][0]["selected"])
+
+    async def test_bulk_rejects_invalid_total_without_changing_normal_limit(self):
+        response = await self.client.post(
+            "/api/generation/bulk-jobs",
+            json={"total_count": 33, "freeform_character": "girl"},
+        )
+        self.assertEqual(400, response.status)
+        response = await self.client.post(
+            "/api/generation/bulk-jobs",
+            json={"total_count": 16, "selection_mode": "unknown", "freeform_character": "girl"},
+        )
+        self.assertEqual(400, response.status)
+
+    async def test_bulk_partial_failures_continue_and_selection_failure_does_not_fail_job(self):
+        await self.client.close()
+        service = _MultiImageService(failure_at=2)
+        self.app = create_generation_app(service=service)
+        self.server = TestServer(self.app)
+        self.client = TestClient(self.server)
+        await self.client.start_server()
+
+        with patch(
+            "services.generation_api.select_generated_images",
+            return_value=ImageSelectionResult([], False, error="selector unavailable"),
+        ):
+            response = await self.client.post(
+                "/api/generation/bulk-jobs",
+                json={"total_count": 16, "selection_mode": "best4", "freeform_character": "girl"},
+            )
+            created = await response.json()
+            result = await self._wait_for_bulk_terminal(created["bulk_id"])
+
+        self.assertEqual("completed", result["state"])
+        self.assertEqual(15, result["completed_count"])
+        self.assertEqual(1, result["failed_count"])
+        self.assertEqual("failed", result["selection_state"])
+        self.assertEqual(16, len(service.submit_calls))
+
+    async def _wait_for_bulk_terminal(self, bulk_id: str) -> dict:
+        for _ in range(300):
+            response = await self.client.get(f"/api/generation/bulk-jobs/{bulk_id}")
+            payload = await response.json()
+            if payload["state"] in {"completed", "failed", "stopped"}:
+                return payload
+            await asyncio.sleep(0.01)
+        self.fail("bulk job did not reach a terminal state")
 
     def test_only_loopback_binding_is_allowed(self):
         with self.assertRaises(ValueError):

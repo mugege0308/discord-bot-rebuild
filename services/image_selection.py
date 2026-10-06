@@ -104,16 +104,17 @@ def _latest_top5_dir(project_dir: Path) -> Path:
     return project_dir / "outputs" / "auto_selected" / "latest_top5"
 
 
-def _load_selected_paths(project_dir: Path) -> list[Path]:
+def _load_selected_paths(project_dir: Path, return_count: int | None = None) -> list[Path]:
     target_dir = _latest_top5_dir(project_dir)
     if not target_dir.exists() or not target_dir.is_dir():
         return []
 
+    limit = get_selection_return_count() if return_count is None else max(1, min(int(return_count), 4))
     return sorted(
         path
         for path in target_dir.iterdir()
         if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
-    )[: get_selection_return_count()]
+    )[:limit]
 
 
 def _read_candidate_scores(project_dir: Path, source_paths: list[Path]) -> dict[Path, float]:
@@ -145,7 +146,7 @@ def _read_candidate_scores(project_dir: Path, source_paths: list[Path]) -> dict[
     return scores
 
 
-def select_generated_images(paths: list[Path]) -> ImageSelectionResult:
+def select_generated_images(paths: list[Path], *, return_count: int | None = None) -> ImageSelectionResult:
     logger.info("Image selection requested: raw_path_count=%s", len(paths))
     source_paths = _image_paths(paths)
     if not source_paths:
@@ -222,7 +223,7 @@ def select_generated_images(paths: list[Path]) -> ImageSelectionResult:
         reason = detail[-1] if detail else f"exit code {completed.returncode}"
         return ImageSelectionResult(source_paths, False, error=f"画像選別AIに失敗しました: {reason[:180]}")
 
-    selected_paths = _load_selected_paths(project_dir)
+    selected_paths = _load_selected_paths(project_dir, return_count=return_count)
     if not selected_paths:
         logger.error("Image selection completed but no selected images were found.")
         return ImageSelectionResult(

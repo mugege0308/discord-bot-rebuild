@@ -44,11 +44,13 @@ from services.generation_reference_assets import (
     save_reference_asset,
 )
 from services.generation_variation import (
+    ALLOWED_BULK_GENERATION_COUNTS,
     MAX_GENERATION_COUNT,
     VARIATION_AUTO,
     VARIATION_OFF,
     merge_variation_tags,
     plan_variation_slots,
+    plan_bulk_variation_slots,
 )
 from services.gallery_control import get_gallery_images_root
 from services.image_composition import IMAGE_SIZE_SPECS
@@ -63,6 +65,7 @@ from services.sd_control import resolve_saved_lora_selections
 from services.sd_control import DEFAULT_REFERENCE_STRENGTH
 from services.pose_reference import DEFAULT_POSE_STRENGTH
 from services.shogou_prompt_designer import PROMPT_RATING_CHOICES
+from services.image_selection import select_generated_images
 
 
 logger = logging.getLogger("secretary-bot.generation_api")
@@ -74,6 +77,7 @@ DEFAULT_REFERENCE_UPLOAD_BYTES = MAX_REFERENCE_IMAGE_BYTES
 MAX_TEXT_LENGTH = 4000
 MAX_EXPLICIT_TAGS = 100
 MAX_LORAS = 3
+BULK_SELECTION_MODES = frozenset({"none", "best1", "best4"})
 
 _ALLOWED_REQUEST_KEYS = frozenset(
     {
@@ -174,6 +178,64 @@ class _JobStore:
     def get(self, job_id: str) -> _Job | None:
         with self._lock:
             return self._jobs.get(job_id)
+
+
+@dataclass
+class _BulkJob:
+    bulk_id: str
+    request: GenerationRequest
+    requested_total: int
+    selection_mode: str
+    variation: str = VARIATION_OFF
+    state: str = "queued"
+    progress: float = 0.0
+    current_index: int = 0
+    completed_count: int = 0
+    failed_count: int = 0
+    error_summary: str | None = None
+    errors: list[str] = field(default_factory=list)
+    output_items: list[dict[str, Any]] = field(default_factory=list)
+    selected_items: list[dict[str, Any]] = field(default_factory=list)
+    selection_state: str = "not_requested"
+    selection_error: str | None = None
+    stop_requested: bool = False
+    generated_paths: list[Path] = field(default_factory=list, repr=False)
+
+
+class _BulkJobStore:
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._jobs: dict[str, _BulkJob] = {}
+
+    def create(
+        self,
+        request: GenerationRequest,
+        total: int,
+        selection_mode: str,
+        variation: str,
+    ) -> _BulkJob:
+        with self._lock:
+            if any(job.state in {"queued", "resolving", "generating", "selecting"} for job in self._jobs.values()):
+                raise GenerationApiError("大量生成は同時に1件だけ実行できます。")
+            job = _BulkJob(
+                bulk_id=secrets.token_urlsafe(12),
+                request=request,
+                requested_total=total,
+                selection_mode=selection_mode,
+                variation=variation,
+            )
+            self._jobs[job.bulk_id] = job
+            return job
+
+    def get(self, bulk_id: str) -> _BulkJob | None:
+        with self._lock:
+            return self._jobs.get(bulk_id)
+
+    def update(self, bulk_id: str, **values: Any) -> None:
+        with self._lock:
+            job = self._jobs[bulk_id]
+            for key, value in values.items():
+                setattr(job, key, value)
 
 
 def _is_configured(*names: str) -> bool:
@@ -530,6 +592,37 @@ def _job_response(job: _Job) -> dict[str, Any]:
     }
 
 
+def _bulk_response(job: _BulkJob) -> dict[str, Any]:
+    completed = int(job.completed_count)
+    failed = int(job.failed_count)
+    return {
+        "bulk_id": job.bulk_id,
+        "job_id": job.bulk_id,
+        "state": job.state,
+        "progress": job.progress,
+        "requested_total": job.requested_total,
+        "total_count": job.requested_total,
+        "current_index": job.current_index,
+        "completed_count": completed,
+        "failed_count": failed,
+        "remaining_count": max(job.requested_total - completed - failed, 0),
+        "stop_requested": job.stop_requested,
+        "selection_mode": job.selection_mode,
+        "variation": job.variation,
+        "selection_state": job.selection_state,
+        "selection_error": job.selection_error,
+        "error_summary": job.error_summary,
+        "errors": job.errors[:4],
+        "output": {
+            "image_count": len(job.output_items),
+            "images": list(job.output_items),
+            "image_identifiers": [item.get("filename") for item in job.output_items if item.get("filename")],
+            "selected_images": list(job.selected_items),
+            "gallery_job_id": job.bulk_id,
+        },
+    }
+
+
 class GenerationApi:
     """aiohttp adapter with an in-memory, non-blocking job lifecycle."""
 
@@ -546,6 +639,7 @@ class GenerationApi:
         self.tag_store = tag_store or DanbooruTagStore()
         self.tag_interpreter = tag_interpreter
         self.jobs = _JobStore()
+        self.bulk_jobs = _BulkJobStore()
         self._generation_lock = asyncio.Lock()
         self._tasks: set[asyncio.Task[None]] = set()
         self.app = web.Application(
@@ -559,6 +653,9 @@ class GenerationApi:
                 web.post("/api/generation/references", self.upload_reference),
                 web.post("/api/generation/jobs", self.create_job),
                 web.get("/api/generation/jobs/{job_id}", self.get_job),
+                web.post("/api/generation/bulk-jobs", self.create_bulk_job),
+                web.get("/api/generation/bulk-jobs/{bulk_id}", self.get_bulk_job),
+                web.post("/api/generation/bulk-jobs/{bulk_id}/stop", self.stop_bulk_job),
             ]
         )
         self.app.on_cleanup.append(self._cleanup)
@@ -692,6 +789,49 @@ class GenerationApi:
         task.add_done_callback(self._tasks.discard)
         return web.json_response(_job_response(job), status=202)
 
+    async def create_bulk_job(self, request: web.Request) -> web.Response:
+        try:
+            if request.content_length is not None and request.content_length > self.config.max_body_bytes:
+                return _json_error("リクエストが大きすぎます。", 413)
+            try:
+                payload = await request.json(loads=json.loads)
+            except (ContentTypeError, json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
+                raise GenerationApiError("JSON bodyが不正です。") from exc
+            if not isinstance(payload, dict):
+                raise GenerationApiError("JSON objectを指定してください。")
+            raw_total = payload.get("total_count")
+            if isinstance(raw_total, bool) or not isinstance(raw_total, int) or raw_total not in ALLOWED_BULK_GENERATION_COUNTS:
+                raise GenerationApiError("大量生成は16、24、32枚だけ指定できます。")
+            selection_mode = payload.get("selection_mode", "none")
+            if not isinstance(selection_mode, str) or selection_mode not in BULK_SELECTION_MODES:
+                raise GenerationApiError("選別モードが不正です。")
+            # The inner request is deliberately count=1, but bulk variation
+            # must retain the caller's mode instead of being normalized to
+            # ``off`` by the normal one-image parser.
+            bulk_variation = _parse_variation(payload.get("variation"), count=2)
+            generation_payload = dict(payload)
+            generation_payload.pop("total_count", None)
+            generation_payload.pop("selection_mode", None)
+            # The normal request remains a one-image request inside each
+            # sequential bulk slot.  The parent total is tracked separately.
+            generation_payload["count"] = 1
+            generation_payload["variation_offset"] = 0
+            generation_request = _build_request(
+                generation_payload,
+                reference_upload_bytes=self.config.reference_upload_bytes,
+            )
+            job = self.bulk_jobs.create(generation_request, raw_total, selection_mode, bulk_variation)
+        except GenerationApiError as exc:
+            status = 409 if "同時に1件" in str(exc) else 400
+            return _json_error(str(exc), status)
+        except web.HTTPRequestEntityTooLarge:
+            return _json_error("リクエストが大きすぎます。", 413)
+
+        task = asyncio.create_task(self._run_bulk_job(job.bulk_id))
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+        return web.json_response(_bulk_response(job), status=202)
+
     async def upload_reference(self, request: web.Request) -> web.Response:
         """Accept one validated image and return only its opaque asset id."""
 
@@ -742,6 +882,21 @@ class GenerationApi:
         if job is None:
             return _json_error("jobが見つかりません。", 404)
         return web.json_response(_job_response(job))
+
+    async def get_bulk_job(self, request: web.Request) -> web.Response:
+        job = self.bulk_jobs.get(request.match_info["bulk_id"])
+        if job is None:
+            return _json_error("大量生成jobが見つかりません。", 404)
+        return web.json_response(_bulk_response(job))
+
+    async def stop_bulk_job(self, request: web.Request) -> web.Response:
+        job = self.bulk_jobs.get(request.match_info["bulk_id"])
+        if job is None:
+            return _json_error("大量生成jobが見つかりません。", 404)
+        if job.state in {"completed", "failed", "stopped"}:
+            return web.json_response(_bulk_response(job))
+        self.bulk_jobs.update(job.bulk_id, stop_requested=True)
+        return web.json_response(_bulk_response(job), status=202)
 
     async def _run_job(self, job_id: str) -> None:
         job = self.jobs.get(job_id)
@@ -902,6 +1057,192 @@ class GenerationApi:
                 state="failed",
                 progress=1.0,
                 error_summary=_safe_error_summary(exc),
+            )
+
+    async def _run_bulk_job(self, bulk_id: str) -> None:
+        job = self.bulk_jobs.get(bulk_id)
+        if job is None:
+            return
+        try:
+            async with self._generation_lock:
+                self.bulk_jobs.update(bulk_id, state="resolving", progress=0.02)
+                resolution_request = replace(job.request, count=1, variation_offset=0)
+                resolved = await asyncio.to_thread(self.service.resolve_request, resolution_request)
+                slots = plan_bulk_variation_slots(
+                    job.requested_total,
+                    job.variation,
+                    explicit_tags=resolution_request.explicit_tags,
+                    resolved_prompt_tags=resolved.prompt_result.resolved_prompt_tags,
+                    resolved_danbooru_tags=resolved.prompt_result.danbooru_resolved_prompt_tags,
+                    request_text=resolution_request.request_text or "",
+                    reference_mode=str((resolution_request.reference or {}).get("mode") or "none"),
+                )
+                outputs: list[dict[str, Any]] = []
+                errors: list[str] = []
+                for slot in slots:
+                    current_index = len(outputs) + len(errors) + 1
+                    if job.stop_requested:
+                        break
+                    self.bulk_jobs.update(
+                        bulk_id,
+                        state="generating",
+                        current_index=current_index,
+                        progress=(current_index - 1) / job.requested_total,
+                    )
+                    variation_request = replace(
+                        resolution_request,
+                        variation=job.variation,
+                        seed=(
+                            -1
+                            if resolution_request.seed < 0
+                            else (resolution_request.seed + slot.index - 1) % (2**32)
+                        ),
+                    )
+                    variation_resolved = replace(resolved, request=variation_request)
+                    variation_positive = merge_variation_tags(
+                        resolved.prompt_result.positive,
+                        slot.tags,
+                    )
+                    try:
+                        prepared = await asyncio.to_thread(
+                            self.service.prepare_generation,
+                            variation_request,
+                            resolved=variation_resolved,
+                            positive_override=variation_positive,
+                            variation_tags=slot.tags,
+                        )
+                        if not isinstance(prepared, PreparedGeneration):
+                            raise RuntimeError("生成準備結果が不正です。")
+                        gallery_metadata = _build_gallery_metadata(
+                            bulk_id,
+                            variation_request,
+                            prepared,
+                            variation_index=slot.index,
+                            variation_tags=slot.tags,
+                        )
+                        prepared = replace(
+                            prepared,
+                            options=replace(
+                                prepared.options,
+                                gallery_output_root=get_gallery_images_root(),
+                                gallery_metadata=gallery_metadata,
+                            ),
+                        )
+                        result = await asyncio.to_thread(
+                            self.service.submit_generation,
+                            variation_request,
+                            prepared=prepared,
+                        )
+                        safe_result = _safe_image_metadata(result)
+                        items = safe_result["images"]
+                        result_images = tuple(getattr(result, "images", ()) or ())
+                        if not items:
+                            raise RuntimeError("画像が生成されませんでした。")
+                        for item, result_image in zip(items, result_images):
+                            item["variation_index"] = slot.index
+                            item["variation_tags"] = list(slot.tags)
+                            image_path = getattr(result_image, "path", None)
+                            if image_path is not None:
+                                job.generated_paths.append(Path(image_path).resolve())
+                        outputs.extend(items)
+                        self.bulk_jobs.update(
+                            bulk_id,
+                            completed_count=len(outputs),
+                            failed_count=len(errors),
+                            current_index=current_index,
+                            output_items=outputs,
+                        )
+                    except Exception as exc:  # noqa: BLE001 - continue remaining slots
+                        logger.exception("Bulk generation variation failed: bulk_id=%s index=%s", bulk_id, slot.index)
+                        errors.append(_safe_error_summary(exc))
+                        self.bulk_jobs.update(
+                            bulk_id,
+                            completed_count=len(outputs),
+                            failed_count=len(errors),
+                            current_index=current_index,
+                            error_summary=errors[-1],
+                            errors=errors,
+                            output_items=outputs,
+                        )
+
+                selection_state = "not_requested"
+                selected_items: list[dict[str, Any]] = []
+                selection_error = None
+                if job.selection_mode != "none" and job.generated_paths:
+                    selection_state = "running"
+                    self.bulk_jobs.update(bulk_id, state="selecting", selection_state=selection_state)
+                    try:
+                        selection = await asyncio.to_thread(
+                            select_generated_images,
+                            list(job.generated_paths),
+                            return_count=1 if job.selection_mode == "best1" else 4,
+                        )
+                        if selection.used_selection:
+                            source_by_name = {path.name: path for path in job.generated_paths}
+                            selected_names: list[str] = []
+                            for rank, selected_path in enumerate(selection.selected_paths, start=1):
+                                selected_name = selected_path.name
+                                source_path = source_by_name.get(selected_name)
+                                if source_path is None:
+                                    suffix_matches = [
+                                        path
+                                        for path in job.generated_paths
+                                        if selected_name.endswith("_" + path.name)
+                                    ]
+                                    if len(suffix_matches) == 1:
+                                        source_path = suffix_matches[0]
+                                        selected_name = source_path.name
+                                selected_names.append(selected_name)
+                                score = selection.candidate_scores.get(source_path) if source_path else None
+                                row: dict[str, Any] = {"filename": selected_name, "rank": rank}
+                                matched_item = next(
+                                    (item for item in outputs if item.get("filename") == selected_name),
+                                    None,
+                                )
+                                if matched_item is not None and matched_item.get("variation_index") is not None:
+                                    row["variation_index"] = matched_item["variation_index"]
+                                if score is not None:
+                                    row["score"] = score
+                                selected_items.append(row)
+                            selected_set = set(selected_names)
+                            for item in outputs:
+                                if item.get("filename") in selected_set:
+                                    item["selected"] = True
+                            selection_state = "completed"
+                        else:
+                            selection_error = _safe_error_summary(
+                                selection.error or selection.message or "画像選別AIを利用できませんでした。"
+                            )
+                            selection_state = "failed"
+                    except Exception as exc:  # noqa: BLE001 - selection never fails generation
+                        logger.exception("Bulk image selection failed: bulk_id=%s", bulk_id)
+                        selection_error = _safe_error_summary(exc)
+                        selection_state = "failed"
+
+                final_state = "stopped" if job.stop_requested else ("completed" if outputs else "failed")
+                self.bulk_jobs.update(
+                    bulk_id,
+                    state=final_state,
+                    progress=1.0,
+                    current_index=len(outputs) + len(errors),
+                    completed_count=len(outputs),
+                    failed_count=len(errors),
+                    errors=errors,
+                    output_items=outputs,
+                    selected_items=selected_items,
+                    selection_state=selection_state,
+                    selection_error=selection_error,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - worker boundary is sanitized
+            logger.exception("Generation API bulk job failed: bulk_id=%s", bulk_id)
+            self.bulk_jobs.update(
+                bulk_id,
+                state="failed",
+                progress=1.0,
+                error_summary=_safe_error_summary(exc),
+                selection_state="failed" if job.selection_mode != "none" else "not_requested",
             )
 
 

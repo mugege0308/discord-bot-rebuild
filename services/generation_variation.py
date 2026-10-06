@@ -18,6 +18,8 @@ from services.prompt_tag_dictionary import (
 )
 from services.prompt_conflict_resolver import classify_text_constraints
 MAX_GENERATION_COUNT = 8
+MAX_BULK_GENERATION_COUNT = 32
+ALLOWED_BULK_GENERATION_COUNTS = frozenset({16, 24, 32})
 VARIATION_OFF = "off"
 VARIATION_AUTO = "auto"
 VARIATION_MODES = frozenset({VARIATION_OFF, VARIATION_AUTO})
@@ -186,6 +188,47 @@ def plan_variation_slots(
     return tuple(slots)
 
 
+def plan_bulk_variation_slots(
+    count: int,
+    mode: str,
+    *,
+    explicit_tags: Sequence[str] = (),
+    resolved_prompt_tags: Sequence[str] = (),
+    resolved_danbooru_tags: Sequence[str] = (),
+    request_text: str = "",
+    reference_mode: str = "none",
+    dictionary: PromptTagDictionary | None = None,
+) -> tuple[VariationSlot, ...]:
+    """Extend the existing eight-slot recipes for an intentionally large run.
+
+    The normal planner remains bounded at eight.  Bulk generation repeats its
+    already-validated eight-slot recipe groups while deriving a distinct seed
+    per slot; it never invents a second variation vocabulary.
+    """
+
+    if (
+        isinstance(count, bool)
+        or not isinstance(count, int)
+        or count not in ALLOWED_BULK_GENERATION_COUNTS
+        or count > MAX_BULK_GENERATION_COUNT
+    ):
+        raise ValueError("大量生成は16、24、32枚だけ指定できます。")
+    base = plan_variation_slots(
+        MAX_GENERATION_COUNT,
+        mode,
+        explicit_tags=explicit_tags,
+        resolved_prompt_tags=resolved_prompt_tags,
+        resolved_danbooru_tags=resolved_danbooru_tags,
+        request_text=request_text,
+        reference_mode=reference_mode,
+        dictionary=dictionary,
+    )
+    return tuple(
+        VariationSlot(index=index, tags=base[(index - 1) % MAX_GENERATION_COUNT].tags)
+        for index in range(1, count + 1)
+    )
+
+
 def merge_variation_tags(
     positive: str,
     tags: Iterable[str],
@@ -218,6 +261,8 @@ def merge_variation_tags(
 
 
 __all__ = [
+    "ALLOWED_BULK_GENERATION_COUNTS",
+    "MAX_BULK_GENERATION_COUNT",
     "MAX_GENERATION_COUNT",
     "VARIATION_AUTO",
     "VARIATION_MODES",
@@ -226,4 +271,5 @@ __all__ = [
     "locked_categories",
     "merge_variation_tags",
     "plan_variation_slots",
+    "plan_bulk_variation_slots",
 ]

@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 
 from services.generation_variation import (
+    plan_bulk_variation_slots,
     VARIATION_AUTO,
     VARIATION_OFF,
     merge_variation_tags,
@@ -93,6 +94,28 @@ class GenerationVariationTests(unittest.TestCase):
         self.assertIn("serious", merged)
         self.assertNotIn("portrait", merged)
         self.assertNotIn("from side", merged)
+
+    def test_bulk_planner_supports_only_large_batch_sizes(self):
+        for count in (16, 24, 32):
+            with self.subTest(count=count):
+                slots = plan_bulk_variation_slots(count, VARIATION_AUTO)
+                self.assertEqual(list(range(1, count + 1)), [slot.index for slot in slots])
+                self.assertEqual(slots[0].tags, slots[8].tags)
+                self.assertEqual(slots[1].tags, slots[9].tags)
+
+        with self.assertRaises(ValueError):
+            plan_bulk_variation_slots(33, VARIATION_AUTO)
+
+    def test_bulk_off_has_no_variation_tags(self):
+        slots = plan_bulk_variation_slots(16, VARIATION_OFF)
+        self.assertEqual(16, len(slots))
+        self.assertTrue(all(slot.tags == () for slot in slots))
+
+    def test_bulk_keeps_reference_locks_across_repeated_recipe_groups(self):
+        slots = plan_bulk_variation_slots(16, VARIATION_AUTO, reference_mode="pose")
+        all_tags = {tag for slot in slots for tag in slot.tags}
+        self.assertFalse({"standing", "sitting", "walking", "kneeling"} & all_tags)
+        self.assertFalse({"portrait", "upper body", "cowboy shot", "full body"} & all_tags)
 
 
 if __name__ == "__main__":
