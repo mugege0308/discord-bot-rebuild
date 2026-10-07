@@ -188,7 +188,13 @@ class OvernightJobStore:
             ).fetchall()
         return [item for item in (self._decode(row) for row in rows) if item is not None]
 
-    def create(self, request: Mapping[str, Any], total_count: int) -> dict[str, Any]:
+    def create(
+        self,
+        request: Mapping[str, Any],
+        total_count: int,
+        *,
+        shutdown_after_completion: bool = False,
+    ) -> dict[str, Any]:
         if total_count not in OVERNIGHT_TOTALS:
             raise OvernightJobError("夜間生成は128、256、512枚だけ指定できます。")
         active = self.list_active()
@@ -211,7 +217,12 @@ class OvernightJobStore:
             "errors": [],
             "rounds": [],
             "final_selected": [],
-            "timing": {},
+            # This is deliberately per-job metadata, not a global setting.
+            # Older rows without the key remain equivalent to False.
+            "timing": {
+                "shutdown_after_completion": bool(shutdown_after_completion),
+                "shutdown_status": "requested" if shutdown_after_completion else "not_requested",
+            },
             "started_at": now,
             "updated_at": now,
             "finished_at": "",
@@ -267,6 +278,13 @@ class OvernightJobStore:
             updated = dict(current)
             updated.update(changes)
             updated["updated_at"] = utc_now_iso()
+            timing = dict(updated.get("timing") or {})
+            timing["last_persisted_at"] = updated["updated_at"]
+            if "state" in changes:
+                timing["last_state"] = str(updated.get("state") or "")
+            if "selection_state" in changes:
+                timing["last_selection_state"] = str(updated.get("selection_state") or "")
+            updated["timing"] = timing
             encoded = {
                 "request_json": _json_dump(updated["request"]),
                 "errors_json": _json_dump(updated["errors"]),
@@ -298,6 +316,8 @@ def overnight_response(record: Mapping[str, Any]) -> dict[str, Any]:
     failed = int(record.get("failed_count") or 0)
     rounds = list(record.get("rounds") or [])
     final_selected = list(record.get("final_selected") or [])
+    timing = dict(record.get("timing") or {})
+    shutdown_requested = bool(timing.get("shutdown_after_completion"))
     return {
         "overnight_job_id": str(record.get("job_id") or ""),
         "job_id": str(record.get("job_id") or ""),
@@ -318,7 +338,14 @@ def overnight_response(record: Mapping[str, Any]) -> dict[str, Any]:
         "final_selected": final_selected,
         "pause_requested": bool(record.get("pause_requested")),
         "stop_requested": bool(record.get("stop_requested")),
-        "timing": dict(record.get("timing") or {}),
+        "timing": timing,
+        "shutdown_after_completion": shutdown_requested,
+        "shutdown": {
+            "requested": shutdown_requested,
+            "status": str(timing.get("shutdown_status") or ("requested" if shutdown_requested else "not_requested")),
+            "scheduled_at": str(timing.get("shutdown_scheduled_at") or ""),
+            "delay_seconds": int(timing.get("shutdown_delay_seconds") or 0),
+        },
         "started_at": str(record.get("started_at") or ""),
         "updated_at": str(record.get("updated_at") or ""),
         "finished_at": str(record.get("finished_at") or ""),

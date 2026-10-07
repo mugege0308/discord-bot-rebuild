@@ -738,6 +738,26 @@ def is_api_available() -> bool:
         return False
 
 
+def is_comfy_queue_empty() -> bool:
+    """Return True only when ComfyUI reports no running or pending prompts."""
+
+    if _backend() != "comfy":
+        return False
+    try:
+        response = requests.get(_api_url("/queue"), timeout=3)
+        response.raise_for_status()
+        payload = response.json()
+        return (
+            isinstance(payload, dict)
+            and isinstance(payload.get("queue_running"), list)
+            and isinstance(payload.get("queue_pending"), list)
+            and not payload["queue_running"]
+            and not payload["queue_pending"]
+        )
+    except (requests.RequestException, ValueError, TypeError):
+        return False
+
+
 def _start_file_env_name() -> str:
     return "COMFYUI_START_FILE" if _backend() == "comfy" else "SD_START_FILE"
 

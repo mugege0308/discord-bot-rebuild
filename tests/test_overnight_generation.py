@@ -107,6 +107,99 @@ class OvernightGenerationStoreTests(unittest.TestCase):
         self.assertNotIn("opaque-id", str(response))
         self.assertNotIn("must-not-return", str(response))
 
+    def test_shutdown_request_is_per_job_and_safe_response_is_explicit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = OvernightJobStore(Path(temporary) / "overnight.db")
+            requested = store.create({}, 128, shutdown_after_completion=True)
+            self.assertTrue(requested["timing"]["shutdown_after_completion"])
+            response = overnight_response(requested)
+            self.assertTrue(response["shutdown_after_completion"])
+            self.assertEqual("requested", response["shutdown"]["status"])
+
+            store.update(requested["job_id"], state="completed", finished_at="now")
+            self.assertTrue(store.get(requested["job_id"])["timing"]["shutdown_after_completion"])
+            ordinary = store.create({}, 128)
+            self.assertFalse(ordinary["timing"]["shutdown_after_completion"])
+
+
+class OvernightShutdownEligibilityTests(unittest.IsolatedAsyncioTestCase):
+    def _record(self, temporary: str, *, requested: bool = True) -> tuple[OvernightJobStore, dict[str, object]]:
+        store = OvernightJobStore(Path(temporary) / "overnight.db")
+        record = store.create({}, 128, shutdown_after_completion=requested)
+        rounds = [
+            {
+                "selection_state": "completed",
+                "generation_finished_at": "now",
+                "selected": [{"image": {"filename": f"best-{index}.png"}}],
+                "slots": [
+                    {
+                        "status": "completed",
+                        "image": {"filename": f"slot-{index}-{slot}.png"},
+                    }
+                    for slot in range(1, 33)
+                ],
+            }
+            for index in range(4)
+        ]
+        record = store.update(
+            record["job_id"],
+            state="completed",
+            selection_state="completed",
+            generated_count=128,
+            failed_count=0,
+            rounds=rounds,
+            final_selected=[{"filename": "final.png", "global_index": 1}],
+            in_flight={},
+            finished_at="now",
+        )
+        return store, record
+
+    async def test_shutdown_is_scheduled_only_after_strict_success(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store, record = self._record(temporary)
+            api = object.__new__(GenerationApi)
+            api.overnight_jobs = store
+            with patch("services.generation_api.is_comfy_queue_empty", return_value=True), patch.object(
+                GenerationApi, "_overnight_gallery_reflected", return_value=True
+            ), patch(
+                "services.generation_api.schedule_overnight_shutdown",
+                return_value={"shutdown_scheduled_at": "now", "shutdown_delay_seconds": 60, "shutdown_status": "scheduled"},
+            ) as schedule:
+                await api._maybe_schedule_overnight_shutdown(record["job_id"])
+            schedule.assert_called_once()
+            self.assertEqual("scheduled", store.get(record["job_id"])["timing"]["shutdown_status"])
+
+    async def test_shutdown_is_not_scheduled_for_failed_or_nonempty_queue(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store, record = self._record(temporary)
+            api = object.__new__(GenerationApi)
+            api.overnight_jobs = store
+            with patch("services.generation_api.is_comfy_queue_empty", return_value=False), patch(
+                "services.generation_api.schedule_overnight_shutdown"
+            ) as schedule:
+                await api._maybe_schedule_overnight_shutdown(record["job_id"])
+            schedule.assert_not_called()
+            self.assertEqual("blocked", store.get(record["job_id"])["timing"]["shutdown_status"])
+
+            failed = store.update(record["job_id"], state="failed", selection_state="failed")
+            eligible, reason = GenerationApi._overnight_shutdown_eligible(
+                failed, queue_empty=True, gallery_reflected=True
+            )
+            self.assertFalse(eligible)
+            self.assertEqual("job_state_not_completed", reason)
+            for state, selection_state in (
+                ("stopped", "pending"),
+                ("paused_error", "paused_error"),
+                ("completed_selection_failed", "failed"),
+            ):
+                with self.subTest(state=state):
+                    candidate = dict(record, state=state, selection_state=selection_state)
+                    eligible, reason = GenerationApi._overnight_shutdown_eligible(
+                        candidate, queue_empty=True, gallery_reflected=True
+                    )
+                    self.assertFalse(eligible)
+                    self.assertEqual("job_state_not_completed", reason)
+
 
 class OvernightGenerationApiTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
@@ -165,6 +258,36 @@ class OvernightGenerationApiTests(unittest.IsolatedAsyncioTestCase):
             json={"model_key": "animagine", "rating": "safe", "size": "square", "total_count": 16, "freeform_character": "test"},
         )
         self.assertEqual(409, bulk.status)
+
+    async def test_shutdown_flag_is_persisted_only_on_the_requested_job(self) -> None:
+        with patch.object(GenerationApi, "_start_overnight_task"), patch.object(
+            GenerationApi, "_preflight_overnight_dependencies", new=AsyncMock()
+        ):
+            response = await self.client.post(
+                "/api/generation/overnight-jobs",
+                json={
+                    "total_count": 128,
+                    "model_key": "animagine",
+                    "size": "square",
+                    "freeform_character": "test",
+                    "shutdown_after_completion": True,
+                },
+            )
+        self.assertEqual(202, response.status)
+        payload = await response.json()
+        self.assertTrue(payload["shutdown_after_completion"])
+        self.assertTrue(payload["shutdown"]["requested"])
+        self.assertEqual("requested", payload["shutdown"]["status"])
+
+    async def test_shutdown_flag_requires_a_boolean(self) -> None:
+        with patch.object(GenerationApi, "_start_overnight_task") as start:
+            response = await self.client.post(
+                "/api/generation/overnight-jobs",
+                json={"total_count": 128, "model_key": "animagine", "size": "square", "shutdown_after_completion": "yes"},
+            )
+        self.assertEqual(400, response.status)
+        self.assertIn("shutdown_after_completion", (await response.json())["error"])
+        start.assert_not_called()
 
     async def test_offline_comfyui_rejects_before_job_creation(self) -> None:
         with patch("services.generation_api.is_api_available", return_value=False):

@@ -63,9 +63,14 @@ from services.lora_training import LORA_TYPES, normalize_lora_type
 from services.prompt_generator import PromptGeneratorError, _get_lmstudio_api_url
 from services.sd_control import OUTPUT_DIR, is_api_available, resolve_saved_lora_selections
 from services.sd_control import DEFAULT_REFERENCE_STRENGTH
+from services.sd_control import is_comfy_queue_empty
 from services.pose_reference import DEFAULT_POSE_STRENGTH
 from services.shogou_prompt_designer import PROMPT_RATING_CHOICES
 from services.image_selection import select_generated_images
+from services.overnight_shutdown import (
+    DEFAULT_OVERNIGHT_SHUTDOWN_DELAY_SECONDS,
+    schedule_overnight_shutdown,
+)
 from services.overnight_generation import (
     OVERNIGHT_ACTIVE_STATES,
     OVERNIGHT_MAX_CONSECUTIVE_INFRA_FAILURES,
@@ -922,6 +927,129 @@ class GenerationApi:
             if not lm_ready:
                 raise GenerationDependencyError("LM Studioが停止しています。")
 
+    @staticmethod
+    def _shutdown_requested(record: Mapping[str, Any]) -> bool:
+        timing = record.get("timing") or {}
+        return bool(isinstance(timing, Mapping) and timing.get("shutdown_after_completion"))
+
+    @staticmethod
+    def _overnight_shutdown_eligible(
+        record: Mapping[str, Any], *, queue_empty: bool, gallery_reflected: bool
+    ) -> tuple[bool, str]:
+        """Prove strict terminal success before scheduling any power action."""
+
+        if record.get("state") != "completed":
+            return False, "job_state_not_completed"
+        if record.get("selection_state") != "completed":
+            return False, "final_selection_not_completed"
+        if int(record.get("generated_count") or 0) < int(record.get("total_count") or 0):
+            return False, "generation_incomplete"
+        if int(record.get("failed_count") or 0) != 0:
+            return False, "generation_failed"
+        if record.get("in_flight"):
+            return False, "in_flight_slot_present"
+        if not record.get("final_selected"):
+            return False, "final_selection_empty"
+        rounds = list(record.get("rounds") or [])
+        if len(rounds) != int(record.get("total_rounds") or 0):
+            return False, "round_records_incomplete"
+        completed_slots = 0
+        for round_data in rounds:
+            if not isinstance(round_data, Mapping):
+                return False, "round_record_invalid"
+            if round_data.get("selection_state") != "completed":
+                return False, "round_selection_incomplete"
+            slots = list(round_data.get("slots") or [])
+            if not slots or any(slot.get("status") != "completed" for slot in slots):
+                return False, "generated_slots_incomplete"
+            completed_slots += len(slots)
+        if completed_slots != int(record.get("total_count") or 0):
+            return False, "generated_slots_count_mismatch"
+        if not gallery_reflected:
+            return False, "gallery_reflection_incomplete"
+        if not queue_empty:
+            return False, "comfyui_queue_not_empty"
+        return True, ""
+
+    def _overnight_gallery_reflected(self, record: Mapping[str, Any]) -> bool:
+        """Verify every completed slot still resolves inside the Gallery root."""
+
+        gallery_root = get_gallery_images_root()
+        if gallery_root is None:
+            return False
+        try:
+            root = gallery_root.expanduser().resolve()
+        except OSError:
+            return False
+        for round_data in record.get("rounds") or []:
+            for slot in round_data.get("slots") or []:
+                if slot.get("status") != "completed":
+                    return False
+                filename = (slot.get("image") or {}).get("filename")
+                path = self._overnight_path_for_filename(filename)
+                if path is None:
+                    return False
+                try:
+                    path.resolve().relative_to(root)
+                except (OSError, ValueError):
+                    return False
+        return True
+
+    def _set_overnight_phase(self, overnight_id: str, phase: str) -> None:
+        """Persist a bounded phase marker for diagnosing unattended stalls."""
+
+        record = self.overnight_jobs.get(overnight_id)
+        if record is None:
+            return
+        timing = dict(record.get("timing") or {})
+        timing["worker_phase"] = phase
+        timing["worker_phase_at"] = utc_now_iso()
+        self.overnight_jobs.update(overnight_id, timing=timing)
+
+    async def _maybe_schedule_overnight_shutdown(self, overnight_id: str) -> None:
+        """Schedule at most one shutdown after a durable successful completion."""
+
+        record = self.overnight_jobs.get(overnight_id)
+        if record is None or not self._shutdown_requested(record):
+            return
+        timing = dict(record.get("timing") or {})
+        if timing.get("shutdown_scheduled_at") or timing.get("shutdown_status") == "scheduled":
+            return
+        queue_empty = await asyncio.to_thread(is_comfy_queue_empty)
+        eligible, reason = self._overnight_shutdown_eligible(
+            record,
+            queue_empty=queue_empty,
+            gallery_reflected=self._overnight_gallery_reflected(record),
+        )
+        if not eligible:
+            timing["shutdown_status"] = "blocked"
+            timing["shutdown_blocked_reason"] = reason
+            self.overnight_jobs.update(overnight_id, timing=timing)
+            logger.warning(
+                "Overnight shutdown not scheduled: overnight_id=%s reason=%s",
+                overnight_id,
+                reason,
+            )
+            return
+        try:
+            shutdown_metadata = await asyncio.to_thread(
+                schedule_overnight_shutdown,
+                DEFAULT_OVERNIGHT_SHUTDOWN_DELAY_SECONDS,
+            )
+        except Exception as exc:  # noqa: BLE001 - shutdown must never change job success
+            timing["shutdown_status"] = "failed"
+            timing["shutdown_error_type"] = type(exc).__name__
+            self.overnight_jobs.update(overnight_id, timing=timing)
+            logger.exception("Could not schedule Overnight shutdown: overnight_id=%s", overnight_id)
+            return
+        timing.update(shutdown_metadata)
+        self.overnight_jobs.update(overnight_id, timing=timing)
+        logger.warning(
+            "Overnight shutdown scheduled: overnight_id=%s delay_seconds=%s",
+            overnight_id,
+            DEFAULT_OVERNIGHT_SHUTDOWN_DELAY_SECONDS,
+        )
+
     async def create_job(self, request: web.Request) -> web.Response:
         try:
             if request.content_length is not None and request.content_length > self.config.max_body_bytes:
@@ -1099,15 +1227,23 @@ class GenerationApi:
             total_count = payload.get("total_count")
             if isinstance(total_count, bool) or not isinstance(total_count, int) or total_count not in OVERNIGHT_TOTALS:
                 raise GenerationApiError("夜間生成は128、256、512枚だけ指定できます。")
+            shutdown_after_completion = payload.get("shutdown_after_completion", False)
+            if not isinstance(shutdown_after_completion, bool):
+                raise GenerationApiError("shutdown_after_completionはtrueまたはfalseで指定してください。")
             self._reject_if_overnight_active()
             snapshot = dict(payload)
             snapshot.pop("total_count", None)
             snapshot.pop("selection_mode", None)
+            snapshot.pop("shutdown_after_completion", None)
             snapshot["count"] = 1
             snapshot["variation_offset"] = 0
             _build_request(snapshot, reference_upload_bytes=self.config.reference_upload_bytes)
             await self._preflight_overnight_dependencies(snapshot)
-            record = self.overnight_jobs.create(snapshot, total_count)
+            record = self.overnight_jobs.create(
+                snapshot,
+                total_count,
+                shutdown_after_completion=shutdown_after_completion,
+            )
         except GenerationDependencyError as exc:
             return _json_error(str(exc), 503)
         except (GenerationApiError, OvernightJobError) as exc:
@@ -1488,6 +1624,8 @@ class GenerationApi:
                     finished_at=utc_now_iso(),
                     in_flight={},
                 )
+                if final_state == "completed":
+                    await self._maybe_schedule_overnight_shutdown(overnight_id)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - durable recovery boundary
@@ -1508,6 +1646,7 @@ class GenerationApi:
         if record is None or record["state"] in OVERNIGHT_TERMINAL_STATES:
             return
         try:
+            self._set_overnight_phase(overnight_id, "starting")
             if record.get("in_flight"):
                 timing = dict(record.get("timing") or {})
                 timing.setdefault("backend_restart_recovered_at", utc_now_iso())
@@ -1525,6 +1664,7 @@ class GenerationApi:
                 request_payload,
                 reference_upload_bytes=self.config.reference_upload_bytes,
             )
+            self._set_overnight_phase(overnight_id, "resolving_prompt")
             resolved = await asyncio.to_thread(self.service.resolve_request, request)
             slots = plan_bulk_variation_slots(
                 OVERNIGHT_ROUND_SIZE,
@@ -1613,6 +1753,10 @@ class GenerationApi:
                             current_slot=slot.index,
                             in_flight=in_flight,
                         )
+                        self._set_overnight_phase(
+                            overnight_id,
+                            f"round_{round_index}_slot_{slot.index}_preparing",
+                        )
                         last_error: BaseException | None = None
                         result = None
                         for attempt in range(OVERNIGHT_MAX_RETRIES + 1):
@@ -1631,6 +1775,10 @@ class GenerationApi:
                                 )
                                 if not isinstance(prepared, PreparedGeneration):
                                     raise RuntimeError("生成準備結果が不正です。")
+                                self._set_overnight_phase(
+                                    overnight_id,
+                                    f"round_{round_index}_slot_{slot.index}_submitting",
+                                )
                                 metadata = {
                                     "overnight_job_id": overnight_id,
                                     "round_index": round_index,
@@ -1744,6 +1892,10 @@ class GenerationApi:
                             in_flight={},
                             error_summary="",
                         )
+                        self._set_overnight_phase(
+                            overnight_id,
+                            f"round_{round_index}_slot_{slot.index}_completed",
+                        )
 
                     round_data["generation_finished_at"] = utc_now_iso()
                     round_paths = self._overnight_paths(
@@ -1824,17 +1976,45 @@ class GenerationApi:
                     finished_at=finished,
                     in_flight={},
                 )
+                # Persist the completed state first.  The shutdown guard then
+                # re-reads that durable record and independently checks the
+                # final selection, all rounds, and the ComfyUI queue.
+                if final_state == "completed":
+                    await self._maybe_schedule_overnight_shutdown(overnight_id)
         except asyncio.CancelledError:
+            logger.warning("Overnight worker cancelled: overnight_id=%s", overnight_id)
+            try:
+                current = self.overnight_jobs.get(overnight_id)
+                if current is not None and current.get("state") in OVERNIGHT_ACTIVE_STATES:
+                    timing = dict(current.get("timing") or {})
+                    timing["worker_cancelled_at"] = utc_now_iso()
+                    timing["worker_phase"] = "cancelled"
+                    self.overnight_jobs.update(
+                        overnight_id,
+                        state="paused_error",
+                        selection_state="paused_error",
+                        error_summary="Overnight workerが中断されたため、重複生成防止のため手動復旧が必要です。",
+                        timing=timing,
+                        in_flight=current.get("in_flight") or {},
+                    )
+            except Exception:  # noqa: BLE001 - preserve cancellation semantics
+                logger.exception("Could not persist Overnight cancellation: overnight_id=%s", overnight_id)
             raise
         except Exception as exc:  # noqa: BLE001 - durable worker boundary
             logger.exception("Overnight generation failed: overnight_id=%s", overnight_id)
             try:
+                current = self.overnight_jobs.get(overnight_id)
+                timing = dict((current or {}).get("timing") or {})
+                timing["worker_exception_at"] = utc_now_iso()
+                timing["worker_exception_type"] = type(exc).__name__
+                timing["worker_phase"] = "failed"
                 self.overnight_jobs.update(
                     overnight_id,
                     state="failed",
                     error_summary=_safe_error_summary(exc),
                     finished_at=utc_now_iso(),
                     in_flight={},
+                    timing=timing,
                 )
             except OvernightJobError:
                 logger.exception("Could not persist overnight failure: overnight_id=%s", overnight_id)
