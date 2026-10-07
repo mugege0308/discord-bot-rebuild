@@ -12,6 +12,8 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from services.generation_api import (
     GenerationApiConfig,
+    _build_overnight_child_request,
+    _build_request,
     _build_gallery_metadata,
     create_generation_app,
 )
@@ -79,6 +81,18 @@ class _MultiImageService(GenerationService):
 
 
 class GenerationApiTests(unittest.IsolatedAsyncioTestCase):
+    def test_normal_count_one_auto_keeps_existing_off_semantics(self) -> None:
+        request = _build_request({"freeform_character": "girl", "count": 1, "variation": "auto"})
+        self.assertEqual(1, request.count)
+        self.assertEqual("off", request.variation)
+
+    def test_overnight_count_one_child_preserves_parent_auto(self) -> None:
+        request = _build_overnight_child_request(
+            {"freeform_character": "girl", "count": 1, "variation": "auto"}
+        )
+        self.assertEqual(1, request.count)
+        self.assertEqual("auto", request.variation)
+
     async def asyncSetUp(self):
         self.service = _FakeGenerationService()
         self.app = create_generation_app(service=self.service)

@@ -18,6 +18,28 @@ from services.overnight_generation import (
 
 
 class OvernightGenerationStoreTests(unittest.TestCase):
+    def test_selection_identity_uses_overnight_job_and_global_index(self) -> None:
+        rows = GenerationApi._selected_rows(
+            [Path("score_prefix_image.png")],
+            [{"image": {"filename": "image.png"}, "global_index": 37, "variation_index": 5}],
+        )
+        # Selector outputs are score-prefixed copies; the durable row keeps
+        # the source filename and global slot identity.
+        self.assertEqual("image.png", rows[0]["filename"])
+        identity = GenerationApi._add_selection_identity(rows, "overnight-1")
+        self.assertEqual("overnight-1", identity[0]["overnight_job_id"])
+        self.assertEqual("overnight-1:37", identity[0]["selection_identity"])
+
+    def test_selection_identity_handles_flattened_final_candidate_rows(self) -> None:
+        rows = GenerationApi._selected_rows(
+            [Path("score_prefix_image.png")],
+            [{"filename": "image.png", "global_index": 38, "variation_index": 6}],
+        )
+        identity = GenerationApi._add_selection_identity(rows, "overnight-1")
+        self.assertEqual("image.png", identity[0]["filename"])
+        self.assertEqual(38, identity[0]["global_index"])
+        self.assertEqual("overnight-1:38", identity[0]["selection_identity"])
+
     def test_selector_path_resolution_uses_project_local_output_without_paths(self) -> None:
         filename = "overnight-selector-test.png"
         with tempfile.TemporaryDirectory() as temporary:
@@ -198,6 +220,26 @@ class OvernightGenerationApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(400, response.status)
         self.assertIn("128", (await response.json())["error"])
         start.assert_not_called()
+
+    async def test_terminal_job_reselection_is_async_and_does_not_start_generation(self) -> None:
+        store = OvernightJobStore(Path(self.db_path))
+        record = store.create({"model_key": "animagine"}, 128)
+        store.update(record["job_id"], state="completed", generated_count=128, finished_at="now")
+        with patch.object(GenerationApi, "_start_overnight_reselection_task") as start:
+            response = await self.client.post(f"/api/generation/overnight-jobs/{record['job_id']}/reselect", json={})
+        self.assertEqual(202, response.status)
+        self.assertEqual("selecting", (await response.json())["state"])
+        start.assert_called_once_with(record["job_id"])
+
+    async def test_fully_generated_paused_job_can_reselect_after_restart(self) -> None:
+        store = OvernightJobStore(Path(self.db_path))
+        record = store.create({"model_key": "animagine"}, 128)
+        store.update(record["job_id"], state="paused", generated_count=128, finished_at="now")
+        with patch.object(GenerationApi, "_start_overnight_reselection_task") as start:
+            response = await self.client.post(f"/api/generation/overnight-jobs/{record['job_id']}/reselect", json={})
+        self.assertEqual(202, response.status)
+        self.assertEqual("selecting", (await response.json())["state"])
+        start.assert_called_once_with(record["job_id"])
 
     async def test_restart_pauses_in_flight_job_without_auto_resume(self) -> None:
         store = OvernightJobStore(Path(self.db_path))

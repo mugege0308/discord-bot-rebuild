@@ -17,6 +17,7 @@ logger = logging.getLogger("secretary-bot.image_selection")
 
 DATA_DIR = project_path("data")
 BATCH_DIR = DATA_DIR / "sd_selection_batches"
+SELECTION_DIAGNOSTIC_DIR = project_path(".generation_backend/logs/selection")
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
 SCORE_TIMEOUT_SECONDS = 900
 DEFAULT_SELECT_GENERATE_COUNT = 5
@@ -147,7 +148,65 @@ def _read_candidate_scores(project_dir: Path, source_paths: list[Path]) -> dict[
     return scores
 
 
-def select_generated_images(paths: list[Path], *, return_count: int | None = None) -> ImageSelectionResult:
+def _selector_environment() -> dict[str, str]:
+    """Run the local selector without making unattended jobs network-bound."""
+
+    environment = os.environ.copy()
+    # The CLIP model is a local runtime dependency.  In the old mode each
+    # subprocess performed a Hugging Face HEAD request even when its files
+    # were already cached, so a transient DNS/TLS failure could fail one
+    # round.  Offline flags make cache state deterministic and fail fast with
+    # a useful diagnostic if the cache is genuinely incomplete.
+    environment["HF_HUB_OFFLINE"] = "1"
+    environment["TRANSFORMERS_OFFLINE"] = "1"
+    environment["HF_DATASETS_OFFLINE"] = "1"
+    environment["HF_HUB_DISABLE_TELEMETRY"] = "1"
+    return environment
+
+
+def _write_selection_diagnostic(
+    *,
+    context: str,
+    command: list[str],
+    cwd: Path,
+    batch_dir: Path,
+    returncode: int | str,
+    stdout: str = "",
+    stderr: str = "",
+    timed_out: bool = False,
+) -> Path | None:
+    """Persist bounded subprocess evidence for unattended selection runs."""
+
+    try:
+        SELECTION_DIAGNOSTIC_DIR.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now(JST).strftime("%Y%m%d_%H%M%S")
+        path = SELECTION_DIAGNOSTIC_DIR / f"{timestamp}_{uuid.uuid4().hex[:8]}.log"
+        safe_context = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in str(context))[:80] or "selection"
+        lines = [
+            f"context={safe_context}",
+            f"command={command!r}",
+            f"cwd={cwd}",
+            f"batch_dir={batch_dir}",
+            f"returncode={returncode}",
+            f"timed_out={str(bool(timed_out)).lower()}",
+            "--- stdout ---",
+            (stdout or "")[-12000:],
+            "--- stderr ---",
+            (stderr or "")[-12000:],
+        ]
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return path
+    except OSError:
+        logger.warning("Could not write selection diagnostic log.", exc_info=True)
+        return None
+
+
+def select_generated_images(
+    paths: list[Path],
+    *,
+    return_count: int | None = None,
+    diagnostic_context: str = "generation",
+) -> ImageSelectionResult:
     logger.info("Image selection requested: raw_path_count=%s", len(paths))
     source_paths = _image_paths(paths)
     if not source_paths:
@@ -197,22 +256,51 @@ def select_generated_images(paths: list[Path], *, return_count: int | None = Non
         project_dir,
     )
 
+    command = [sys.executable, str(script_path), str(batch_dir)]
     try:
         completed = subprocess.run(
-            [sys.executable, str(script_path), str(batch_dir)],
+            command,
             cwd=str(project_dir),
             capture_output=True,
             text=True,
             timeout=SCORE_TIMEOUT_SECONDS,
             shell=False,
+            env=_selector_environment(),
         )
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as exc:
+        _write_selection_diagnostic(
+            context=diagnostic_context,
+            command=command,
+            cwd=project_dir,
+            batch_dir=batch_dir,
+            returncode="timeout",
+            stdout=str(getattr(exc, "stdout", "") or ""),
+            stderr=str(getattr(exc, "stderr", "") or ""),
+            timed_out=True,
+        )
         logger.exception("Image selection timed out.")
         return ImageSelectionResult(source_paths, False, error="画像選別AIがタイムアウトしました。")
-    except Exception:
+    except Exception as exc:
+        _write_selection_diagnostic(
+            context=diagnostic_context,
+            command=command,
+            cwd=project_dir,
+            batch_dir=batch_dir,
+            returncode="spawn_error",
+            stderr=str(exc),
+        )
         logger.exception("Failed to run image selection.")
         return ImageSelectionResult(source_paths, False, error="画像選別AIの実行に失敗しました。")
 
+    diagnostic_path = _write_selection_diagnostic(
+        context=diagnostic_context,
+        command=command,
+        cwd=project_dir,
+        batch_dir=batch_dir,
+        returncode=completed.returncode,
+        stdout=completed.stdout,
+        stderr=completed.stderr,
+    )
     if completed.returncode != 0:
         logger.error(
             "Image selection failed: returncode=%s stdout=%s stderr=%s",
@@ -222,6 +310,8 @@ def select_generated_images(paths: list[Path], *, return_count: int | None = Non
         )
         detail = (completed.stderr or completed.stdout or "").strip().splitlines()
         reason = detail[-1] if detail else f"exit code {completed.returncode}"
+        if diagnostic_path is not None:
+            logger.error("Image selection diagnostic saved: path=%s", diagnostic_path)
         return ImageSelectionResult(source_paths, False, error=f"画像選別AIに失敗しました: {reason[:180]}")
 
     selected_paths = _load_selected_paths(project_dir, return_count=return_count)

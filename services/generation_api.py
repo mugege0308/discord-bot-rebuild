@@ -514,6 +514,18 @@ def _build_request(
     return generation_request
 
 
+def _build_overnight_child_request(
+    payload: Mapping[str, object],
+    *,
+    reference_upload_bytes: int = MAX_REFERENCE_IMAGE_BYTES,
+) -> GenerationRequest:
+    """Build a count=1 child while preserving the parent's variation mode."""
+
+    request = _build_request(payload, reference_upload_bytes=reference_upload_bytes)
+    overnight_variation = _parse_variation(payload.get("variation"), count=2)
+    return replace(request, count=1, variation=overnight_variation, variation_offset=0)
+
+
 def _safe_error_summary(exc: BaseException) -> str:
     """Return a short client-safe error without traceback or absolute paths."""
 
@@ -594,6 +606,7 @@ def _build_gallery_metadata(
         "variation_index": variation_index,
         "variation_tags": list(variation_tags),
         "variation": request.variation,
+        "requested_variation": request.variation,
         "variation_offset": request.variation_offset,
         "model": str(options.model_key or request.model_key),
         "rating": request.rating,
@@ -724,6 +737,7 @@ class GenerationApi:
                 web.post("/api/generation/overnight-jobs/{overnight_id}/pause", self.pause_overnight_job),
                 web.post("/api/generation/overnight-jobs/{overnight_id}/resume", self.resume_overnight_job),
                 web.post("/api/generation/overnight-jobs/{overnight_id}/stop", self.stop_overnight_job),
+                web.post("/api/generation/overnight-jobs/{overnight_id}/reselect", self.reselect_overnight_job),
             ]
         )
         self.app.on_cleanup.append(self._cleanup)
@@ -1061,6 +1075,20 @@ class GenerationApi:
 
         task.add_done_callback(_finished)
 
+    def _start_overnight_reselection_task(self, overnight_id: str) -> None:
+        if self._overnight_task is not None and not self._overnight_task.done():
+            return
+        task = asyncio.create_task(self._recover_overnight_selection(overnight_id))
+        self._overnight_task = task
+        self._tasks.add(task)
+
+        def _finished(completed: asyncio.Task[None]) -> None:
+            self._tasks.discard(completed)
+            if self._overnight_task is completed:
+                self._overnight_task = None
+
+        task.add_done_callback(_finished)
+
     async def create_overnight_job(self, request: web.Request) -> web.Response:
         try:
             if request.content_length is not None and request.content_length > self.config.max_body_bytes:
@@ -1156,6 +1184,35 @@ class GenerationApi:
         except OvernightJobError as exc:
             return _json_error(str(exc), 404)
 
+    async def reselect_overnight_job(self, request: web.Request) -> web.Response:
+        """Re-run selection for an existing terminal job without generation."""
+
+        record = self.overnight_jobs.get(request.match_info["overnight_id"])
+        if record is None:
+            return _json_error("夜間生成jobが見つかりません。", 404)
+        generated_count = int(record.get("generated_count") or 0)
+        total_count = int(record.get("total_count") or 0)
+        fully_generated = total_count > 0 and generated_count >= total_count and not record.get("in_flight")
+        if record["state"] not in OVERNIGHT_TERMINAL_STATES and not (
+            record["state"] == "paused" and fully_generated
+        ):
+            return _json_error("実行中の夜間生成は再選別できません。", 409)
+        if generated_count < 1:
+            return _json_error("再選別できる生成画像がありません。", 400)
+        if self._overnight_task is not None and not self._overnight_task.done():
+            return _json_error("夜間生成の別処理が実行中です。", 409)
+        timing = dict(record.get("timing") or {})
+        timing["selection_recovery_requested_at"] = utc_now_iso()
+        record = self.overnight_jobs.update(
+            record["job_id"],
+            state="selecting",
+            selection_state="recovery_queued",
+            error_summary="",
+            timing=timing,
+        )
+        self._start_overnight_reselection_task(record["job_id"])
+        return web.json_response(overnight_response(record), status=202)
+
     @staticmethod
     def _overnight_error_retryable(exc: BaseException) -> bool:
         text = str(exc).casefold()
@@ -1250,9 +1307,9 @@ class GenerationApi:
         source_rows: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
         by_name = {
-            str((row.get("image") or {}).get("filename")): row
+            str(((row.get("image") or row).get("filename"))): row
             for row in source_rows
-            if (row.get("image") or {}).get("filename")
+            if ((row.get("image") or row).get("filename"))
         }
         rows: list[dict[str, Any]] = []
         for rank, selected_path in enumerate(selected_paths, start=1):
@@ -1263,37 +1320,188 @@ class GenerationApi:
                 source = matches[0] if len(matches) == 1 else None
             if source is None:
                 continue
-            image = dict(source.get("image") or {})
+            image = dict(source.get("image") or source)
             rows.append(
                 {
                     "filename": str(image.get("filename") or ""),
                     "rank": rank,
-                    "variation_index": source.get("variation_index"),
-                    "global_index": source.get("global_index"),
+                    "variation_index": (
+                        source.get("variation_index")
+                        if source.get("variation_index") is not None
+                        else image.get("variation_index")
+                    ),
+                    "global_index": (
+                        source.get("global_index")
+                        if source.get("global_index") is not None
+                        else image.get("global_index")
+                    ),
                 }
             )
         return rows
 
-    async def _select_overnight_paths(self, paths: list[Path]) -> tuple[list[Path], int, str | None]:
+    @staticmethod
+    def _add_selection_identity(rows: list[dict[str, Any]], overnight_id: str) -> list[dict[str, Any]]:
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            item["overnight_job_id"] = overnight_id
+            global_index = item.get("global_index")
+            if isinstance(global_index, int) and global_index > 0:
+                item["selection_identity"] = f"{overnight_id}:{global_index}"
+            result.append(item)
+        return result
+
+    async def _select_overnight_paths(
+        self,
+        paths: list[Path],
+        *,
+        diagnostic_context: str = "overnight",
+    ) -> tuple[list[Path], int, str | None]:
         """Use the existing selector, chunking only when its input is large."""
 
         if not paths:
             return [], 0, "選別対象の画像がありません。"
         if len(paths) <= 32:
-            result = await asyncio.to_thread(select_generated_images, paths, return_count=4)
+            result = await asyncio.to_thread(
+                select_generated_images,
+                paths,
+                return_count=4,
+                diagnostic_context=diagnostic_context,
+            )
             if not result.used_selection:
                 return [], 1, _safe_error_summary(result.error or result.message or "画像選別AIを利用できませんでした。")
             return list(result.selected_paths), 1, None
         finalists: list[Path] = []
         calls = 0
         for start in range(0, len(paths), 32):
-            selected, used_calls, error = await self._select_overnight_paths(paths[start : start + 32])
+            selected, used_calls, error = await self._select_overnight_paths(
+                paths[start : start + 32],
+                diagnostic_context=f"{diagnostic_context}-chunk-{start // 32 + 1}",
+            )
             calls += used_calls
             if error:
                 return [], calls, error
             finalists.extend(selected)
-        selected, used_calls, error = await self._select_overnight_paths(finalists)
+        selected, used_calls, error = await self._select_overnight_paths(
+            finalists,
+            diagnostic_context=f"{diagnostic_context}-final",
+        )
         return selected, calls + used_calls, error
+
+    async def _recover_overnight_selection(self, overnight_id: str) -> None:
+        """Re-select existing overnight images without submitting generation jobs."""
+
+        try:
+            async with self._generation_lock:
+                record = self.overnight_jobs.get(overnight_id)
+                if record is None:
+                    return
+                rounds = [dict(item) for item in (record.get("rounds") or []) if isinstance(item, dict)]
+                timing = dict(record.get("timing") or {})
+                timing.setdefault("selection_recovery_started_at", utc_now_iso())
+                recovery_rounds: list[int] = []
+                self.overnight_jobs.update(
+                    overnight_id,
+                    state="selecting",
+                    selection_state="recovery_selecting",
+                    timing=timing,
+                    rounds=rounds,
+                )
+
+                for round_data in rounds:
+                    if round_data.get("selection_state") != "failed":
+                        continue
+                    round_index = int(round_data.get("round_index") or 0)
+                    if round_index < 1:
+                        continue
+                    recovery_rounds.append(round_index)
+                    completed_rows = [
+                        slot
+                        for slot in (round_data.get("slots") or [])
+                        if slot.get("status") == "completed" and isinstance(slot.get("image"), dict)
+                    ]
+                    paths = self._overnight_paths(completed_rows)
+                    round_data["selection_started_at"] = utc_now_iso()
+                    round_data["selection_state"] = "recovery_running"
+                    self.overnight_jobs.update(overnight_id, rounds=rounds)
+                    selected_paths, calls, error = await self._select_overnight_paths(
+                        paths,
+                        diagnostic_context=f"overnight-{overnight_id}-round-{round_index}-recovery",
+                    )
+                    round_data["selection_finished_at"] = utc_now_iso()
+                    round_data["selection_calls"] = int(round_data.get("selection_calls") or 0) + calls
+                    round_data["selected"] = self._add_selection_identity(
+                        self._selected_rows(selected_paths, completed_rows), overnight_id
+                    )
+                    round_data["selection_state"] = "completed" if not error else "failed"
+                    round_data["error"] = error or ""
+                    self.overnight_jobs.update(overnight_id, rounds=rounds, error_summary=error or "")
+
+                record = self.overnight_jobs.get(overnight_id) or record
+                candidates: list[dict[str, Any]] = []
+                for round_data in record.get("rounds") or []:
+                    selected_rows = list(round_data.get("selected") or [])
+                    if not selected_rows and round_data.get("selection_state") == "failed":
+                        selected_rows = [
+                            dict(slot.get("image") or {})
+                            for slot in (round_data.get("slots") or [])
+                            if slot.get("status") == "completed" and isinstance(slot.get("image"), dict)
+                        ]
+                    candidates.extend(selected_rows)
+                candidate_paths = self._overnight_paths([{"image": row} for row in candidates])
+                timing["final_selection_started_at"] = utc_now_iso()
+                self.overnight_jobs.update(
+                    overnight_id,
+                    state="selecting",
+                    selection_state="final_recovery_selecting",
+                    timing=timing,
+                )
+                final_paths, final_calls, final_error = await self._select_overnight_paths(
+                    candidate_paths,
+                    diagnostic_context=f"overnight-{overnight_id}-final-recovery",
+                )
+                timing["final_selection_finished_at"] = utc_now_iso()
+                timing["selection_recovery_finished_at"] = utc_now_iso()
+                timing["selection_recovery_rounds"] = recovery_rounds
+                timing["selection_recovery_calls"] = sum(
+                    int(item.get("selection_calls") or 0) for item in (record.get("rounds") or [])
+                ) + final_calls
+                final_selected = list(record.get("final_selected") or [])
+                if not final_error:
+                    final_selected = self._add_selection_identity(
+                        self._selected_rows(final_paths[:4], [{"image": row} for row in candidates]),
+                        overnight_id,
+                    )
+                rounds_complete = all(
+                    item.get("selection_state") == "completed"
+                    for item in (record.get("rounds") or [])
+                    if item.get("generation_finished_at")
+                )
+                final_state = "completed" if not final_error and rounds_complete else "completed_selection_failed"
+                self.overnight_jobs.update(
+                    overnight_id,
+                    state=final_state,
+                    selection_state="completed" if not final_error and rounds_complete else "failed",
+                    final_selected=final_selected,
+                    error_summary=final_error or "",
+                    timing=timing,
+                    finished_at=utc_now_iso(),
+                    in_flight={},
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - durable recovery boundary
+            logger.exception("Overnight selection recovery failed: overnight_id=%s", overnight_id)
+            try:
+                self.overnight_jobs.update(
+                    overnight_id,
+                    state="completed_selection_failed",
+                    selection_state="failed",
+                    error_summary=_safe_error_summary(exc),
+                    in_flight={},
+                )
+            except OvernightJobError:
+                logger.exception("Could not persist overnight selection recovery failure: overnight_id=%s", overnight_id)
 
     async def _run_overnight_job(self, overnight_id: str) -> None:
         record = self.overnight_jobs.get(overnight_id)
@@ -1313,11 +1521,10 @@ class GenerationApi:
                 )
                 return
             request_payload = dict(record.get("request") or {})
-            request = _build_request(
+            request = _build_overnight_child_request(
                 request_payload,
                 reference_upload_bytes=self.config.reference_upload_bytes,
             )
-            request = replace(request, count=1, variation_offset=0)
             resolved = await asyncio.to_thread(self.service.resolve_request, request)
             slots = plan_bulk_variation_slots(
                 OVERNIGHT_ROUND_SIZE,
@@ -1547,11 +1754,16 @@ class GenerationApi:
                     self.overnight_jobs.update(
                         overnight_id, state="selecting", selection_state=f"round_{round_index}_selecting", rounds=rounds,
                     )
-                    selected_paths, selection_calls, selection_error = await self._select_overnight_paths(round_paths)
+                    selected_paths, selection_calls, selection_error = await self._select_overnight_paths(
+                        round_paths,
+                        diagnostic_context=f"overnight-{overnight_id}-round-{round_index}",
+                    )
                     round_data["selection_finished_at"] = utc_now_iso()
                     round_data["selection_calls"] = selection_calls
                     source_rows = [slot for slot in round_data.get("slots") or [] if slot.get("status") == "completed"]
-                    round_data["selected"] = self._selected_rows(selected_paths, source_rows)
+                    round_data["selected"] = self._add_selection_identity(
+                        self._selected_rows(selected_paths, source_rows), overnight_id
+                    )
                     round_data["selection_state"] = "completed" if not selection_error else "failed"
                     round_data["error"] = selection_error or ""
                     rounds = [item for item in rounds if int(item.get("round_index") or 0) != round_index]
@@ -1588,15 +1800,18 @@ class GenerationApi:
                 self.overnight_jobs.update(
                     overnight_id, state="selecting", selection_state="final_selecting", timing=timing,
                 )
-                final_paths, final_calls, final_error = await self._select_overnight_paths(candidate_paths)
+                final_paths, final_calls, final_error = await self._select_overnight_paths(
+                    candidate_paths,
+                    diagnostic_context=f"overnight-{overnight_id}-final",
+                )
                 timing["final_selection_finished_at"] = utc_now_iso()
                 timing["selector_calls"] = sum(
                     int(item.get("selection_calls") or 0) for item in (record.get("rounds") or [])
                 ) + final_calls
-                final_selected = [
-                    {"filename": path.name, "rank": rank}
-                    for rank, path in enumerate(final_paths[:4], start=1)
-                ]
+                final_source_rows = [{"image": row} for row in candidates]
+                final_selected = self._add_selection_identity(
+                    self._selected_rows(final_paths[:4], final_source_rows), overnight_id
+                )
                 finished = utc_now_iso()
                 final_state = "completed_selection_failed" if final_error else "completed"
                 self.overnight_jobs.update(
