@@ -21,6 +21,9 @@ from services.sd_control import (
 )
 
 
+ROOT = Path(__file__).resolve().parents[1]
+
+
 def _workflow() -> dict:
     return {
         "4": {
@@ -301,10 +304,10 @@ class LoraGenerationTestCase(unittest.TestCase):
         self.assertEqual(effective_lora_selections(result)[0].key, "character")
 
     def test_workflow_selection_is_lora_only_and_reference_combination_is_explicitly_rejected(self):
-        self.assertEqual(_get_comfy_workflow_file(False), Path("workflows/comfy_workflow.json"))
+        self.assertEqual(_get_comfy_workflow_file(False), ROOT / "workflows" / "comfy_workflow.json")
         self.assertEqual(
             _get_comfy_workflow_file(False, (LoraSelection("x", "x", "style", "x", "", 0.5),)),
-            Path("workflows/comfy_workflow_lora.json"),
+            ROOT / "workflows" / "comfy_workflow_lora.json",
         )
         with self.assertRaisesRegex(ValueError, "同時適用"):
             _get_comfy_workflow_file(True, (LoraSelection("x", "x", "style", "x", "", 0.5),))

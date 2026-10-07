@@ -25,6 +25,9 @@ from services.lora_paths import (
 from services.lora_training import LORA_TYPE_CHARACTER, LORA_TYPE_STYLE
 
 
+ROOT = Path(__file__).resolve().parents[1]
+
+
 def _write_model(root: Path, relative: str, metadata: dict | None = None) -> Path:
     path = root / relative
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -180,7 +183,7 @@ class LoraCatalogTestCase(unittest.TestCase):
         ):
             self.assertEqual(get_lora_manager_outputs_dir(), Path("custom-outputs"))
             self.assertEqual(get_comfy_lora_root(), Path("custom-loras"))
-        self.assertEqual(DEFAULT_STYLE_WORKFLOW, Path("workflows") / "comfy_workflow_lora.json")
+        self.assertEqual(DEFAULT_STYLE_WORKFLOW, ROOT / "workflows" / "comfy_workflow_lora.json")
 
     def test_legacy_environment_resolves_project_outputs_and_recognized_comfy_layout(self):
         with tempfile.TemporaryDirectory() as directory:

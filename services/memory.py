@@ -9,11 +9,12 @@ from services.prompt_context_conflicts import (
     weak_visual_hint_conflicts_with_request,
 )
 from services.weather import JST
+from services.runtime_paths import project_path
 
 
 logger = logging.getLogger("secretary-bot.memory_service")
 
-DATA_DIR = Path("data")
+DATA_DIR = project_path("data")
 MEMORY_FILE = DATA_DIR / "memory.json"
 MAX_MEMORY_TEXT_LENGTH = 500
 MAX_CONTEXT_CHARS = 1400

@@ -16,9 +16,11 @@ from pathlib import Path
 
 from PIL import Image
 
+from services.runtime_paths import project_path, resolve_project_path
+
 
 MAX_REFERENCE_IMAGE_BYTES = 10 * 1024 * 1024
-REFERENCE_IMAGE_ROOT = Path("data") / "generation_references"
+REFERENCE_IMAGE_ROOT = project_path("data", "generation_references")
 REFERENCE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{16,64}$")
 _FORMAT_TO_CONTENT_TYPE = {
     "PNG": "image/png",
@@ -43,7 +45,7 @@ class ReferenceAsset:
 
 def storage_root() -> Path:
     configured = os.getenv("GENERATION_REFERENCE_ROOT", "").strip()
-    return Path(configured) if configured else REFERENCE_IMAGE_ROOT
+    return resolve_project_path(configured or None, REFERENCE_IMAGE_ROOT)
 
 
 def _decode_image(image_bytes: bytes, claimed_content_type: str | None) -> tuple[str, int, int]:

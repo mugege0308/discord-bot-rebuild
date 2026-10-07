@@ -22,8 +22,8 @@ import threading
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Mapping
-
 from aiohttp import ContentTypeError, web
+import requests
 
 from services.appearance_resolver import get_appearance_resolver_status
 from services.character_tag_dictionary import list_characters
@@ -60,8 +60,8 @@ from services.image_generation_profiles import (
 )
 from services.lora_catalog import COMFY_STYLES, model_family_compatible
 from services.lora_training import LORA_TYPES, normalize_lora_type
-from services.prompt_generator import PromptGeneratorError
-from services.sd_control import OUTPUT_DIR, resolve_saved_lora_selections
+from services.prompt_generator import PromptGeneratorError, _get_lmstudio_api_url
+from services.sd_control import OUTPUT_DIR, is_api_available, resolve_saved_lora_selections
 from services.sd_control import DEFAULT_REFERENCE_STRENGTH
 from services.pose_reference import DEFAULT_POSE_STRENGTH
 from services.shogou_prompt_designer import PROMPT_RATING_CHOICES
@@ -120,6 +120,10 @@ GENERATION_API_APP_KEY = web.AppKey("generation_api", object)
 
 class GenerationApiError(ValueError):
     """A client-visible, sanitized request validation error."""
+
+
+class GenerationDependencyError(GenerationApiError):
+    """A safe error raised when an Overnight dependency is offline."""
 
 
 @dataclass(frozen=True)
@@ -268,6 +272,31 @@ def _is_configured(*names: str) -> bool:
 
 def _json_error(message: str, status: int = 400) -> web.Response:
     return web.json_response({"error": message}, status=status)
+
+
+def _lm_studio_ready() -> bool:
+    """Probe the endpoint used by the current Prompt Designer path.
+
+    This is deliberately a small liveness check.  It never sends a prompt,
+    never logs the configured URL, and accepts the two LM Studio API layouts
+    used by the project.
+    """
+
+    base_url = _get_lmstudio_api_url().strip().rstrip("/")
+    if not base_url:
+        return False
+    candidates = [
+        f"{base_url}/models" if base_url.endswith("/v1") else f"{base_url}/v1/models",
+        f"{base_url}/api/v1/models" if not base_url.endswith("/api/v1") else f"{base_url}/models",
+    ]
+    for candidate in dict.fromkeys(candidates):
+        try:
+            response = requests.get(candidate, timeout=2)
+        except requests.RequestException:
+            continue
+        if response.status_code == 200:
+            return True
+    return False
 
 
 def _clean_text(value: object, field_name: str, *, allow_none: bool = True) -> str | None:
@@ -855,6 +884,30 @@ class GenerationApi:
         if self._overnight_is_active():
             raise GenerationApiError("夜間生成実行中は通常生成と大量生成を開始できません。")
 
+    @staticmethod
+    def _overnight_requires_lm_studio(_snapshot: Mapping[str, object]) -> bool:
+        """Return whether the current Overnight execution path resolves prompts.
+
+        Overnight currently stores the public request fields and resolves them
+        inside ``_run_overnight_job`` before the first slot.  There is no
+        accepted resolved-prompt snapshot field, so LM Studio is required for
+        every current Overnight request.  This explicit predicate keeps the
+        exception point clear if a future trusted snapshot path is added.
+        """
+
+        return True
+
+    async def _preflight_overnight_dependencies(self, snapshot: Mapping[str, object]) -> None:
+        """Reject an obviously unstartable Overnight request before persistence."""
+
+        comfy_ready = await asyncio.to_thread(is_api_available)
+        if not comfy_ready:
+            raise GenerationDependencyError("ComfyUIが停止しています。")
+        if self._overnight_requires_lm_studio(snapshot):
+            lm_ready = await asyncio.to_thread(_lm_studio_ready)
+            if not lm_ready:
+                raise GenerationDependencyError("LM Studioが停止しています。")
+
     async def create_job(self, request: web.Request) -> web.Response:
         try:
             if request.content_length is not None and request.content_length > self.config.max_body_bytes:
@@ -1025,7 +1078,10 @@ class GenerationApi:
             snapshot["count"] = 1
             snapshot["variation_offset"] = 0
             _build_request(snapshot, reference_upload_bytes=self.config.reference_upload_bytes)
+            await self._preflight_overnight_dependencies(snapshot)
             record = self.overnight_jobs.create(snapshot, total_count)
+        except GenerationDependencyError as exc:
+            return _json_error(str(exc), 503)
         except (GenerationApiError, OvernightJobError) as exc:
             status = 409 if "同時に1件" in str(exc) or "実行中" in str(exc) else 400
             return _json_error(str(exc), status)
@@ -1159,13 +1215,7 @@ class GenerationApi:
         # be able to recover it after a restart, while browser responses still
         # expose only safe filenames. Keep the lookup project-local and never
         # accept a caller-supplied path.
-        roots.extend(
-            (
-                Path.cwd() / "data" / "sd_outputs",
-                OUTPUT_DIR,
-                Path(__file__).resolve().parents[1] / "data" / "sd_outputs",
-            )
-        )
+        roots.append(OUTPUT_DIR)
         seen: set[Path] = set()
         for raw_root in roots:
             try:

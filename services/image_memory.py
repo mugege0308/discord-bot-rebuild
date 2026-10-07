@@ -7,12 +7,13 @@ from pathlib import Path
 from typing import Any
 
 from services.prompt_context_conflicts import filter_conflicting_weak_visual_hints
+from services.runtime_paths import project_path, resolve_project_path
 
 
 logger = logging.getLogger("secretary-bot.image_memory")
 
 JST = timezone(timedelta(hours=9))
-DATA_DIR = Path("data/image_memory")
+DATA_DIR = project_path("data", "image_memory")
 IMAGES_DIR = DATA_DIR / "images"
 FILE_PREFIX = "ref_"
 IMAGE_EXTENSIONS = {"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp"}
@@ -92,8 +93,7 @@ def resolve_image_memory_image_path(item: dict[str, Any], memory_id: int | None 
     except (TypeError, ValueError):
         return None
     candidate = Path(raw_path.strip())
-    if not candidate.is_absolute():
-        candidate = Path.cwd() / candidate
+    candidate = resolve_project_path(candidate, candidate)
     try:
         resolved = candidate.resolve()
         allowed_dir = (DATA_DIR / "images").resolve()

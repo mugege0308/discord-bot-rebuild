@@ -4,7 +4,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from aiohttp.test_utils import TestClient, TestServer
 
@@ -105,7 +105,9 @@ class OvernightGenerationApiTests(unittest.IsolatedAsyncioTestCase):
     async def test_valid_overnight_job_is_durable_and_exposes_safe_state(self) -> None:
         # Keep this test at the API boundary without starting a real generation
         # worker or touching ComfyUI.
-        with patch.object(GenerationApi, "_start_overnight_task"):
+        with patch.object(GenerationApi, "_start_overnight_task"), patch.object(
+            GenerationApi, "_preflight_overnight_dependencies", new=AsyncMock()
+        ):
             response = await self.client.post(
                 "/api/generation/overnight-jobs",
                 json={
@@ -141,6 +143,51 @@ class OvernightGenerationApiTests(unittest.IsolatedAsyncioTestCase):
             json={"model_key": "animagine", "rating": "safe", "size": "square", "total_count": 16, "freeform_character": "test"},
         )
         self.assertEqual(409, bulk.status)
+
+    async def test_offline_comfyui_rejects_before_job_creation(self) -> None:
+        with patch("services.generation_api.is_api_available", return_value=False):
+            response = await self.client.post(
+                "/api/generation/overnight-jobs",
+                json={"total_count": 128, "model_key": "animagine", "size": "square", "freeform_character": "test"},
+            )
+        self.assertEqual(503, response.status)
+        self.assertIn("ComfyUI", (await response.json())["error"])
+        self.assertEqual([], OvernightJobStore(Path(self.db_path)).list_active())
+
+    async def test_offline_lm_studio_rejects_before_job_creation(self) -> None:
+        with patch("services.generation_api.is_api_available", return_value=True), patch(
+            "services.generation_api._lm_studio_ready", return_value=False
+        ):
+            response = await self.client.post(
+                "/api/generation/overnight-jobs",
+                json={"total_count": 128, "model_key": "animagine", "size": "square", "freeform_character": "test"},
+            )
+        self.assertEqual(503, response.status)
+        self.assertIn("LM Studio", (await response.json())["error"])
+        self.assertEqual([], OvernightJobStore(Path(self.db_path)).list_active())
+
+    async def test_dependency_preflight_success_is_before_persistence(self) -> None:
+        with patch("services.generation_api.is_api_available", return_value=True), patch(
+            "services.generation_api._lm_studio_ready", return_value=True
+        ), patch.object(GenerationApi, "_start_overnight_task"):
+            response = await self.client.post(
+                "/api/generation/overnight-jobs",
+                json={"total_count": 128, "model_key": "animagine", "size": "square", "freeform_character": "test"},
+            )
+        self.assertEqual(202, response.status)
+        self.assertEqual(1, len(OvernightJobStore(Path(self.db_path)).list_active()))
+
+    async def test_lm_studio_is_not_required_for_explicit_non_lm_path(self) -> None:
+        with patch("services.generation_api.is_api_available", return_value=True), patch(
+            "services.generation_api._lm_studio_ready", return_value=False
+        ), patch.object(GenerationApi, "_overnight_requires_lm_studio", return_value=False), patch.object(
+            GenerationApi, "_start_overnight_task"
+        ):
+            response = await self.client.post(
+                "/api/generation/overnight-jobs",
+                json={"total_count": 128, "model_key": "animagine", "size": "square", "freeform_character": "test"},
+            )
+        self.assertEqual(202, response.status)
 
     async def test_invalid_total_is_rejected_before_worker_start(self) -> None:
         with patch.object(GenerationApi, "_start_overnight_task") as start:

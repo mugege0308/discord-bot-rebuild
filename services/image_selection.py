@@ -10,11 +10,12 @@ from datetime import datetime
 from pathlib import Path
 
 from services.weather import JST
+from services.runtime_paths import project_path, resolve_project_path
 
 
 logger = logging.getLogger("secretary-bot.image_selection")
 
-DATA_DIR = Path("data")
+DATA_DIR = project_path("data")
 BATCH_DIR = DATA_DIR / "sd_selection_batches"
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
 SCORE_TIMEOUT_SECONDS = 900
@@ -38,7 +39,7 @@ def _local_ai_project_dir() -> Path | None:
     raw_value = os.getenv("LOCAL_AI_PROJECT_DIR", "").strip().strip('"')
     if not raw_value:
         return None
-    return Path(raw_value)
+    return resolve_project_path(raw_value, raw_value)
 
 
 def _env_int(name: str, default: int, minimum: int, maximum: int) -> int:

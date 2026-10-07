@@ -14,11 +14,12 @@ from sd_prompt_template_generator import (
 )
 from services.memory import append_memory_to_system_prompt
 from services.image_memory import build_image_memory_prompt_context
+from services.runtime_paths import project_path
 
 
 logger = logging.getLogger("secretary-bot.prompt_generator")
 
-INSTRUCTION_FILE = Path("fixed_template_llm_instruction.md")
+INSTRUCTION_FILE = project_path("fixed_template_llm_instruction.md")
 DEFAULT_TIMEOUT_SECONDS = 30
 DEFAULT_MODEL = "local-model"
 DEFAULT_PROMPT_DESIGNER_MAX_TOKENS = 512

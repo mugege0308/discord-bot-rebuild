@@ -9,9 +9,11 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$serverScript = Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) "generation_backend_server.py"
+$ProjectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+$serverScript = Join-Path $ProjectRoot "generation_backend_server.py"
 
 try {
+    Set-Location -LiteralPath $ProjectRoot
     & $PythonPath -u $serverScript 1>> $StdoutLog 2>> $StderrLog
     exit $LASTEXITCODE
 } catch {

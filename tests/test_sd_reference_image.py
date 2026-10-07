@@ -71,7 +71,7 @@ class ReferenceWorkflowTestCase(unittest.TestCase):
         self.assertEqual(sum(node["class_type"] == "IPAdapterAdvanced" for node in workflow.values()), 1)
 
     def test_reference_selects_dedicated_workflow(self):
-        self.assertEqual(_get_comfy_workflow_file(True), Path("workflows/comfy_workflow_ipadapter.json"))
+        self.assertEqual(_get_comfy_workflow_file(True), ROOT / "workflows" / "comfy_workflow_ipadapter.json")
 
     def test_reference_name_weight_seed_and_prompt_are_applied(self):
         options = validate_options(

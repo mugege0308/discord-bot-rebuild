@@ -58,12 +58,12 @@ from services.generate_ai_debug import (
     store_generate_ai_prompt_tag_resolution,
     store_generate_ai_stage_detail,
 )
+from services.runtime_paths import PROJECT_ROOT, project_path, resolve_project_path
 
 
 logger = logging.getLogger("secretary-bot.shogou_prompt_designer")
 
-INSTRUCTION_FILE = Path("shogou_chan_prompt_designer_instruction.md")
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+INSTRUCTION_FILE = project_path("shogou_chan_prompt_designer_instruction.md")
 REQUIRED_KEYS = ("positive", "negative", "summary", "assumptions")
 SHOGOU_RESPONSE_FORMAT = {"type": "json_schema", "json_schema": {"name": "shogou_prompt_result", "schema": {"type": "object"}}}
 PROMPT_RATING_AUTO = "auto"
@@ -174,10 +174,7 @@ def _build_grounded_summary(positive: str) -> str:
 def _resolve_prompt_instruction_path(path: Path) -> Path:
     """Resolve bundled prompt instructions independently of the process CWD."""
 
-    candidate = Path(path)
-    if candidate.is_absolute():
-        return candidate
-    return PROJECT_ROOT / candidate
+    return resolve_project_path(path, path)
 
 
 def load_shogou_instruction(model_key: str = DEFAULT_IMAGE_GENERATION_MODEL_KEY) -> str:

@@ -29,12 +29,13 @@ from services.lora_training import (
     load_lora_metadata,
     normalize_lora_type,
 )
+from services.runtime_paths import project_path
 
 
 logger = logging.getLogger("secretary-bot.lora_catalog")
 
 KOHYA_INTERMEDIATE_CHECKPOINT_SUFFIX = re.compile(r"-\d{6}$")
-DEFAULT_STYLE_WORKFLOW = Path("workflows") / "comfy_workflow_lora.json"
+DEFAULT_STYLE_WORKFLOW = project_path("workflows", "comfy_workflow_lora.json")
 MAX_DISCORD_CHOICES = 25
 
 

@@ -17,6 +17,8 @@ import threading
 from typing import Any, Mapping
 import uuid
 
+from services.runtime_paths import resolve_project_path
+
 
 OVERNIGHT_TOTALS = frozenset({128, 256, 512})
 OVERNIGHT_DEFAULT_TOTAL = 256
@@ -32,8 +34,8 @@ def utc_now_iso() -> str:
 
 
 def resolve_overnight_db_path() -> Path:
-    raw = os.getenv("BATCH_GENERATION_DB_PATH", "data/batch_generation.db").strip().strip('"')
-    return Path(raw or "data/batch_generation.db")
+    raw = os.getenv("BATCH_GENERATION_DB_PATH", "").strip().strip('"')
+    return resolve_project_path(raw or None, "data/batch_generation.db")
 
 
 def _json_load(value: str, default: Any) -> Any:
@@ -89,7 +91,11 @@ class OvernightJobStore:
     )
 
     def __init__(self, db_path: str | Path | None = None) -> None:
-        self.db_path = Path(db_path) if db_path is not None else resolve_overnight_db_path()
+        self.db_path = (
+            resolve_project_path(db_path, "data/batch_generation.db")
+            if db_path is not None
+            else resolve_overnight_db_path()
+        )
         self._lock = threading.RLock()
         self._ensure_schema()
 

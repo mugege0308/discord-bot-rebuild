@@ -29,6 +29,7 @@ from services.image_generation_profiles import (
     DEFAULT_IMAGE_GENERATION_MODEL_KEY,
     get_image_generation_profile,
 )
+from services.runtime_paths import resolve_project_path
 from services.sd_control import LoraSelection, lora_selections_to_dicts
 from services.shogou_prompt_designer import (
     PROMPT_RATING_AUTO,
@@ -126,10 +127,8 @@ def _now_iso() -> str:
 
 
 def _db_path() -> Path:
-    raw = os.getenv("BATCH_GENERATION_DB_PATH", "data/batch_generation.db").strip().strip('"')
-    if not raw:
-        raw = "data/batch_generation.db"
-    return Path(raw).expanduser().resolve()
+    raw = os.getenv("BATCH_GENERATION_DB_PATH", "").strip().strip('"')
+    return resolve_project_path(raw or None, "data/batch_generation.db")
 
 
 @contextmanager

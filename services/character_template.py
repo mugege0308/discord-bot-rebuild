@@ -3,8 +3,10 @@ import random
 from pathlib import Path
 from typing import Any
 
+from services.runtime_paths import project_path
 
-OPTIONS_FILE = Path("data/character_template_options.json")
+
+OPTIONS_FILE = project_path("data", "character_template_options.json")
 CATEGORY_ORDER = ("hair_color", "hair_style", "eye_color", "expression", "outfit", "background", "atmosphere")
 SPECIAL_NONE = "__none__"
 SPECIAL_RANDOM = "__random__"

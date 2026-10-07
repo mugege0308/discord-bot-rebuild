@@ -70,12 +70,12 @@ from services.pose_reference import (
     sdpose_keypoint_summary,
 )
 from services.weather import JST
+from services.runtime_paths import PROJECT_ROOT, project_path, resolve_project_path
 
 
 logger = logging.getLogger("secretary-bot.sd_control")
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DATA_DIR = Path("data")
+DATA_DIR = project_path("data")
 OUTPUT_DIR = DATA_DIR / "sd_outputs"
 POSE_DEBUG_DIR = DATA_DIR / "pose_debug"
 FAVORITES_DIR = DATA_DIR / "sd_favorites"
@@ -85,9 +85,9 @@ DEFAULT_NEGATIVE_PROMPT = (
     "low quality, worst quality, bad anatomy, extra fingers, missing fingers, "
     "bad hands, blurry, jpeg artifacts, watermark, text, logo"
 )
-DEFAULT_COMFY_WORKFLOW_FILE = Path("workflows") / "comfy_workflow.json"
-LORA_COMFY_WORKFLOW_FILE = Path("workflows") / "comfy_workflow_lora.json"
-REFERENCE_COMFY_WORKFLOW_FILE = Path("workflows") / "comfy_workflow_ipadapter.json"
+DEFAULT_COMFY_WORKFLOW_FILE = project_path("workflows", "comfy_workflow.json")
+LORA_COMFY_WORKFLOW_FILE = project_path("workflows", "comfy_workflow_lora.json")
+REFERENCE_COMFY_WORKFLOW_FILE = project_path("workflows", "comfy_workflow_ipadapter.json")
 DEFAULT_REFERENCE_STRENGTH = 0.5
 REFERENCE_IMAGE_EXTENSIONS = {
     "image/jpeg": ".jpg",
@@ -312,7 +312,7 @@ def _load_latest_paths() -> list[Path]:
 
     paths = []
     for raw_path in raw_paths:
-        path = Path(str(raw_path))
+        path = resolve_project_path(str(raw_path), str(raw_path))
         if path.exists() and path.is_file():
             paths.append(path)
     return paths
@@ -891,10 +891,7 @@ def _get_comfy_workflow_file(
 
 
 def _resolve_project_path(path: Path) -> Path:
-    candidate = Path(path)
-    if candidate.is_absolute():
-        return candidate
-    return PROJECT_ROOT / candidate
+    return resolve_project_path(path, path)
 
 
 def _get_node_id(name: str) -> str:
