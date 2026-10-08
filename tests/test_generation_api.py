@@ -216,6 +216,16 @@ class GenerationApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("tag_provenance", metadata)
         self.assertIn("suppressed_tags", metadata)
         self.assertIn("prompt_conflicts", metadata)
+        self.assertEqual(
+            {
+                "requires_multiple_people": False,
+                "implies_mixed_sex": False,
+                "explicit_people_count": [],
+                "visible_partner_preferred": False,
+                "source_interactions": [],
+            },
+            metadata["people_semantics"],
+        )
 
         variation_metadata = _build_gallery_metadata(
             "api-job-1",

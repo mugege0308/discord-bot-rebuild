@@ -639,6 +639,7 @@ def _build_gallery_metadata(
         "tag_provenance": tag_provenance,
         "suppressed_tags": suppressed_tags,
         "prompt_conflicts": prompt_conflicts,
+        "people_semantics": prepared.resolved.people_semantics.to_dict(),
     }
     if requested_seed_override is not _UNSET:
         metadata["requested_seed"] = requested_seed_override

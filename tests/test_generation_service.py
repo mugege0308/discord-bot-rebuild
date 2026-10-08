@@ -297,6 +297,137 @@ class GenerationServicePreparationTests(unittest.TestCase):
         self.assertEqual("user_explicit", provenance["1boy"])
         self.assertFalse(any(item.category == "people_count" for item in prepared.resolved.prompt_conflicts))
 
+    def test_clothed_sex_does_not_receive_late_default_solo(self):
+        service = GenerationService(
+            prompt_resolver=Mock(
+                return_value=_prompt_result(
+                    positive="1girl, clothed_sex, upper body",
+                )
+            )
+        )
+        request = GenerationRequest(
+            explicit_tags=("1girl", "clothed_sex", "upper body"),
+            request_text="clothed_sex",
+            model_key="animagine",
+            rating="safe",
+        )
+
+        prepared = service.prepare_generation(request)
+        positive = {token.strip() for token in prepared.options.prompt.split(",")}
+        self.assertNotIn("solo", positive)
+        self.assertIn("1girl", positive)
+        self.assertIn("clothed_sex", positive)
+        self.assertTrue(prepared.resolved.people_semantics.requires_multiple_people)
+        self.assertEqual(("1girl",), prepared.resolved.people_semantics.explicit_people_count)
+
+    def test_clothed_sex_regression_fixture_removes_only_auto_solo(self):
+        service = GenerationService(
+            prompt_resolver=Mock(
+                return_value=_prompt_result(
+                    positive=(
+                        "1girl, solo, explicit, cafe_stella_to_shinigami_no_chou, blazer, "
+                        "clothed_sex, upper body, from side, blush, standing, masterpiece, "
+                        "high score, great score, absurdres"
+                    )
+                )
+            )
+        )
+        request = GenerationRequest(
+            explicit_tags=("1girl", "clothed_sex", "upper body", "from side", "blush", "standing"),
+            request_text="clothed_sex",
+            model_key="animagine",
+            rating="safe",
+        )
+
+        prepared = service.prepare_generation(request)
+        positive = {token.strip() for token in prepared.options.prompt.split(",")}
+        self.assertNotIn("solo", positive)
+        self.assertIn("1girl", positive)
+        self.assertIn("clothed_sex", positive)
+        self.assertIn("upper body", positive)
+        suppressed = [item for item in prepared.resolved.suppressed_tags if item.tag == "solo"]
+        self.assertTrue(suppressed)
+        self.assertEqual("clothed_sex", suppressed[-1].source_interaction)
+
+    def test_prompt_designer_solo_is_suppressed_for_hetero_and_mixed_sex_is_recorded(self):
+        service = GenerationService(
+            prompt_resolver=Mock(
+                return_value=_prompt_result(
+                    positive="1girl, hetero, solo, upper body",
+                )
+            )
+        )
+        request = GenerationRequest(
+            explicit_tags=("1girl", "hetero", "upper body"),
+            request_text="hetero",
+            model_key="animagine",
+            rating="safe",
+        )
+
+        prepared = service.prepare_generation(request)
+        positive = {token.strip() for token in prepared.options.prompt.split(",")}
+        self.assertNotIn("solo", positive)
+        self.assertTrue(prepared.resolved.people_semantics.requires_multiple_people)
+        self.assertTrue(prepared.resolved.people_semantics.implies_mixed_sex)
+        self.assertTrue(any(item.tag == "solo" for item in prepared.resolved.suppressed_tags))
+
+    def test_variation_solo_is_suppressed_for_multi_person_request(self):
+        service = GenerationService(
+            prompt_resolver=Mock(
+                return_value=_prompt_result(
+                    positive="1girl, clothed_sex, upper body",
+                )
+            )
+        )
+        request = GenerationRequest(
+            explicit_tags=("1girl", "clothed_sex", "upper body"),
+            request_text="clothed_sex",
+            model_key="animagine",
+            rating="safe",
+        )
+
+        prepared = service.prepare_generation(
+            request,
+            positive_override="1girl, clothed_sex, upper body, solo",
+            variation_tags=("solo",),
+        )
+        positive = {token.strip() for token in prepared.options.prompt.split(",")}
+        self.assertNotIn("solo", positive)
+        self.assertTrue(any(item.tag == "solo" for item in prepared.resolved.suppressed_tags))
+
+    def test_explicit_people_counts_keep_onegirl_oneboy_and_two_girls_without_solo(self):
+        for explicit_tags, prompt in (
+            (("1girl", "1boy", "hugging"), "1girl, 1boy, hugging, solo"),
+            (("2girls", "hugging"), "2girls, hugging, solo"),
+        ):
+            with self.subTest(explicit_tags=explicit_tags):
+                service = GenerationService(prompt_resolver=Mock(return_value=_prompt_result(prompt)))
+                request = GenerationRequest(
+                    explicit_tags=explicit_tags,
+                    request_text="hugging",
+                    model_key="animagine",
+                    rating="safe",
+                )
+                prepared = service.prepare_generation(request)
+                positive = {token.strip() for token in prepared.options.prompt.split(",")}
+                self.assertNotIn("solo", positive)
+
+    def test_explicit_solo_conflict_is_not_silently_rewritten(self):
+        service = GenerationService(
+            prompt_resolver=Mock(return_value=_prompt_result("2girls, solo, hugging"))
+        )
+        request = GenerationRequest(
+            explicit_tags=("2girls", "solo", "hugging"),
+            request_text="hugging",
+            model_key="animagine",
+            rating="safe",
+        )
+
+        prepared = service.prepare_generation(request)
+        positive = {token.strip() for token in prepared.options.prompt.split(",")}
+        self.assertIn("solo", positive)
+        self.assertTrue(prepared.resolved.prompt_conflicts)
+
     def test_no_lora_safe_and_explicit_seed_are_preserved(self):
         request = GenerationRequest(
             freeform_character="かわいい女の子",

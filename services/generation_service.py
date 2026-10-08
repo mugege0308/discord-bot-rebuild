@@ -31,8 +31,10 @@ from services.prompt_tag_resolver import (
 )
 from services.prompt_conflict_resolver import (
     PromptConflict,
+    PromptPeopleSemantics,
     PromptTagRecord,
     SuppressedPromptTag,
+    detect_people_semantics,
     has_non_solo_constraint,
     resolve_prompt_tag_conflicts,
 )
@@ -368,6 +370,7 @@ class ResolvedGeneration:
     provenance: tuple[TagProvenance, ...] = ()
     suppressed_tags: tuple[SuppressedPromptTag, ...] = ()
     prompt_conflicts: tuple[PromptConflict, ...] = ()
+    people_semantics: PromptPeopleSemantics = PromptPeopleSemantics()
 
 
 @dataclass(frozen=True)
@@ -530,6 +533,15 @@ class GenerationService:
             explicit_tags=explicit_tags,
             appearance_tags=appearance_tags,
             provenance=tuple(dict.fromkeys(provenance)),
+            people_semantics=detect_people_semantics(
+                _positive_tokens(positive),
+                context_text=" ".join(
+                    value
+                    for value in (request.request_text, request.character_preset, request.freeform_character)
+                    if _normalise_text(value)
+                ),
+                explicit_values=explicit_tags,
+            ),
         )
 
     def resolve_request(
@@ -623,6 +635,27 @@ class GenerationService:
         )
         positive = final_conflicts.positive
         positive = apply_lora_triggers(positive, loras)
+        # Lora triggers are another final tag source.  Run the same semantic
+        # invariant once more after them so a late auto/inferred ``solo`` can
+        # never survive merely because it was appended after the first pass.
+        post_lora_conflicts = resolve_prompt_tag_conflicts(
+            positive,
+            explicit_tags=resolved.explicit_tags,
+            request_text=request.request_text or "",
+            character_text=" ".join(
+                value
+                for value in (request.character_preset, request.freeform_character)
+                if _normalise_text(value)
+            ),
+            base_provenance=(
+                *base_provenance,
+                *pre_final_conflicts.provenance,
+                *system_records,
+                *final_conflicts.provenance,
+            ),
+            variation_tags=variation_tags,
+        )
+        positive = post_lora_conflicts.positive
         negative = (
             negative_prompt_override
             if negative_prompt_override is not None
@@ -635,7 +668,7 @@ class GenerationService:
 
         prepared_provenance = [
             TagProvenance(item.tag, item.source, item.category)
-            for item in final_conflicts.provenance
+            for item in post_lora_conflicts.provenance
         ]
         prepared_provenance.extend(
             item
@@ -672,10 +705,24 @@ class GenerationService:
                 known_provenance_keys.add(key)
 
         suppressed_tags = tuple(
-            dict.fromkeys((*resolved.suppressed_tags, *pre_final_conflicts.suppressed_tags, *final_conflicts.suppressed_tags))
+            dict.fromkeys(
+                (
+                    *resolved.suppressed_tags,
+                    *pre_final_conflicts.suppressed_tags,
+                    *final_conflicts.suppressed_tags,
+                    *post_lora_conflicts.suppressed_tags,
+                )
+            )
         )
         prompt_conflicts = tuple(
-            dict.fromkeys((*resolved.prompt_conflicts, *pre_final_conflicts.prompt_conflicts, *final_conflicts.prompt_conflicts))
+            dict.fromkeys(
+                (
+                    *resolved.prompt_conflicts,
+                    *pre_final_conflicts.prompt_conflicts,
+                    *final_conflicts.prompt_conflicts,
+                    *post_lora_conflicts.prompt_conflicts,
+                )
+            )
         )
 
         reference_values = dict(request.reference or {})
@@ -744,6 +791,7 @@ class GenerationService:
             provenance=tuple(dict.fromkeys(prepared_provenance)),
             suppressed_tags=suppressed_tags,
             prompt_conflicts=prompt_conflicts,
+            people_semantics=post_lora_conflicts.people_semantics,
         )
         return PreparedGeneration(
             request=request,

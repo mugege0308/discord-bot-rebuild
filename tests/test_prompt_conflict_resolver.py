@@ -5,6 +5,7 @@ import unittest
 from services.prompt_conflict_resolver import (
     PromptTagRecord,
     classify_text_constraints,
+    detect_people_semantics,
     resolve_prompt_tag_conflicts,
 )
 
@@ -85,6 +86,53 @@ class PromptConflictResolverTests(unittest.TestCase):
         self.assertIn("camera_horizontal", constraints)
         self.assertIn("basic_pose", constraints)
         self.assertIn("gaze", constraints)
+
+    def test_people_semantics_detects_multi_person_and_mixed_sex_signals(self):
+        clothed_sex = detect_people_semantics(
+            ("1girl", "clothed_sex"),
+            explicit_values=("1girl", "clothed_sex"),
+            context_text="clothed_sex",
+        )
+        self.assertTrue(clothed_sex.requires_multiple_people)
+        self.assertTrue(clothed_sex.visible_partner_preferred)
+        self.assertEqual(("1girl",), clothed_sex.explicit_people_count)
+        self.assertEqual(("clothed_sex",), clothed_sex.source_interactions)
+        self.assertFalse(clothed_sex.implies_mixed_sex)
+
+        hetero = detect_people_semantics(("hetero",), explicit_values=("hetero",))
+        self.assertTrue(hetero.requires_multiple_people)
+        self.assertTrue(hetero.implies_mixed_sex)
+        self.assertEqual(("hetero",), hetero.source_interactions)
+
+    def test_late_clothed_sex_output_suppresses_auto_solo(self):
+        result = resolve_prompt_tag_conflicts(
+            "1girl, solo, clothed_sex, upper body",
+            request_text="clothed_sex",
+        )
+        self.assertNotIn("solo", result.positive)
+        self.assertTrue(result.people_semantics.requires_multiple_people)
+        suppressed = next(item for item in result.suppressed_tags if item.tag == "solo")
+        self.assertEqual("conflicts_with_multi_person_interaction", suppressed.reason)
+        self.assertEqual("clothed_sex", suppressed.source_interaction)
+        self.assertEqual("suppressed", suppressed.status)
+
+    def test_gender_unknown_carrying_suppresses_solo_without_inventing_counts(self):
+        result = resolve_prompt_tag_conflicts(
+            "solo, carrying",
+            request_text="carrying",
+        )
+        self.assertNotIn("solo", result.positive)
+        self.assertTrue(result.people_semantics.requires_multiple_people)
+        self.assertFalse(result.people_semantics.implies_mixed_sex)
+        self.assertEqual((), result.people_semantics.explicit_people_count)
+
+    def test_explicit_solo_and_clothed_sex_are_kept_without_suppression(self):
+        result = resolve_prompt_tag_conflicts(
+            "solo, clothed_sex",
+            explicit_tags=("solo", "clothed_sex"),
+        )
+        self.assertEqual("solo, clothed_sex", result.positive)
+        self.assertFalse(any(item.tag == "solo" for item in result.suppressed_tags))
 
 
 if __name__ == "__main__":

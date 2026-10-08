@@ -65,6 +65,9 @@ _CATEGORY_ALIASES: dict[str, tuple[str, ...]] = {
         "kiss",
         "embrace",
         "embracing",
+        "carrying",
+        "clothed sex",
+        "hetero",
         "together",
     ),
     "expression": (
@@ -126,6 +129,43 @@ _CATEGORY_ALIASES_NORMALIZED = {
     for category, aliases in _CATEGORY_ALIASES.items()
 }
 
+# This is intentionally narrower than the interaction category above.  Some
+# interaction-shaped words (for example ``dancing``) can describe one person;
+# only high-confidence relationship tags participate in the people-count
+# invariant.
+_MULTI_PERSON_INTERACTIONS: Mapping[str, str] = {
+    "hugging": "hugging",
+    "holding hands": "holding hands",
+    "handshake": "handshake",
+    "dancing together": "dancing together",
+    "kissing": "kissing",
+    "kiss": "kiss",
+    "embrace": "embrace",
+    "embracing": "embracing",
+    "carrying": "carrying",
+    "clothed sex": "clothed_sex",
+    "hetero": "hetero",
+}
+_MIXED_SEX_INTERACTIONS = frozenset({"hetero"})
+_MULTI_PERSON_COUNT_TAGS = frozenset(
+    {
+        "2girls",
+        "2boys",
+        "1girl 1boy",
+        "multiple girls",
+        "multiple boys",
+        "multiple people",
+        "group",
+        "couple",
+        "two girls",
+        "two boys",
+        "three girls",
+        "three boys",
+    }
+)
+_FEMALE_COUNT_TAGS = frozenset({"1girl", "2girls", "multiple girls", "two girls", "three girls"})
+_MALE_COUNT_TAGS = frozenset({"1boy", "2boys", "multiple boys", "two boys", "three boys"})
+
 
 @dataclass(frozen=True)
 class PromptTagRecord:
@@ -140,6 +180,10 @@ class SuppressedPromptTag:
     source: str
     reason: str
     category: str = ""
+    status: str = "suppressed"
+    conflicting_tag: str = ""
+    conflicting_concept: str = ""
+    source_interaction: str = ""
 
     def to_dict(self) -> dict[str, str]:
         return {
@@ -147,6 +191,10 @@ class SuppressedPromptTag:
             "source": self.source,
             "reason": self.reason,
             "category": self.category,
+            "status": self.status,
+            "conflicting_tag": self.conflicting_tag,
+            "conflicting_concept": self.conflicting_concept,
+            "source_interaction": self.source_interaction,
         }
 
 
@@ -167,12 +215,33 @@ class PromptConflict:
 
 
 @dataclass(frozen=True)
+class PromptPeopleSemantics:
+    """Conservative people/relationship facts derived from known tags."""
+
+    requires_multiple_people: bool = False
+    implies_mixed_sex: bool = False
+    explicit_people_count: tuple[str, ...] = ()
+    visible_partner_preferred: bool = False
+    source_interactions: tuple[str, ...] = ()
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "requires_multiple_people": self.requires_multiple_people,
+            "implies_mixed_sex": self.implies_mixed_sex,
+            "explicit_people_count": list(self.explicit_people_count),
+            "visible_partner_preferred": self.visible_partner_preferred,
+            "source_interactions": list(self.source_interactions),
+        }
+
+
+@dataclass(frozen=True)
 class PromptConflictResolution:
     positive: str
     provenance: tuple[PromptTagRecord, ...]
     suppressed_tags: tuple[SuppressedPromptTag, ...] = ()
     prompt_conflicts: tuple[PromptConflict, ...] = ()
     locked_categories: frozenset[str] = frozenset()
+    people_semantics: PromptPeopleSemantics = PromptPeopleSemantics()
 
 
 def normalize_prompt_constraint(value: object) -> str:
@@ -245,11 +314,82 @@ def classify_text_constraints(
 
 def _tokens(value: object) -> tuple[str, ...]:
     values = []
-    for raw in str(value or "").split(","):
-        clean = " ".join(raw.strip().split())
-        if clean:
-            values.append(clean)
+    raw_values = value if isinstance(value, (tuple, list, set, frozenset)) else (value,)
+    for raw_value in raw_values:
+        for raw in str(raw_value or "").split(","):
+            clean = " ".join(raw.strip().split())
+            if clean:
+                values.append(clean)
     return tuple(values)
+
+
+def _people_count_requires_multiple(values: Sequence[str]) -> bool:
+    normalized = {
+        normalize_prompt_constraint(value)
+        for value in values
+        if normalize_prompt_constraint(value)
+    }
+    if normalized.intersection(_MULTI_PERSON_COUNT_TAGS):
+        return True
+    return bool(normalized.intersection(_FEMALE_COUNT_TAGS) and normalized.intersection(_MALE_COUNT_TAGS))
+
+
+def _canonical_interaction(value: object) -> str:
+    return _MULTI_PERSON_INTERACTIONS.get(normalize_prompt_constraint(value), "")
+
+
+def detect_people_semantics(
+    values: Sequence[str] = (),
+    *,
+    context_text: str = "",
+    explicit_values: Sequence[str] = (),
+    dictionary: PromptTagDictionary | None = None,
+) -> PromptPeopleSemantics:
+    """Derive only high-confidence people/relationship constraints.
+
+    ``values`` may include the current Positive tokens so a late default or
+    Prompt Designer tag cannot evade the final safety pass.  ``explicit_values``
+    is kept separate so provenance can distinguish user counts from observed
+    generated tags.
+    """
+
+    prompt_dictionary = dictionary or load_prompt_tag_dictionary(DEFAULT_PROMPT_TAG_PROFILE)
+    observed_values = _tokens(values)
+    context_constraints = classify_text_constraints(context_text, dictionary=prompt_dictionary)
+    observed_values = (*observed_values, *context_constraints.get("interaction", ()))
+    observed_counts = [
+        value
+        for value in (*_tokens(explicit_values), *observed_values)
+        if "people_count" in classify_tag(value, dictionary=prompt_dictionary)
+    ]
+    source_interactions = tuple(
+        dict.fromkeys(
+            canonical
+            for value in observed_values
+            if (canonical := _canonical_interaction(value))
+        )
+    )
+    explicit_counts = tuple(
+        dict.fromkeys(
+            normalize_prompt_constraint(value)
+            for value in (*_tokens(explicit_values), *context_constraints.get("people_count", ()))
+            if "people_count" in classify_tag(value, dictionary=prompt_dictionary)
+        )
+    )
+    observed_count_keys = tuple(normalize_prompt_constraint(value) for value in observed_counts)
+    mixed_by_count = bool(
+        set(observed_count_keys).intersection(_FEMALE_COUNT_TAGS)
+        and set(observed_count_keys).intersection(_MALE_COUNT_TAGS)
+    )
+    requires_multiple = bool(source_interactions) or _people_count_requires_multiple(observed_count_keys)
+    mixed = mixed_by_count or bool(set(source_interactions).intersection(_MIXED_SEX_INTERACTIONS))
+    return PromptPeopleSemantics(
+        requires_multiple_people=requires_multiple,
+        implies_mixed_sex=mixed,
+        explicit_people_count=explicit_counts,
+        visible_partner_preferred=requires_multiple,
+        source_interactions=source_interactions,
+    )
 
 
 def _source_priority(source: str) -> int:
@@ -301,6 +441,12 @@ def resolve_prompt_tag_conflicts(
         explicit_categories.update(classify_tag(value, dictionary=prompt_dictionary))
     explicit_categories.update(text_constraints)
     context_values = {value for values in text_constraints.values() for value in values}
+    people_semantics = detect_people_semantics(
+        (*explicit_values, *_tokens(positive), *context_values),
+        context_text=" ".join(part for part in (request_text, character_text) if str(part or "").strip()),
+        explicit_values=explicit_values,
+        dictionary=prompt_dictionary,
+    )
 
     known_sources: dict[str, PromptTagRecord] = {}
     for item in base_provenance:
@@ -337,26 +483,33 @@ def resolve_prompt_tag_conflicts(
         # User-explicit tags and request-derived constraints are retained even
         # when the user's own input contains a contradiction.
         is_user_constraint = source in {"user_explicit", "user_request"}
-        non_solo_constraint = any(
-            category_name in {"interaction", "people_count"}
-            and normalize_prompt_constraint(tag) != "solo"
-            for category_name in categories
-        )
+        tag_semantics = detect_people_semantics((tag,), dictionary=prompt_dictionary)
+        non_solo_constraint = tag_semantics.requires_multiple_people
         if (
             normalize_prompt_constraint(tag) == "solo"
             and non_solo_constraint is False
-            and any(
-                category_name in {"interaction", "people_count"}
-                for category_name in explicit_categories
-            )
+            and people_semantics.requires_multiple_people
             and not is_user_constraint
         ):
+            source_interaction = people_semantics.source_interactions[0] if people_semantics.source_interactions else ""
+            conflicting_concept = (
+                "requires_multiple_people"
+                if source_interaction
+                else "explicit_people_count"
+            )
             suppressed.append(
                 SuppressedPromptTag(
                     tag=tag,
                     source=source,
-                    reason="複数人物またはinteraction制約が明示されているため除外",
+                    reason=(
+                        "conflicts_with_multi_person_interaction"
+                        if source_interaction
+                        else "conflicts_with_multiple_people_count"
+                    ),
                     category="people_count",
+                    conflicting_tag=source_interaction,
+                    conflicting_concept=conflicting_concept,
+                    source_interaction=source_interaction,
                 )
             )
             continue
@@ -410,6 +563,7 @@ def resolve_prompt_tag_conflicts(
         suppressed_tags=tuple(dict.fromkeys(suppressed)),
         prompt_conflicts=conflicts,
         locked_categories=frozenset(explicit_categories),
+        people_semantics=people_semantics,
     )
 
 
@@ -420,32 +574,23 @@ def has_non_solo_constraint(
     dictionary: PromptTagDictionary | None = None,
 ) -> bool:
     prompt_dictionary = dictionary or load_prompt_tag_dictionary(DEFAULT_PROMPT_TAG_PROFILE)
-    one_person_tags = {"1girl", "1boy", "1other"}
-    if any(
-        category in {"interaction", "people_count"}
-        and (
-            category == "interaction"
-            or normalize_prompt_constraint(value) not in one_person_tags | {"solo"}
-        )
-        for value in values
-        for category in classify_tag(value, dictionary=prompt_dictionary)
-    ):
-        return True
-    constraints = classify_text_constraints(context_text, dictionary=prompt_dictionary)
-    return bool(constraints.get("interaction") or any(
-        normalize_prompt_constraint(value) not in one_person_tags | {"solo"}
-        for value in constraints.get("people_count", ())
-    ))
+    return detect_people_semantics(
+        values,
+        context_text=context_text,
+        dictionary=prompt_dictionary,
+    ).requires_multiple_people
 
 
 __all__ = [
     "PromptConflict",
     "PromptConflictResolution",
+    "PromptPeopleSemantics",
     "PromptTagRecord",
     "SOURCE_PRIORITY",
     "SuppressedPromptTag",
     "classify_tag",
     "classify_text_constraints",
+    "detect_people_semantics",
     "has_non_solo_constraint",
     "normalize_prompt_constraint",
     "resolve_prompt_tag_conflicts",
