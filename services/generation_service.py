@@ -31,11 +31,13 @@ from services.prompt_tag_resolver import (
 )
 from services.prompt_conflict_resolver import (
     PromptConflict,
+    PromptFramingSemantics,
     PromptPeopleSemantics,
     PromptTagRecord,
     SuppressedPromptTag,
     detect_people_semantics,
     has_non_solo_constraint,
+    merge_prompt_framing_semantics,
     resolve_prompt_tag_conflicts,
 )
 from services.sd_control import (
@@ -371,6 +373,7 @@ class ResolvedGeneration:
     suppressed_tags: tuple[SuppressedPromptTag, ...] = ()
     prompt_conflicts: tuple[PromptConflict, ...] = ()
     people_semantics: PromptPeopleSemantics = PromptPeopleSemantics()
+    framing_semantics: PromptFramingSemantics = PromptFramingSemantics()
 
 
 @dataclass(frozen=True)
@@ -792,6 +795,17 @@ class GenerationService:
             suppressed_tags=suppressed_tags,
             prompt_conflicts=prompt_conflicts,
             people_semantics=post_lora_conflicts.people_semantics,
+            framing_semantics=replace(
+                merge_prompt_framing_semantics(
+                    resolved.framing_semantics,
+                    pre_final_conflicts.framing_semantics,
+                    final_conflicts.framing_semantics,
+                    post_lora_conflicts.framing_semantics,
+                ),
+                # Only the last pass describes the effective final prompt;
+                # requested/source/suppressed traces remain additive.
+                effective=post_lora_conflicts.framing_semantics.effective,
+            ),
         )
         return PreparedGeneration(
             request=request,

@@ -116,6 +116,38 @@ class PromptConflictResolverTests(unittest.TestCase):
         self.assertEqual("clothed_sex", suppressed.source_interaction)
         self.assertEqual("suppressed", suppressed.status)
 
+    def test_multi_person_auto_portrait_is_suppressed_with_framing_provenance(self):
+        result = resolve_prompt_tag_conflicts(
+            "1girl, 1boy, hetero, clothed_sex, portrait",
+            explicit_tags=("1girl", "1boy", "hetero", "clothed_sex"),
+        )
+        self.assertTrue(result.people_semantics.requires_multiple_people)
+        self.assertNotIn("portrait", result.positive)
+        suppressed = next(item for item in result.suppressed_tags if item.tag == "portrait")
+        self.assertEqual("conflicts_with_multi_person_framing", suppressed.reason)
+        self.assertEqual("framing", suppressed.category)
+        self.assertEqual("requires_multiple_people", suppressed.conflicting_concept)
+        self.assertEqual("hetero", suppressed.source_interaction)
+        self.assertEqual(("portrait",), result.framing_semantics.suppressed)
+
+    def test_multi_person_auto_close_up_is_suppressed_but_upper_body_is_kept(self):
+        result = resolve_prompt_tag_conflicts(
+            "1girl, 1boy, hetero, close-up, upper body",
+            explicit_tags=("1girl", "1boy", "hetero"),
+        )
+        self.assertNotIn("close-up", result.positive)
+        self.assertIn("upper body", result.positive)
+        self.assertEqual(("close-up",), result.framing_semantics.suppressed)
+
+    def test_explicit_multi_person_portrait_is_preserved(self):
+        result = resolve_prompt_tag_conflicts(
+            "1girl, 1boy, hetero, portrait",
+            explicit_tags=("1girl", "1boy", "hetero", "portrait"),
+        )
+        self.assertIn("portrait", result.positive)
+        self.assertFalse(any(item.tag == "portrait" for item in result.suppressed_tags))
+        self.assertEqual(("portrait",), result.framing_semantics.effective)
+
     def test_gender_unknown_carrying_suppresses_solo_without_inventing_counts(self):
         result = resolve_prompt_tag_conflicts(
             "solo, carrying",

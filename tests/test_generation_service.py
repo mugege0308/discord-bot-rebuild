@@ -371,6 +371,73 @@ class GenerationServicePreparationTests(unittest.TestCase):
         self.assertTrue(prepared.resolved.people_semantics.implies_mixed_sex)
         self.assertTrue(any(item.tag == "solo" for item in prepared.resolved.suppressed_tags))
 
+    def test_prompt_designer_portrait_is_suppressed_for_multi_person_request(self):
+        service = GenerationService(
+            prompt_resolver=Mock(
+                return_value=_prompt_result(
+                    positive="1girl, 1boy, hetero, clothed_sex, portrait",
+                )
+            )
+        )
+        request = GenerationRequest(
+            explicit_tags=("1girl", "1boy", "hetero", "clothed_sex"),
+            request_text="hetero clothed_sex",
+            model_key="animagine",
+            rating="safe",
+        )
+
+        prepared = service.prepare_generation(request)
+        positive = {token.strip() for token in prepared.options.prompt.split(",")}
+        self.assertTrue({"1girl", "1boy", "hetero", "clothed_sex"}.issubset(positive))
+        self.assertNotIn("portrait", positive)
+        suppressed = next(item for item in prepared.resolved.suppressed_tags if item.tag == "portrait")
+        self.assertEqual("prompt_designer", suppressed.source)
+        self.assertEqual("conflicts_with_multi_person_framing", suppressed.reason)
+        self.assertEqual(("portrait",), prepared.resolved.framing_semantics.suppressed)
+
+    def test_multi_person_auto_framing_keeps_moderate_upper_body(self):
+        service = GenerationService(
+            prompt_resolver=Mock(
+                return_value=_prompt_result(
+                    positive="1girl, 1boy, hetero, upper body",
+                )
+            )
+        )
+        request = GenerationRequest(
+            explicit_tags=("1girl", "1boy", "hetero"),
+            request_text="hetero",
+            model_key="animagine",
+            rating="safe",
+        )
+
+        prepared = service.prepare_generation(request)
+        self.assertIn("upper body", prepared.options.prompt)
+        self.assertFalse(prepared.resolved.framing_semantics.suppressed)
+
+    def test_variation_added_portrait_is_suppressed_for_multi_person_request(self):
+        service = GenerationService(
+            prompt_resolver=Mock(
+                return_value=_prompt_result(
+                    positive="1girl, 1boy, hetero, clothed_sex",
+                )
+            )
+        )
+        request = GenerationRequest(
+            explicit_tags=("1girl", "1boy", "hetero", "clothed_sex"),
+            request_text="hetero clothed_sex",
+            model_key="animagine",
+            rating="safe",
+        )
+
+        prepared = service.prepare_generation(
+            request,
+            positive_override="1girl, 1boy, hetero, clothed_sex, portrait",
+            variation_tags=("portrait",),
+        )
+        self.assertNotIn("portrait", prepared.options.prompt)
+        suppressed = next(item for item in prepared.resolved.suppressed_tags if item.tag == "portrait")
+        self.assertEqual("variation_auto", suppressed.source)
+
     def test_variation_solo_is_suppressed_for_multi_person_request(self):
         service = GenerationService(
             prompt_resolver=Mock(
@@ -451,6 +518,21 @@ class GenerationServicePreparationTests(unittest.TestCase):
         self.assertEqual(1024, prepared.options.height)
         provenance = {(item.tag, item.source) for item in prepared.resolved.provenance}
         self.assertIn(("1girl", "system"), provenance)
+
+    def test_single_person_auto_portrait_remains_unchanged(self):
+        service = GenerationService(
+            prompt_resolver=Mock(return_value=_prompt_result("1girl, portrait, standing"))
+        )
+        request = GenerationRequest(
+            explicit_tags=("1girl",),
+            request_text="standing",
+            model_key="animagine",
+            rating="safe",
+        )
+
+        prepared = service.prepare_generation(request)
+        self.assertIn("portrait", prepared.options.prompt)
+        self.assertEqual(("portrait",), prepared.resolved.framing_semantics.effective)
 
     def test_lora_selection_and_trigger_are_resolved_by_existing_backend_helpers(self):
         lora = LoraSelection(

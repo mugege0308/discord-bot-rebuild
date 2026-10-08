@@ -36,6 +36,22 @@ class GenerationVariationTests(unittest.TestCase):
         self.assertEqual(8, len(set(recipes)))
         self.assertNotEqual(recipes[:4], recipes[4:])
 
+    def test_multi_person_auto_variation_avoids_single_subject_portrait(self):
+        slots = plan_variation_slots(
+            8,
+            VARIATION_AUTO,
+            explicit_tags=("1girl", "1boy", "hetero", "clothed_sex"),
+            requires_multiple_people=True,
+        )
+        framing_tags = {
+            tag
+            for slot in slots
+            for tag in slot.tags
+            if tag in {"portrait", "upper body", "cowboy shot", "full body"}
+        }
+        self.assertNotIn("portrait", framing_tags)
+        self.assertTrue(framing_tags & {"upper body", "cowboy shot", "full body"})
+
     def test_start_index_continues_auto_variations_at_slots_five_to_eight(self):
         first = plan_variation_slots(4, VARIATION_AUTO)
         continuation = plan_variation_slots(4, VARIATION_AUTO, start_index=4)

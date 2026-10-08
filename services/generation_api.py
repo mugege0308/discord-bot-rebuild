@@ -640,6 +640,7 @@ def _build_gallery_metadata(
         "suppressed_tags": suppressed_tags,
         "prompt_conflicts": prompt_conflicts,
         "people_semantics": prepared.resolved.people_semantics.to_dict(),
+        "framing_semantics": prepared.resolved.framing_semantics.to_dict(),
     }
     if requested_seed_override is not _UNSET:
         metadata["requested_seed"] = requested_seed_override
@@ -1702,6 +1703,7 @@ class GenerationApi:
                 resolved_danbooru_tags=resolved.prompt_result.danbooru_resolved_prompt_tags,
                 request_text=request.request_text or "",
                 reference_mode=str((request.reference or {}).get("mode") or "none"),
+                requires_multiple_people=resolved.people_semantics.requires_multiple_people,
             )
             rounds = list(record.get("rounds") or [])
             used_seeds = {
@@ -2104,6 +2106,7 @@ class GenerationApi:
                     resolved_danbooru_tags=resolved.prompt_result.danbooru_resolved_prompt_tags,
                     request_text=resolution_request.request_text or "",
                     reference_mode=str((resolution_request.reference or {}).get("mode") or "none"),
+                    requires_multiple_people=resolved.people_semantics.requires_multiple_people,
                 )
                 outputs: list[dict[str, Any]] = []
                 errors: list[str] = []
@@ -2227,6 +2230,7 @@ class GenerationApi:
                     resolved_danbooru_tags=resolved.prompt_result.danbooru_resolved_prompt_tags,
                     request_text=resolution_request.request_text or "",
                     reference_mode=str((resolution_request.reference or {}).get("mode") or "none"),
+                    requires_multiple_people=resolved.people_semantics.requires_multiple_people,
                 )
                 outputs: list[dict[str, Any]] = []
                 errors: list[str] = []

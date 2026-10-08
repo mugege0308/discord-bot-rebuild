@@ -86,6 +86,11 @@ class GenerationApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(1, request.count)
         self.assertEqual("off", request.variation)
 
+    def test_portrait_size_only_sets_dimensions_without_prompt_framing_tag(self) -> None:
+        request = _build_request({"freeform_character": "girl", "size": "portrait"})
+        self.assertEqual((768, 1024), (request.width, request.height))
+        self.assertEqual((), request.explicit_tags)
+
     def test_overnight_count_one_child_preserves_parent_auto(self) -> None:
         request = _build_overnight_child_request(
             {"freeform_character": "girl", "count": 1, "variation": "auto"}
@@ -225,6 +230,15 @@ class GenerationApiTests(unittest.IsolatedAsyncioTestCase):
                 "source_interactions": [],
             },
             metadata["people_semantics"],
+        )
+        self.assertEqual(
+            {
+                "requested": ["portrait"],
+                "effective": ["portrait"],
+                "source": [{"tag": "portrait", "source": "user_explicit"}],
+                "suppressed": [],
+            },
+            metadata["framing_semantics"],
         )
 
         variation_metadata = _build_gallery_metadata(

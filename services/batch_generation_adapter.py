@@ -332,6 +332,7 @@ def build_batch_image_options(
             item.to_dict() for item in prepared.resolved.prompt_conflicts
         ]
         metadata["people_semantics"] = prepared.resolved.people_semantics.to_dict()
+        metadata["framing_semantics"] = prepared.resolved.framing_semantics.to_dict()
         prepared = replace(
             prepared,
             options=replace(prepared.options, gallery_metadata=metadata),

@@ -97,6 +97,9 @@ _CATEGORY_ALIASES: dict[str, tuple[str, ...]] = {
         "portrait",
         "close-up",
         "close up",
+        "face close-up",
+        "face close up",
+        "face focus",
         "upper body",
         "cowboy shot",
         "thigh up",
@@ -165,6 +168,16 @@ _MULTI_PERSON_COUNT_TAGS = frozenset(
 )
 _FEMALE_COUNT_TAGS = frozenset({"1girl", "2girls", "multiple girls", "two girls", "three girls"})
 _MALE_COUNT_TAGS = frozenset({"1boy", "2boys", "multiple boys", "two boys", "three boys"})
+_SINGLE_SUBJECT_FRAMING = frozenset(
+    {
+        "portrait",
+        "close-up",
+        "close up",
+        "face close-up",
+        "face close up",
+        "face focus",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -235,6 +248,27 @@ class PromptPeopleSemantics:
 
 
 @dataclass(frozen=True)
+class PromptFramingSemantics:
+    """Framing tags requested, effective, and suppressed by finalization."""
+
+    requested: tuple[str, ...] = ()
+    effective: tuple[str, ...] = ()
+    source: tuple[tuple[str, str], ...] = ()
+    suppressed: tuple[str, ...] = ()
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "requested": list(self.requested),
+            "effective": list(self.effective),
+            "source": [
+                {"tag": tag, "source": source}
+                for tag, source in self.source
+            ],
+            "suppressed": list(self.suppressed),
+        }
+
+
+@dataclass(frozen=True)
 class PromptConflictResolution:
     positive: str
     provenance: tuple[PromptTagRecord, ...]
@@ -242,6 +276,7 @@ class PromptConflictResolution:
     prompt_conflicts: tuple[PromptConflict, ...] = ()
     locked_categories: frozenset[str] = frozenset()
     people_semantics: PromptPeopleSemantics = PromptPeopleSemantics()
+    framing_semantics: PromptFramingSemantics = PromptFramingSemantics()
 
 
 def normalize_prompt_constraint(value: object) -> str:
@@ -336,6 +371,41 @@ def _people_count_requires_multiple(values: Sequence[str]) -> bool:
 
 def _canonical_interaction(value: object) -> str:
     return _MULTI_PERSON_INTERACTIONS.get(normalize_prompt_constraint(value), "")
+
+
+def _single_subject_framing(value: object) -> str:
+    normalized = normalize_prompt_constraint(value)
+    return normalized if normalized in _SINGLE_SUBJECT_FRAMING else ""
+
+
+def merge_prompt_framing_semantics(
+    *values: PromptFramingSemantics,
+) -> PromptFramingSemantics:
+    """Merge additive framing traces across the multiple finalization passes."""
+
+    requested: list[str] = []
+    effective: list[str] = []
+    source: list[tuple[str, str]] = []
+    suppressed: list[str] = []
+    for value in values:
+        for tag in value.requested:
+            if tag not in requested:
+                requested.append(tag)
+        for tag in value.effective:
+            if tag not in effective:
+                effective.append(tag)
+        for item in value.source:
+            if item not in source:
+                source.append(item)
+        for tag in value.suppressed:
+            if tag not in suppressed:
+                suppressed.append(tag)
+    return PromptFramingSemantics(
+        requested=tuple(requested),
+        effective=tuple(effective),
+        source=tuple(source),
+        suppressed=tuple(suppressed),
+    )
 
 
 def detect_people_semantics(
@@ -459,6 +529,10 @@ def resolve_prompt_tag_conflicts(
     suppressed: list[SuppressedPromptTag] = []
     kept: list[str] = []
     seen: set[str] = set()
+    framing_requested: list[str] = []
+    framing_effective: list[str] = []
+    framing_sources: list[tuple[str, str]] = []
+    framing_suppressed: list[str] = []
 
     def explicit_text_match(tag: str) -> bool:
         key = normalize_prompt_constraint(tag)
@@ -479,12 +553,38 @@ def resolve_prompt_tag_conflicts(
         else:
             source = _base_source(known.source if known else "prompt_designer")
         category = next(iter(categories), known.category if known else "")
+        framing_key = _single_subject_framing(tag) if "framing" in categories else ""
+        if "framing" in categories:
+            if tag not in framing_requested:
+                framing_requested.append(tag)
+            if (tag, source) not in framing_sources:
+                framing_sources.append((tag, source))
         locked = bool(categories.intersection(explicit_categories))
         # User-explicit tags and request-derived constraints are retained even
         # when the user's own input contains a contradiction.
         is_user_constraint = source in {"user_explicit", "user_request"}
         tag_semantics = detect_people_semantics((tag,), dictionary=prompt_dictionary)
         non_solo_constraint = tag_semantics.requires_multiple_people
+        if (
+            framing_key
+            and people_semantics.requires_multiple_people
+            and not is_user_constraint
+        ):
+            source_interaction = people_semantics.source_interactions[0] if people_semantics.source_interactions else ""
+            suppressed.append(
+                SuppressedPromptTag(
+                    tag=tag,
+                    source=source,
+                    reason="conflicts_with_multi_person_framing",
+                    category="framing",
+                    conflicting_tag=source_interaction,
+                    conflicting_concept="requires_multiple_people",
+                    source_interaction=source_interaction,
+                )
+            )
+            if tag not in framing_suppressed:
+                framing_suppressed.append(tag)
+            continue
         if (
             normalize_prompt_constraint(tag) == "solo"
             and non_solo_constraint is False
@@ -530,6 +630,8 @@ def resolve_prompt_tag_conflicts(
         kept.append(tag)
         seen.add(key)
         records.append(PromptTagRecord(tag=tag, source=source, category=category))
+        if "framing" in categories and tag not in framing_effective:
+            framing_effective.append(tag)
 
     # Explicit-vs-explicit conflicts are warnings only.  Never silently remove
     # one of the user's own tags.
@@ -564,6 +666,12 @@ def resolve_prompt_tag_conflicts(
         prompt_conflicts=conflicts,
         locked_categories=frozenset(explicit_categories),
         people_semantics=people_semantics,
+        framing_semantics=PromptFramingSemantics(
+            requested=tuple(framing_requested),
+            effective=tuple(framing_effective),
+            source=tuple(framing_sources),
+            suppressed=tuple(framing_suppressed),
+        ),
     )
 
 
@@ -584,6 +692,7 @@ def has_non_solo_constraint(
 __all__ = [
     "PromptConflict",
     "PromptConflictResolution",
+    "PromptFramingSemantics",
     "PromptPeopleSemantics",
     "PromptTagRecord",
     "SOURCE_PRIORITY",
@@ -592,6 +701,7 @@ __all__ = [
     "classify_text_constraints",
     "detect_people_semantics",
     "has_non_solo_constraint",
+    "merge_prompt_framing_semantics",
     "normalize_prompt_constraint",
     "resolve_prompt_tag_conflicts",
 ]

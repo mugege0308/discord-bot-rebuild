@@ -16,7 +16,7 @@ from services.prompt_tag_dictionary import (
     PromptTagEntry,
     load_prompt_tag_dictionary,
 )
-from services.prompt_conflict_resolver import classify_text_constraints
+from services.prompt_conflict_resolver import classify_text_constraints, detect_people_semantics
 MAX_GENERATION_COUNT = 8
 MAX_BULK_GENERATION_COUNT = 32
 ALLOWED_BULK_GENERATION_COUNTS = frozenset({16, 24, 32})
@@ -62,6 +62,8 @@ _EXPLICIT_CATEGORY_HINTS = {
     "looking back": "gaze_direction",
     "looking to the side": "gaze_direction",
 }
+
+_SINGLE_SUBJECT_FRAMING_IDS = frozenset({"framing.portrait"})
 
 
 @dataclass(frozen=True)
@@ -124,6 +126,7 @@ def plan_variation_slots(
     resolved_danbooru_tags: Sequence[str] = (),
     request_text: str = "",
     reference_mode: str = "none",
+    requires_multiple_people: bool | None = None,
     dictionary: PromptTagDictionary | None = None,
 ) -> tuple[VariationSlot, ...]:
     """Build bounded slots without changing identity, appearance, or LoRAs."""
@@ -151,6 +154,12 @@ def plan_variation_slots(
         request_text,
         dictionary=prompt_dictionary,
     )
+    if requires_multiple_people is None:
+        requires_multiple_people = detect_people_semantics(
+            (*explicit_tags, *resolved_prompt_tags, *resolved_danbooru_tags),
+            context_text=request_text,
+            dictionary=prompt_dictionary,
+        ).requires_multiple_people
     normalized_reference_mode = _key(reference_mode or "none")
     if normalized_reference_mode == "pose":
         # The pose reference owns the pose and its framing.  Expression may
@@ -169,6 +178,11 @@ def plan_variation_slots(
             for tag_id in ids
             if tag_id in prompt_dictionary.entry_by_id
             and prompt_dictionary.entry_by_id[tag_id].status == "verified"
+            and not (
+                category == "framing"
+                and requires_multiple_people
+                and tag_id in _SINGLE_SUBJECT_FRAMING_IDS
+            )
         )
         if values:
             candidates.append((category, values))
@@ -197,6 +211,7 @@ def plan_bulk_variation_slots(
     resolved_danbooru_tags: Sequence[str] = (),
     request_text: str = "",
     reference_mode: str = "none",
+    requires_multiple_people: bool | None = None,
     dictionary: PromptTagDictionary | None = None,
 ) -> tuple[VariationSlot, ...]:
     """Extend the existing eight-slot recipes for an intentionally large run.
@@ -221,6 +236,7 @@ def plan_bulk_variation_slots(
         resolved_danbooru_tags=resolved_danbooru_tags,
         request_text=request_text,
         reference_mode=reference_mode,
+        requires_multiple_people=requires_multiple_people,
         dictionary=dictionary,
     )
     return tuple(
