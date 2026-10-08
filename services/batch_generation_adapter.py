@@ -333,6 +333,9 @@ def build_batch_image_options(
         ]
         metadata["people_semantics"] = prepared.resolved.people_semantics.to_dict()
         metadata["framing_semantics"] = prepared.resolved.framing_semantics.to_dict()
+        metadata["multi_person_framing_requested"] = prepared.resolved.multi_person_framing_requested
+        metadata["multi_person_framing_effective"] = prepared.resolved.multi_person_framing_effective
+        metadata["multi_person_framing_source"] = prepared.resolved.multi_person_framing_source
         prepared = replace(
             prepared,
             options=replace(prepared.options, gallery_metadata=metadata),

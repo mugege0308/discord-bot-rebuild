@@ -23,6 +23,11 @@ from services.image_generation_profiles import (
     DEFAULT_IMAGE_GENERATION_MODEL_KEY,
     get_image_generation_profile,
 )
+from services.multi_person_framing import (
+    MULTI_PERSON_FRAMING_TAGS,
+    MultiPersonFramingDecision,
+    validate_multi_person_framing,
+)
 from services.prompt_generator import PromptGeneratorError
 from services.prompt_tag_resolver import (
     PromptTagResolution,
@@ -35,6 +40,8 @@ from services.prompt_conflict_resolver import (
     PromptPeopleSemantics,
     PromptTagRecord,
     SuppressedPromptTag,
+    classify_tag,
+    classify_text_constraints,
     detect_people_semantics,
     has_non_solo_constraint,
     merge_prompt_framing_semantics,
@@ -139,6 +146,47 @@ def _append_tags(positive: str, tags: Sequence[str]) -> str:
     return ", ".join(tokens)
 
 
+def resolve_multi_person_framing_decision(
+    requested: object,
+    *,
+    requires_multiple_people: bool,
+    explicit_tags: Sequence[str] = (),
+    request_text: str = "",
+) -> MultiPersonFramingDecision:
+    """Resolve the UI mode without allowing it to override user framing."""
+
+    mode = validate_multi_person_framing(requested)
+    if not requires_multiple_people:
+        return MultiPersonFramingDecision(
+            requested=mode,
+            effective="auto",
+            source="single_person_ignored",
+        )
+
+    explicit_framing = [
+        str(tag).strip()
+        for tag in explicit_tags
+        if str(tag).strip() and "framing" in classify_tag(tag)
+    ]
+    text_framing = list(classify_text_constraints(request_text).get("framing", ()))
+    explicit_values = tuple(dict.fromkeys((*explicit_framing, *text_framing)))
+    if explicit_values:
+        source = "user_explicit" if explicit_framing else "user_request"
+        return MultiPersonFramingDecision(
+            requested=mode,
+            effective="explicit",
+            source=source,
+            explicit_tags=explicit_values,
+        )
+    preferred_tag = MULTI_PERSON_FRAMING_TAGS.get(mode, "")
+    return MultiPersonFramingDecision(
+        requested=mode,
+        effective=mode,
+        source="user_ui" if mode != "auto" else "system_default",
+        preferred_tag=preferred_tag,
+    )
+
+
 _SYSTEM_TAG_KEYS = frozenset(
     {
         "1girl",
@@ -202,6 +250,7 @@ class GenerationRequest:
     rating: str = PROMPT_RATING_AUTO
     loras: tuple[object, ...] = ()
     size_preset: str | None = None
+    multi_person_framing: str = "auto"
     width: int = 512
     height: int = 512
     steps: int = 20
@@ -230,6 +279,7 @@ class GenerationRequest:
         object.__setattr__(self, "explicit_tags", _split_tag_values(tuple(self.explicit_tags)))
         object.__setattr__(self, "loras", tuple(self.loras or ()))
         object.__setattr__(self, "source_metadata", dict(self.source_metadata or {}))
+        object.__setattr__(self, "multi_person_framing", validate_multi_person_framing(self.multi_person_framing))
 
     @property
     def prompt_input(self) -> str:
@@ -374,6 +424,9 @@ class ResolvedGeneration:
     prompt_conflicts: tuple[PromptConflict, ...] = ()
     people_semantics: PromptPeopleSemantics = PromptPeopleSemantics()
     framing_semantics: PromptFramingSemantics = PromptFramingSemantics()
+    multi_person_framing_requested: str = "auto"
+    multi_person_framing_effective: str = "auto"
+    multi_person_framing_source: str = "system_default"
 
 
 @dataclass(frozen=True)
@@ -519,6 +572,22 @@ class GenerationService:
             if clean and _tag_key(clean) not in {_tag_key(item.tag) for item in provenance}:
                 provenance.append(TagProvenance(clean, "request_resolver"))
 
+        people_semantics = detect_people_semantics(
+            _positive_tokens(positive),
+            context_text=" ".join(
+                value
+                for value in (request.request_text, request.character_preset, request.freeform_character)
+                if _normalise_text(value)
+            ),
+            explicit_values=explicit_tags,
+        )
+        framing_decision = resolve_multi_person_framing_decision(
+            request.multi_person_framing,
+            requires_multiple_people=people_semantics.requires_multiple_people,
+            explicit_tags=explicit_tags,
+            request_text=request.request_text or "",
+        )
+
         merged_result = replace(
             prompt_result,
             positive=positive,
@@ -536,15 +605,10 @@ class GenerationService:
             explicit_tags=explicit_tags,
             appearance_tags=appearance_tags,
             provenance=tuple(dict.fromkeys(provenance)),
-            people_semantics=detect_people_semantics(
-                _positive_tokens(positive),
-                context_text=" ".join(
-                    value
-                    for value in (request.request_text, request.character_preset, request.freeform_character)
-                    if _normalise_text(value)
-                ),
-                explicit_values=explicit_tags,
-            ),
+            people_semantics=people_semantics,
+            multi_person_framing_requested=framing_decision.requested,
+            multi_person_framing_effective=framing_decision.effective,
+            multi_person_framing_source=framing_decision.source,
         )
 
     def resolve_request(
@@ -557,13 +621,18 @@ class GenerationService:
         profile = get_image_generation_profile(request.model_key.strip())
         validate_requested_prompt_rating(request.rating, is_adult=profile.is_adult)
         resolver = prompt_resolver or self._prompt_resolver or generate_shogou_prompt_result
+        resolver_kwargs: dict[str, Any] = {
+            "enable_generic_danbooru": request.enable_generic_danbooru,
+        }
+        if request.multi_person_framing != "auto":
+            resolver_kwargs["multi_person_framing"] = request.multi_person_framing
         prompt_result = resolver(
             request.prompt_input,
             self._requester_for_prompt(request),
             request.reference_id,
             profile.model_key,
             request.rating,
-            enable_generic_danbooru=request.enable_generic_danbooru,
+            **resolver_kwargs,
         )
         if not isinstance(prompt_result, ShogouPromptResult):
             raise PromptGeneratorError("Prompt Designerの結果が不正です。")
@@ -599,10 +668,24 @@ class GenerationService:
             resolve_loras = lora_resolver or resolve_saved_lora_selections
             loras = tuple(resolve_loras(request.loras, model_family=profile.model_family))
         positive_source = positive_override if positive_override is not None else resolved.prompt_result.positive
+        framing_decision = resolve_multi_person_framing_decision(
+            request.multi_person_framing,
+            requires_multiple_people=resolved.people_semantics.requires_multiple_people,
+            explicit_tags=resolved.explicit_tags,
+            request_text=request.request_text or "",
+        )
+        preferred_framing_tag = framing_decision.preferred_tag
+        if preferred_framing_tag:
+            positive_source = _append_tags(positive_source, (preferred_framing_tag,))
         base_provenance = tuple(
             PromptTagRecord(item.tag, item.source, item.category)
             for item in resolved.provenance
         )
+        if preferred_framing_tag:
+            preferred_key = _tag_key(preferred_framing_tag)
+            base_provenance = tuple(
+                item for item in base_provenance if _tag_key(item.tag) != preferred_key
+            ) + (PromptTagRecord(preferred_framing_tag, "user_ui", "framing"),)
         pre_final_conflicts = resolve_prompt_tag_conflicts(
             positive_source,
             explicit_tags=resolved.explicit_tags,
@@ -614,6 +697,7 @@ class GenerationService:
             ),
             base_provenance=base_provenance,
             variation_tags=variation_tags,
+            preferred_framing_tag=preferred_framing_tag,
         )
         positive, system_provenance = _finalize_positive(
             request,
@@ -635,6 +719,7 @@ class GenerationService:
             ),
             base_provenance=(*base_provenance, *pre_final_conflicts.provenance, *system_records),
             variation_tags=variation_tags,
+            preferred_framing_tag=preferred_framing_tag,
         )
         positive = final_conflicts.positive
         positive = apply_lora_triggers(positive, loras)
@@ -657,6 +742,7 @@ class GenerationService:
                 *final_conflicts.provenance,
             ),
             variation_tags=variation_tags,
+            preferred_framing_tag=preferred_framing_tag,
         )
         positive = post_lora_conflicts.positive
         negative = (
@@ -727,6 +813,20 @@ class GenerationService:
                 )
             )
         )
+        if framing_decision.explicit_tags and framing_decision.requested != "auto":
+            prompt_conflicts = tuple(
+                dict.fromkeys(
+                    (
+                        *prompt_conflicts,
+                        PromptConflict(
+                            category="framing",
+                            tags=(framing_decision.requested, *framing_decision.explicit_tags),
+                            sources=("user_ui", framing_decision.source),
+                            reason="explicit_framing_overrides_multi_person_selector",
+                        ),
+                    )
+                )
+            )
 
         reference_values = dict(request.reference or {})
         reference_mode = str(reference_values.get("mode") or "none").strip().casefold()
@@ -806,6 +906,9 @@ class GenerationService:
                 # requested/source/suppressed traces remain additive.
                 effective=post_lora_conflicts.framing_semantics.effective,
             ),
+            multi_person_framing_requested=framing_decision.requested,
+            multi_person_framing_effective=framing_decision.effective,
+            multi_person_framing_source=framing_decision.source,
         )
         return PreparedGeneration(
             request=request,

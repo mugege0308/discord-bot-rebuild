@@ -49,6 +49,23 @@ class GenerationServiceCharacterizationTests(unittest.TestCase):
         self.assertEqual("safe", self.prompt_resolver.call_args.args[4])
         self.assertEqual("1girl, portrait", resolved.prompt_result.positive)
 
+    def test_multi_person_framing_is_forwarded_to_prompt_designer(self):
+        request = GenerationRequest(
+            explicit_tags=("1girl", "1boy", "hetero"),
+            request_text="hetero",
+            multi_person_framing="both_faces",
+            model_key="animagine",
+            rating="safe",
+            source="gallery",
+        )
+
+        self.service.resolve_request(request)
+
+        self.assertEqual(
+            "both_faces",
+            self.prompt_resolver.call_args.kwargs["multi_person_framing"],
+        )
+
     def test_registered_character_preset_preserves_confirmed_prompt_and_negative(self):
         confirmed = _prompt_result(
             positive="1girl, kochiya sanae, green hair",
@@ -413,6 +430,81 @@ class GenerationServicePreparationTests(unittest.TestCase):
         prepared = service.prepare_generation(request)
         self.assertIn("upper body", prepared.options.prompt)
         self.assertFalse(prepared.resolved.framing_semantics.suppressed)
+
+    def test_multi_person_ui_full_body_adds_verified_tag_and_suppresses_auto_framing(self):
+        service = GenerationService(
+            prompt_resolver=Mock(
+                return_value=_prompt_result(
+                    positive="1girl, 1boy, hetero, portrait",
+                )
+            )
+        )
+        request = GenerationRequest(
+            explicit_tags=("1girl", "1boy", "hetero"),
+            request_text="hetero",
+            multi_person_framing="full_body",
+            model_key="animagine",
+            rating="safe",
+        )
+
+        prepared = service.prepare_generation(request)
+
+        positive = {token.strip() for token in prepared.options.prompt.split(",")}
+        self.assertIn("full body", positive)
+        self.assertNotIn("portrait", positive)
+        self.assertEqual("full_body", prepared.resolved.multi_person_framing_effective)
+        self.assertIn(("full body", "user_ui"), {(item.tag, item.source) for item in prepared.resolved.provenance})
+
+    def test_multi_person_explicit_framing_wins_over_ui_mode_and_is_recorded(self):
+        service = GenerationService(
+            prompt_resolver=Mock(return_value=_prompt_result("1girl, 1boy, hetero, portrait"))
+        )
+        request = GenerationRequest(
+            explicit_tags=("1girl", "1boy", "hetero", "portrait"),
+            request_text="hetero",
+            multi_person_framing="full_body",
+            model_key="animagine",
+            rating="safe",
+        )
+
+        prepared = service.prepare_generation(request)
+
+        self.assertIn("portrait", prepared.options.prompt)
+        self.assertNotIn("full body", prepared.options.prompt)
+        self.assertEqual("explicit", prepared.resolved.multi_person_framing_effective)
+        self.assertTrue(any(item.reason == "explicit_framing_overrides_multi_person_selector" for item in prepared.resolved.prompt_conflicts))
+
+    def test_semantic_multi_person_modes_do_not_invent_positive_tags(self):
+        service = GenerationService(
+            prompt_resolver=Mock(return_value=_prompt_result("1girl, 1boy, hetero"))
+        )
+        for mode in ("both_faces", "partial_partner_ok"):
+            with self.subTest(mode=mode):
+                request = GenerationRequest(
+                    explicit_tags=("1girl", "1boy", "hetero"),
+                    request_text="hetero",
+                    multi_person_framing=mode,
+                    model_key="animagine",
+                    rating="safe",
+                )
+                prepared = service.prepare_generation(request)
+                self.assertNotIn(mode, prepared.options.prompt)
+                self.assertEqual(mode, prepared.resolved.multi_person_framing_effective)
+
+    def test_single_person_ignores_multi_person_framing_mode(self):
+        service = GenerationService(prompt_resolver=Mock(return_value=_prompt_result("1girl, portrait")))
+        request = GenerationRequest(
+            explicit_tags=("1girl",),
+            request_text="standing",
+            multi_person_framing="full_body",
+            model_key="animagine",
+            rating="safe",
+        )
+
+        prepared = service.prepare_generation(request)
+
+        self.assertNotIn("full body", prepared.options.prompt)
+        self.assertEqual("auto", prepared.resolved.multi_person_framing_effective)
 
     def test_variation_added_portrait_is_suppressed_for_multi_person_request(self):
         service = GenerationService(

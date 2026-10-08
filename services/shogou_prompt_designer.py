@@ -48,6 +48,7 @@ from services.prompt_positive_cleanup import (
     normalize_prompt_tag_key,
 )
 from services.prompt_semantic_grounding import ground_prompt_semantics
+from services.multi_person_framing import build_multi_person_framing_instruction
 from services.verified_character_registry import VerifiedCharacterRegistry
 from services.generate_ai_debug import (
     complete_generate_ai_debug,
@@ -320,6 +321,7 @@ def generate_shogou_prompt_result(
     requested_rating: str = "auto",
     *,
     enable_generic_danbooru: bool = False,
+    multi_person_framing: str = "auto",
 ) -> ShogouPromptResult:
     text = user_input.strip()
     if not text:
@@ -465,6 +467,9 @@ def generate_shogou_prompt_result(
         system_prompt += "\n\n" + build_danbooru_tag_instruction(generic_resolution)
     if character_resolution is not None:
         system_prompt += "\n\n" + build_danbooru_character_instruction(character_resolution)
+    framing_instruction = build_multi_person_framing_instruction(multi_person_framing)
+    if framing_instruction:
+        system_prompt += "\n\n" + framing_instruction
     system_prompt = system_prompt.rstrip()
     if user_id is not None:
         mark_generate_ai_stage(trace_id, "02_prompt_build")

@@ -17,6 +17,7 @@ from services.prompt_tag_dictionary import (
     load_prompt_tag_dictionary,
 )
 from services.prompt_conflict_resolver import classify_text_constraints, detect_people_semantics
+from services.multi_person_framing import validate_multi_person_framing
 MAX_GENERATION_COUNT = 8
 MAX_BULK_GENERATION_COUNT = 32
 ALLOWED_BULK_GENERATION_COUNTS = frozenset({16, 24, 32})
@@ -127,6 +128,7 @@ def plan_variation_slots(
     request_text: str = "",
     reference_mode: str = "none",
     requires_multiple_people: bool | None = None,
+    multi_person_framing: str = "auto",
     dictionary: PromptTagDictionary | None = None,
 ) -> tuple[VariationSlot, ...]:
     """Build bounded slots without changing identity, appearance, or LoRAs."""
@@ -160,6 +162,11 @@ def plan_variation_slots(
             context_text=request_text,
             dictionary=prompt_dictionary,
         ).requires_multiple_people
+    selected_framing = validate_multi_person_framing(multi_person_framing)
+    if requires_multiple_people and selected_framing != "auto":
+        # An explicit UI framing mode is a per-request lock.  Semantic modes
+        # also lock the framing category so variation cannot undo the intent.
+        locked = frozenset((*locked, "framing"))
     normalized_reference_mode = _key(reference_mode or "none")
     if normalized_reference_mode == "pose":
         # The pose reference owns the pose and its framing.  Expression may
@@ -212,6 +219,7 @@ def plan_bulk_variation_slots(
     request_text: str = "",
     reference_mode: str = "none",
     requires_multiple_people: bool | None = None,
+    multi_person_framing: str = "auto",
     dictionary: PromptTagDictionary | None = None,
 ) -> tuple[VariationSlot, ...]:
     """Extend the existing eight-slot recipes for an intentionally large run.
@@ -237,6 +245,7 @@ def plan_bulk_variation_slots(
         request_text=request_text,
         reference_mode=reference_mode,
         requires_multiple_people=requires_multiple_people,
+        multi_person_framing=multi_person_framing,
         dictionary=dictionary,
     )
     return tuple(

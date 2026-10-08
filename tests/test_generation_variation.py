@@ -52,6 +52,17 @@ class GenerationVariationTests(unittest.TestCase):
         self.assertNotIn("portrait", framing_tags)
         self.assertTrue(framing_tags & {"upper body", "cowboy shot", "full body"})
 
+    def test_explicit_multi_person_framing_locks_variation_framing(self):
+        slots = plan_variation_slots(
+            8,
+            VARIATION_AUTO,
+            explicit_tags=("1girl", "1boy", "hetero"),
+            requires_multiple_people=True,
+            multi_person_framing="full_body",
+        )
+        all_tags = {tag for slot in slots for tag in slot.tags}
+        self.assertFalse({"portrait", "upper body", "cowboy shot", "full body"} & all_tags)
+
     def test_start_index_continues_auto_variations_at_slots_five_to_eight(self):
         first = plan_variation_slots(4, VARIATION_AUTO)
         continuation = plan_variation_slots(4, VARIATION_AUTO, start_index=4)

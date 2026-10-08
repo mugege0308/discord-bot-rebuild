@@ -86,6 +86,15 @@ class GenerationApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(1, request.count)
         self.assertEqual("off", request.variation)
 
+    def test_multi_person_framing_defaults_and_validates(self) -> None:
+        self.assertEqual("auto", _build_request({"freeform_character": "girl"}).multi_person_framing)
+        self.assertEqual(
+            "both_faces",
+            _build_request({"freeform_character": "couple", "multi_person_framing": "both_faces"}).multi_person_framing,
+        )
+        with self.assertRaisesRegex(ValueError, "multi_person_framing"):
+            _build_request({"freeform_character": "couple", "multi_person_framing": "unknown"})
+
     def test_portrait_size_only_sets_dimensions_without_prompt_framing_tag(self) -> None:
         request = _build_request({"freeform_character": "girl", "size": "portrait"})
         self.assertEqual((768, 1024), (request.width, request.height))
@@ -100,13 +109,18 @@ class GenerationApiTests(unittest.IsolatedAsyncioTestCase):
 
     async def asyncSetUp(self):
         self.service = _FakeGenerationService()
-        self.app = create_generation_app(service=self.service)
+        self.overnight_tempdir = tempfile.TemporaryDirectory(dir=Path.cwd())
+        self.app = create_generation_app(
+            service=self.service,
+            overnight_db_path=Path(self.overnight_tempdir.name) / "overnight.db",
+        )
         self.server = TestServer(self.app)
         self.client = TestClient(self.server)
         await self.client.start_server()
 
     async def asyncTearDown(self):
         await self.client.close()
+        self.overnight_tempdir.cleanup()
 
     async def _wait_for_terminal(self, job_id: str) -> dict:
         for _ in range(100):
@@ -139,6 +153,10 @@ class GenerationApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual({"square", "portrait", "landscape"}, {item["key"] for item in payload["sizes"]})
         self.assertIn("style", payload["loras"])
         self.assertIn("character_presets", payload)
+        self.assertEqual(
+            {"auto", "both_faces", "upper_body", "cowboy", "full_body", "partial_partner_ok"},
+            {item["key"] for item in payload["multi_person_framing"]},
+        )
         self.assertNotIn("source_path", str(payload))
         self.assertNotIn("metadata_path", str(payload))
 
@@ -221,6 +239,9 @@ class GenerationApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("tag_provenance", metadata)
         self.assertIn("suppressed_tags", metadata)
         self.assertIn("prompt_conflicts", metadata)
+        self.assertEqual("auto", metadata["multi_person_framing_requested"])
+        self.assertEqual("auto", metadata["multi_person_framing_effective"])
+        self.assertEqual("system_default", metadata["multi_person_framing_source"])
         self.assertEqual(
             {
                 "requires_multiple_people": False,

@@ -54,6 +54,11 @@ from services.generation_variation import (
 )
 from services.gallery_control import get_gallery_images_root
 from services.image_composition import IMAGE_SIZE_SPECS
+from services.multi_person_framing import (
+    MULTI_PERSON_FRAMING_CHOICES,
+    MULTI_PERSON_FRAMING_LABELS,
+    validate_multi_person_framing,
+)
 from services.image_generation_profiles import (
     IMAGE_GENERATION_PROFILES,
     get_image_generation_profile,
@@ -109,6 +114,7 @@ _ALLOWED_REQUEST_KEYS = frozenset(
         "rating",
         "loras",
         "size",
+        "multi_person_framing",
         "count",
         "variation",
         "variation_offset",
@@ -484,6 +490,11 @@ def _build_request(
     size = size.casefold()
     size_spec = IMAGE_SIZE_SPECS[size]
 
+    try:
+        multi_person_framing = validate_multi_person_framing(payload.get("multi_person_framing", "auto"))
+    except ValueError as exc:
+        raise GenerationApiError(str(exc)) from exc
+
     count = _parse_count(payload.get("count", 1))
     variation = _parse_variation(payload.get("variation"), count=count)
     variation_offset = _parse_variation_offset(payload.get("variation_offset"), count=count)
@@ -504,6 +515,7 @@ def _build_request(
         rating=rating,
         loras=loras,
         size_preset=size,
+        multi_person_framing=multi_person_framing,
         width=size_spec.width,
         height=size_spec.height,
         count=count,
@@ -640,7 +652,10 @@ def _build_gallery_metadata(
         "suppressed_tags": suppressed_tags,
         "prompt_conflicts": prompt_conflicts,
         "people_semantics": prepared.resolved.people_semantics.to_dict(),
+        "multi_person_framing_requested": prepared.resolved.multi_person_framing_requested,
+        "multi_person_framing_effective": prepared.resolved.multi_person_framing_effective,
         "framing_semantics": prepared.resolved.framing_semantics.to_dict(),
+        "multi_person_framing_source": prepared.resolved.multi_person_framing_source,
     }
     if requested_seed_override is not _UNSET:
         metadata["requested_seed"] = requested_seed_override
@@ -715,6 +730,7 @@ class GenerationApi:
         config: GenerationApiConfig | None = None,
         tag_store: DanbooruTagStore | None = None,
         tag_interpreter: object | None = None,
+        overnight_db_path: str | Path | None = None,
     ) -> None:
         self.config = config or GenerationApiConfig()
         self.service = service or GenerationService()
@@ -722,7 +738,7 @@ class GenerationApi:
         self.tag_interpreter = tag_interpreter
         self.jobs = _JobStore()
         self.bulk_jobs = _BulkJobStore()
-        self.overnight_jobs = OvernightJobStore()
+        self.overnight_jobs = OvernightJobStore(overnight_db_path)
         self._overnight_task: asyncio.Task[None] | None = None
         self._generation_lock = asyncio.Lock()
         self._tasks: set[asyncio.Task[None]] = set()
@@ -853,6 +869,10 @@ class GenerationApi:
                 "sizes": [
                     {"key": spec.key, "label": spec.label, "width": spec.width, "height": spec.height}
                     for spec in IMAGE_SIZE_SPECS.values()
+                ],
+                "multi_person_framing": [
+                    {"key": key, "label": MULTI_PERSON_FRAMING_LABELS[key]}
+                    for key in MULTI_PERSON_FRAMING_CHOICES
                 ],
                 "character_presets": character_presets,
                 "loras": lora_catalog,
@@ -1704,6 +1724,7 @@ class GenerationApi:
                 request_text=request.request_text or "",
                 reference_mode=str((request.reference or {}).get("mode") or "none"),
                 requires_multiple_people=resolved.people_semantics.requires_multiple_people,
+                multi_person_framing=request.multi_person_framing,
             )
             rounds = list(record.get("rounds") or [])
             used_seeds = {
@@ -2107,6 +2128,7 @@ class GenerationApi:
                     request_text=resolution_request.request_text or "",
                     reference_mode=str((resolution_request.reference or {}).get("mode") or "none"),
                     requires_multiple_people=resolved.people_semantics.requires_multiple_people,
+                    multi_person_framing=resolution_request.multi_person_framing,
                 )
                 outputs: list[dict[str, Any]] = []
                 errors: list[str] = []
@@ -2231,6 +2253,7 @@ class GenerationApi:
                     request_text=resolution_request.request_text or "",
                     reference_mode=str((resolution_request.reference or {}).get("mode") or "none"),
                     requires_multiple_people=resolved.people_semantics.requires_multiple_people,
+                    multi_person_framing=resolution_request.multi_person_framing,
                 )
                 outputs: list[dict[str, Any]] = []
                 errors: list[str] = []
@@ -2430,6 +2453,7 @@ def create_generation_app(
     config: GenerationApiConfig | None = None,
     tag_store: DanbooruTagStore | None = None,
     tag_interpreter: object | None = None,
+    overnight_db_path: str | Path | None = None,
 ) -> web.Application:
     """Build the app without binding a socket; suitable for a launcher/tests."""
 
@@ -2438,6 +2462,7 @@ def create_generation_app(
         config=config,
         tag_store=tag_store,
         tag_interpreter=tag_interpreter,
+        overnight_db_path=overnight_db_path,
     ).app
 
 

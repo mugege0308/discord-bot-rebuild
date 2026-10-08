@@ -27,6 +27,7 @@ SOURCE_PRIORITY: Mapping[str, int] = {
     "character_confirmed": 90,
     "appearance_resolver": 85,
     "reference_lock": 80,
+    "user_ui": 94,
     "variation_auto": 60,
     "prompt_designer": 50,
     "request_resolver": 50,
@@ -495,6 +496,7 @@ def resolve_prompt_tag_conflicts(
     character_text: str = "",
     base_provenance: Iterable[PromptTagRecord] = (),
     variation_tags: Sequence[str] = (),
+    preferred_framing_tag: str = "",
     dictionary: PromptTagDictionary | None = None,
 ) -> PromptConflictResolution:
     """Keep user intent and suppress only lower-priority conflicting tags."""
@@ -524,6 +526,7 @@ def resolve_prompt_tag_conflicts(
             continue
         known_sources.setdefault(normalize_prompt_constraint(item.tag), item)
     variation_keys = {normalize_prompt_constraint(value) for value in variation_tags}
+    preferred_framing_key = normalize_prompt_constraint(preferred_framing_tag)
 
     records: list[PromptTagRecord] = []
     suppressed: list[SuppressedPromptTag] = []
@@ -562,9 +565,28 @@ def resolve_prompt_tag_conflicts(
         locked = bool(categories.intersection(explicit_categories))
         # User-explicit tags and request-derived constraints are retained even
         # when the user's own input contains a contradiction.
-        is_user_constraint = source in {"user_explicit", "user_request"}
+        is_user_constraint = source in {"user_explicit", "user_request", "user_ui"}
         tag_semantics = detect_people_semantics((tag,), dictionary=prompt_dictionary)
         non_solo_constraint = tag_semantics.requires_multiple_people
+        if (
+            preferred_framing_key
+            and "framing" in categories
+            and key != preferred_framing_key
+            and not is_user_constraint
+        ):
+            suppressed.append(
+                SuppressedPromptTag(
+                    tag=tag,
+                    source=source,
+                    reason="overridden_by_multi_person_framing_selector",
+                    category="framing",
+                    conflicting_tag=preferred_framing_tag,
+                    conflicting_concept="multi_person_framing",
+                )
+            )
+            if tag not in framing_suppressed:
+                framing_suppressed.append(tag)
+            continue
         if (
             framing_key
             and people_semantics.requires_multiple_people
