@@ -22,6 +22,14 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def _output_text(value: object) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
+
+
 def build_shutdown_command(delay_seconds: int) -> list[str]:
     """Return the fixed, non-shell Windows command used for this feature."""
 
@@ -54,12 +62,65 @@ def schedule_overnight_shutdown(
     if os.name != "nt":
         raise RuntimeError("Overnight shutdown is supported only on Windows.")
     command = build_shutdown_command(delay_seconds)
-    (runner or subprocess.run)(command, check=True, shell=False, timeout=10)
-    return {
-        "shutdown_scheduled_at": _now_iso(),
+    attempted_at = _now_iso()
+    metadata: dict[str, object] = {
+        "shutdown_attempted_at": attempted_at,
+        "shutdown_command": list(command),
+        "shutdown_return_code": None,
+        "shutdown_stdout": "",
+        "shutdown_stderr": "",
+        "shutdown_scheduled_at": "",
+        "shutdown_cancelled_at": "",
+        "shutdown_failed_at": "",
+        "shutdown_failure_reason": "",
         "shutdown_delay_seconds": delay_seconds,
-        "shutdown_status": "scheduled",
     }
+    try:
+        result = (runner or subprocess.run)(
+            command,
+            check=False,
+            shell=False,
+            timeout=10,
+            capture_output=True,
+            text=True,
+        )
+    except Exception as exc:  # noqa: BLE001 - diagnostics must survive command errors
+        failed_at = _now_iso()
+        metadata.update(
+            {
+                "shutdown_status": "failed",
+                "shutdown_failed_at": failed_at,
+                "shutdown_failure_reason": f"{type(exc).__name__}: {exc}",
+            }
+        )
+        return metadata
+
+    return_code = getattr(result, "returncode", 0)
+    stdout = _output_text(getattr(result, "stdout", ""))
+    stderr = _output_text(getattr(result, "stderr", ""))
+    metadata.update(
+        {
+            "shutdown_return_code": return_code,
+            "shutdown_stdout": stdout,
+            "shutdown_stderr": stderr,
+        }
+    )
+    if return_code == 0:
+        metadata.update(
+            {
+                "shutdown_status": "scheduled",
+                "shutdown_scheduled_at": _now_iso(),
+            }
+        )
+    else:
+        metadata.update(
+            {
+                "shutdown_status": "failed",
+                "shutdown_failed_at": _now_iso(),
+                "shutdown_failure_reason": f"shutdown.exe returned {return_code}",
+            }
+        )
+    return metadata
 
 
 __all__ = [

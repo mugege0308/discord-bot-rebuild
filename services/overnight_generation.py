@@ -222,6 +222,16 @@ class OvernightJobStore:
             "timing": {
                 "shutdown_after_completion": bool(shutdown_after_completion),
                 "shutdown_status": "requested" if shutdown_after_completion else "not_requested",
+                "shutdown_job_id": "",
+                "shutdown_attempted_at": "",
+                "shutdown_command": [],
+                "shutdown_return_code": None,
+                "shutdown_stdout": "",
+                "shutdown_stderr": "",
+                "shutdown_scheduled_at": "",
+                "shutdown_cancelled_at": "",
+                "shutdown_failed_at": "",
+                "shutdown_failure_reason": "",
             },
             "started_at": now,
             "updated_at": now,
@@ -230,6 +240,7 @@ class OvernightJobStore:
             "stop_requested": False,
             "in_flight": {},
         }
+        record["timing"]["shutdown_job_id"] = record["job_id"]
         columns = (
             "job_id", "request_json", "total_count", "round_size", "total_rounds",
             "current_round", "current_slot", "generated_count", "failed_count", "state",
@@ -343,7 +354,16 @@ def overnight_response(record: Mapping[str, Any]) -> dict[str, Any]:
         "shutdown": {
             "requested": shutdown_requested,
             "status": str(timing.get("shutdown_status") or ("requested" if shutdown_requested else "not_requested")),
+            "job_id": str(timing.get("shutdown_job_id") or record.get("job_id") or ""),
+            "attempted_at": str(timing.get("shutdown_attempted_at") or ""),
+            "command": list(timing.get("shutdown_command") or []),
+            "return_code": timing.get("shutdown_return_code"),
+            "stdout": str(timing.get("shutdown_stdout") or ""),
+            "stderr": str(timing.get("shutdown_stderr") or ""),
             "scheduled_at": str(timing.get("shutdown_scheduled_at") or ""),
+            "cancelled_at": str(timing.get("shutdown_cancelled_at") or ""),
+            "failed_at": str(timing.get("shutdown_failed_at") or ""),
+            "failure_reason": str(timing.get("shutdown_failure_reason") or ""),
             "delay_seconds": int(timing.get("shutdown_delay_seconds") or 0),
         },
         "started_at": str(record.get("started_at") or ""),

@@ -69,6 +69,7 @@ from services.shogou_prompt_designer import PROMPT_RATING_CHOICES
 from services.image_selection import select_generated_images
 from services.overnight_shutdown import (
     DEFAULT_OVERNIGHT_SHUTDOWN_DELAY_SECONDS,
+    build_shutdown_command,
     schedule_overnight_shutdown,
 )
 from services.overnight_generation import (
@@ -1013,6 +1014,7 @@ class GenerationApi:
         if record is None or not self._shutdown_requested(record):
             return
         timing = dict(record.get("timing") or {})
+        timing.setdefault("shutdown_job_id", overnight_id)
         if timing.get("shutdown_scheduled_at") or timing.get("shutdown_status") == "scheduled":
             return
         queue_empty = await asyncio.to_thread(is_comfy_queue_empty)
@@ -1024,9 +1026,10 @@ class GenerationApi:
         if not eligible:
             timing["shutdown_status"] = "blocked"
             timing["shutdown_blocked_reason"] = reason
+            timing["shutdown_failure_reason"] = reason
             self.overnight_jobs.update(overnight_id, timing=timing)
             logger.warning(
-                "Overnight shutdown not scheduled: overnight_id=%s reason=%s",
+                "Overnight shutdown not scheduled: job_id=%s phase=eligibility reason=%s",
                 overnight_id,
                 reason,
             )
@@ -1037,18 +1040,34 @@ class GenerationApi:
                 DEFAULT_OVERNIGHT_SHUTDOWN_DELAY_SECONDS,
             )
         except Exception as exc:  # noqa: BLE001 - shutdown must never change job success
+            attempted_at = timing.get("shutdown_attempted_at") or utc_now_iso()
             timing["shutdown_status"] = "failed"
-            timing["shutdown_error_type"] = type(exc).__name__
+            timing["shutdown_job_id"] = overnight_id
+            timing["shutdown_attempted_at"] = attempted_at
+            timing["shutdown_command"] = build_shutdown_command(DEFAULT_OVERNIGHT_SHUTDOWN_DELAY_SECONDS)
+            timing["shutdown_failed_at"] = utc_now_iso()
+            timing["shutdown_failure_reason"] = f"{type(exc).__name__}: {exc}"
             self.overnight_jobs.update(overnight_id, timing=timing)
-            logger.exception("Could not schedule Overnight shutdown: overnight_id=%s", overnight_id)
+            logger.exception("Could not schedule Overnight shutdown: job_id=%s phase=command", overnight_id)
             return
         timing.update(shutdown_metadata)
+        timing["shutdown_job_id"] = overnight_id
         self.overnight_jobs.update(overnight_id, timing=timing)
-        logger.warning(
-            "Overnight shutdown scheduled: overnight_id=%s delay_seconds=%s",
-            overnight_id,
-            DEFAULT_OVERNIGHT_SHUTDOWN_DELAY_SECONDS,
-        )
+        if timing.get("shutdown_status") == "scheduled":
+            logger.warning(
+                "Overnight shutdown requested: job_id=%s attempted_at=%s scheduled_at=%s return_code=%s",
+                overnight_id,
+                timing.get("shutdown_attempted_at", ""),
+                timing.get("shutdown_scheduled_at", ""),
+                timing.get("shutdown_return_code"),
+            )
+        else:
+            logger.error(
+                "Overnight shutdown failed: job_id=%s phase=command return_code=%s reason=%s",
+                overnight_id,
+                timing.get("shutdown_return_code"),
+                timing.get("shutdown_failure_reason", ""),
+            )
 
     async def create_job(self, request: web.Request) -> web.Response:
         try:
@@ -1309,6 +1328,14 @@ class GenerationApi:
             state = "stopping" if self._overnight_task is not None and not self._overnight_task.done() else "stopped"
             timing = dict(record.get("timing") or {})
             timing.setdefault("stop_requested_at", utc_now_iso())
+            if (
+                timing.get("shutdown_after_completion")
+                and not timing.get("shutdown_scheduled_at")
+                and not timing.get("shutdown_cancelled_at")
+            ):
+                timing["shutdown_status"] = "cancelled"
+                timing["shutdown_cancelled_at"] = timing["stop_requested_at"]
+                timing["shutdown_failure_reason"] = "job_stop_requested"
             if state == "stopped":
                 timing.setdefault("stopped_at", utc_now_iso())
             record = self.overnight_jobs.update(
@@ -1691,6 +1718,7 @@ class GenerationApi:
                 for round_index in range(int(record["current_round"]), int(record["total_rounds"]) + 1):
                     record = self.overnight_jobs.get(overnight_id) or record
                     if record.get("stop_requested"):
+                        timing.update(dict(record.get("timing") or {}))
                         timing["stopped_at"] = utc_now_iso()
                         self.overnight_jobs.update(
                             overnight_id, state="stopped", finished_at=timing["stopped_at"], timing=timing, in_flight={},
@@ -1720,6 +1748,7 @@ class GenerationApi:
                             continue
                         record = self.overnight_jobs.get(overnight_id) or record
                         if record.get("stop_requested"):
+                            timing.update(dict(record.get("timing") or {}))
                             timing["stopped_at"] = utc_now_iso()
                             self.overnight_jobs.update(
                                 overnight_id, state="stopped", finished_at=timing["stopped_at"], timing=timing, in_flight={},
