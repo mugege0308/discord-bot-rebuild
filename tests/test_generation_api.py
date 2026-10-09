@@ -19,7 +19,12 @@ from services.generation_api import (
 )
 from services.generation_service import GenerationRequest, GenerationService
 from services.image_selection import ImageSelectionResult
-from services.sd_control import GeneratedImage
+from services.sd_control import (
+    GeneratedImage,
+    _apply_comfy_options,
+    _extract_latent_dimensions,
+    _load_comfy_workflow,
+)
 from services.shogou_prompt_designer import ShogouPromptResult
 
 
@@ -81,6 +86,18 @@ class _MultiImageService(GenerationService):
 
 
 class GenerationApiTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def _final_workflow_size(request: GenerationRequest) -> tuple[int | None, int | None]:
+        service = GenerationService(
+            prompt_resolver=lambda *_args, **_kwargs: ShogouPromptResult(
+                positive="1girl, safe",
+                negative="low quality",
+            )
+        )
+        prepared = service.prepare_generation(request)
+        workflow, _, _ = _apply_comfy_options(_load_comfy_workflow(), prepared.options)
+        return _extract_latent_dimensions(workflow)
+
     def test_normal_count_one_auto_keeps_existing_off_semantics(self) -> None:
         request = _build_request({"freeform_character": "girl", "count": 1, "variation": "auto"})
         self.assertEqual(1, request.count)
@@ -99,6 +116,44 @@ class GenerationApiTests(unittest.IsolatedAsyncioTestCase):
         request = _build_request({"freeform_character": "girl", "size": "portrait"})
         self.assertEqual((768, 1024), (request.width, request.height))
         self.assertEqual((), request.explicit_tags)
+
+    def test_portrait_size_reaches_final_workflow(self) -> None:
+        request = _build_request({"freeform_character": "girl", "size": "portrait"})
+
+        self.assertEqual(frozenset({"width", "height"}), request.explicit_generation_fields)
+        self.assertEqual((768, 1024), self._final_workflow_size(request))
+
+    def test_square_size_reaches_final_workflow(self) -> None:
+        request = _build_request({"freeform_character": "girl", "size": "square"})
+
+        self.assertEqual((1024, 1024), self._final_workflow_size(request))
+
+    def test_landscape_size_reaches_final_workflow(self) -> None:
+        request = _build_request({"freeform_character": "girl", "size": "landscape"})
+
+        self.assertEqual((1024, 768), self._final_workflow_size(request))
+
+    def test_explicit_dimensions_keep_existing_priority(self) -> None:
+        request = GenerationRequest(
+            freeform_character="girl",
+            model_key="animagine",
+            rating="safe",
+            width=640,
+            height=896,
+            explicit_generation_fields=frozenset({"width", "height"}),
+        )
+
+        self.assertEqual((640, 896), self._final_workflow_size(request))
+
+    def test_qwen_remains_outside_generation_api_profiles(self) -> None:
+        with self.assertRaisesRegex(ValueError, "対応していません"):
+            _build_request(
+                {
+                    "freeform_character": "girl",
+                    "model_key": "qwen",
+                    "size": "portrait",
+                }
+            )
 
     def test_overnight_count_one_child_preserves_parent_auto(self) -> None:
         request = _build_overnight_child_request(

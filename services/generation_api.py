@@ -518,6 +518,7 @@ def _build_request(
         multi_person_framing=multi_person_framing,
         width=size_spec.width,
         height=size_spec.height,
+        explicit_generation_fields=frozenset({"width", "height"}),
         count=count,
         variation=variation,
         variation_offset=variation_offset,
