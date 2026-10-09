@@ -11,7 +11,7 @@ import subprocess
 import threading
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Sequence
@@ -71,6 +71,14 @@ from services.pose_reference import (
 )
 from services.weather import JST
 from services.runtime_paths import PROJECT_ROOT, project_path, resolve_project_path
+from services.qwen_workflow_adapter import (
+    QWEN_MODEL_COMPONENTS,
+    QWEN_WORKFLOW_FILE,
+    QwenWorkflowError,
+    load_qwen_workflow,
+    patch_qwen_workflow,
+    validate_qwen_runtime_nodes,
+)
 
 
 logger = logging.getLogger("secretary-bot.sd_control")
@@ -182,6 +190,9 @@ class SdGenerationOptions:
     negative_prompt: str | None = None
     model_key: str | None = None
     model_family: str | None = None
+    engine: str = "sdxl_tag"
+    workflow_key: str | None = None
+    model_components: dict[str, str] | None = None
     filename_prefix: str | None = None
     model_selection_explicit: bool = False
     preserve_prompt_text: bool = False
@@ -191,6 +202,7 @@ class SdGenerationOptions:
     steps: int = 20
     cfg: float = 7.0
     sampler: str = "Euler a"
+    scheduler: str = "normal"
     seed: int = -1
     style_key: str | None = None
     lora_strength: float | None = None
@@ -693,6 +705,9 @@ def validate_options(options: SdGenerationOptions) -> SdGenerationOptions:
         negative_prompt=negative_prompt,
         model_key=options.model_key,
         model_family=resolved_model_family,
+        engine=options.engine,
+        workflow_key=options.workflow_key,
+        model_components=(None if options.model_components is None else dict(options.model_components)),
         filename_prefix=options.filename_prefix,
         model_selection_explicit=options.model_selection_explicit,
         preserve_prompt_text=options.preserve_prompt_text,
@@ -702,6 +717,7 @@ def validate_options(options: SdGenerationOptions) -> SdGenerationOptions:
         steps=_clamp_int(options.steps, 1, max_steps),
         cfg=_clamp_float(options.cfg, 1.0, max_cfg),
         sampler=options.sampler.strip() or "Euler a",
+        scheduler=options.scheduler.strip() or "normal",
         seed=options.seed if options.seed is not None else -1,
         style_key=style_key,
         lora_strength=lora_strength,
@@ -2144,7 +2160,91 @@ def _generate_webui_images(options: SdGenerationOptions) -> list[Path]:
     return paths
 
 
+def _check_qwen_runtime_nodes() -> None:
+    try:
+        response = requests.get(_api_url("/object_info"), timeout=20)
+        response.raise_for_status()
+        object_info = response.json()
+        validate_qwen_runtime_nodes(object_info)
+    except QwenWorkflowError:
+        raise
+    except (requests.RequestException, ValueError) as exc:
+        raise RuntimeError("Qwen用ComfyUI nodeの確認に失敗しました。生成は開始していません。") from exc
+
+
+def _generate_qwen_images_with_metadata(options: SdGenerationOptions) -> list[GeneratedImage]:
+    if options.count != 1:
+        raise RuntimeError("Qwen-Image 2.1ではcountは1だけ指定できます。")
+    if options.loras or options.reference_image_bytes is not None or options.pose_reference_bytes is not None:
+        raise RuntimeError("Qwen-Image 2.1ではLoRA / Reference / Poseは未対応です。")
+    _check_qwen_runtime_nodes()
+    workflow, workflow_file = load_qwen_workflow(QWEN_WORKFLOW_FILE)
+    workflow_hash = _safe_workflow_file_hash(workflow_file)
+    requested_seed = options.seed if isinstance(options.seed, int) and options.seed >= 0 else random.randint(0, 2**32 - 1)
+    patched = patch_qwen_workflow(
+        workflow,
+        prompt=options.prompt,
+        width=options.width,
+        height=options.height,
+        seed=requested_seed,
+        steps=options.steps,
+        cfg=options.cfg,
+        sampler=options.sampler,
+        scheduler=options.scheduler,
+        output_prefix=options.filename_prefix or "Qwen21",
+        components=options.model_components or QWEN_MODEL_COMPONENTS,
+    )
+    seed_node_id, seed_key = _find_seed_input(patched)
+    sampler_node_id = _find_sampler_node(patched)
+    steps, cfg, sampler_name, scheduler = _extract_sampler_settings(patched, sampler_node_id)
+    width, height = _extract_latent_dimensions(patched)
+    client_id = str(uuid.uuid4())
+    prompt_id = _queue_comfy_prompt_with_logging(patched, client_id)
+    history = _wait_comfy_history(prompt_id)
+    gallery_metadata = None
+    if options.gallery_metadata is not None:
+        gallery_metadata = dict(options.gallery_metadata)
+        if not gallery_metadata.get("workflow_hash"):
+            gallery_metadata["workflow_hash"] = workflow_hash
+        if not gallery_metadata.get("workflow"):
+            gallery_metadata["workflow"] = options.workflow_key or workflow_file.stem
+    download_options = options
+    if gallery_metadata is not None:
+        download_options = replace(options, gallery_metadata=gallery_metadata)
+    paths = _download_comfy_images(
+        history,
+        1,
+        gallery_output_root=download_options.gallery_output_root,
+        gallery_metadata=download_options.gallery_metadata,
+        prompt_id=prompt_id,
+        actual_seed=requested_seed,
+    )
+    actual_seed = requested_seed
+    if seed_node_id and seed_key:
+        raw_seed = _node_inputs(patched, seed_node_id).get(seed_key)
+        actual_seed = raw_seed if isinstance(raw_seed, int) else requested_seed
+    return [
+        GeneratedImage(
+            path=path,
+            batch_index=1,
+            seed=actual_seed,
+            checkpoint_name=None,
+            sampler_name=sampler_name,
+            scheduler=scheduler,
+            steps=steps,
+            cfg=cfg,
+            width=width,
+            height=height,
+            workflow_file=str(workflow_file),
+            workflow_hash=workflow_hash,
+        )
+        for path in paths
+    ]
+
+
 def _generate_comfy_images_with_metadata(options: SdGenerationOptions) -> list[GeneratedImage]:
+    if options.engine == "qwen_image":
+        return _generate_qwen_images_with_metadata(options)
     reference_enabled = options.reference_image_bytes is not None
     pose_enabled = options.pose_reference_bytes is not None
     loras = effective_lora_selections(options)
@@ -2312,6 +2412,8 @@ def generate_images_with_metadata(options: SdGenerationOptions) -> list[Generate
     safe_options = validate_options(options)
     try:
         backend = _backend()
+        if safe_options.engine == "qwen_image" and backend != "comfy":
+            raise RuntimeError("Qwen-Image 2.1はComfyUIバックエンドでのみ利用できます。")
         if backend != "comfy" and safe_options.model_key is not None and safe_options.model_selection_explicit:
             raise RuntimeError("モデルを明示選択できるのはComfyUIバックエンドだけです。SD_BACKEND=comfyを指定してください。")
         if backend != "comfy" and safe_options.reference_image_bytes is not None:

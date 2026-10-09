@@ -60,8 +60,10 @@ from services.multi_person_framing import (
     validate_multi_person_framing,
 )
 from services.image_generation_profiles import (
-    IMAGE_GENERATION_PROFILES,
+    QWEN_IMAGE_ENGINE,
+    enabled_image_generation_profiles,
     get_image_generation_profile,
+    is_image_generation_profile_enabled,
 )
 from services.lora_catalog import COMFY_STYLES, model_family_compatible
 from services.lora_training import LORA_TYPES, normalize_lora_type
@@ -476,6 +478,8 @@ def _build_request(
         profile = get_image_generation_profile(model_key.strip())
     except ValueError as exc:
         raise GenerationApiError("指定されたモデルには対応していません。") from exc
+    if not is_image_generation_profile_enabled(profile):
+        raise GenerationApiError(f"{profile.display_name}は現在無効です。")
 
     rating = payload.get("rating", "auto")
     if not isinstance(rating, str) or rating.casefold() not in PROMPT_RATING_CHOICES:
@@ -484,11 +488,15 @@ def _build_request(
     if not profile.is_adult and rating not in {"auto", "safe"}:
         raise GenerationApiError("このratingはAdultモデルでのみ使用できます。")
 
-    size = payload.get("size", "square")
-    if not isinstance(size, str) or size.casefold() not in IMAGE_SIZE_SPECS:
+    size = payload.get("size", profile.default_size)
+    if not isinstance(size, str) or size.casefold() not in profile.supported_sizes:
         raise GenerationApiError("指定されたsizeには対応していません。")
     size = size.casefold()
-    size_spec = IMAGE_SIZE_SPECS[size]
+    base_size_spec = IMAGE_SIZE_SPECS[size]
+    if size == profile.default_size and profile.width and profile.height:
+        size_spec = replace(base_size_spec, width=profile.width, height=profile.height)
+    else:
+        size_spec = base_size_spec
 
     try:
         multi_person_framing = validate_multi_person_framing(payload.get("multi_person_framing", "auto"))
@@ -498,6 +506,16 @@ def _build_request(
     count = _parse_count(payload.get("count", 1))
     variation = _parse_variation(payload.get("variation"), count=count)
     variation_offset = _parse_variation_offset(payload.get("variation_offset"), count=count)
+    if not profile.supports_bulk and count != 1:
+        raise GenerationApiError(f"{profile.display_name}では複数枚生成は未対応です。")
+    if not profile.supports_lora and payload.get("loras"):
+        raise GenerationApiError(f"{profile.display_name}ではLoRAは未対応です。")
+    if not profile.supports_reference and (
+        payload.get("reference_image_id") or str(payload.get("reference_mode") or "none").casefold() != "none"
+    ):
+        raise GenerationApiError(f"{profile.display_name}ではReference / Poseは未対応です。")
+    if profile.engine == QWEN_IMAGE_ENGINE and variation != VARIATION_OFF:
+        raise GenerationApiError(f"{profile.display_name}ではvariationは未対応です。")
     reference = _parse_reference(payload, reference_upload_bytes=reference_upload_bytes)
 
     loras = _parse_loras(payload.get("loras"), model_family=profile.model_family)
@@ -519,6 +537,9 @@ def _build_request(
         width=size_spec.width,
         height=size_spec.height,
         explicit_generation_fields=frozenset({"width", "height"}),
+        steps=int(profile.default_steps if profile.default_steps is not None else 20),
+        cfg=float(profile.default_cfg if profile.default_cfg is not None else 7.0),
+        sampler=str(profile.default_sampler or "Euler a"),
         count=count,
         variation=variation,
         variation_offset=variation_offset,
@@ -628,6 +649,16 @@ def _build_gallery_metadata(
         "requested_variation": request.variation,
         "variation_offset": request.variation_offset,
         "model": str(options.model_key or request.model_key),
+        "engine": str(getattr(options, "engine", "sdxl_tag") or "sdxl_tag"),
+        "workflow": str(getattr(options, "workflow_key", "") or ""),
+        "workflow_hash": str(getattr(options, "workflow_hash", "") or ""),
+        "width": int(getattr(options, "width", request.width)),
+        "height": int(getattr(options, "height", request.height)),
+        "steps": int(getattr(options, "steps", request.steps)),
+        "sampler": str(getattr(options, "sampler", request.sampler) or ""),
+        "scheduler": str(getattr(options, "scheduler", "normal") or ""),
+        "cfg": float(getattr(options, "cfg", request.cfg)),
+        "model_components": dict(getattr(options, "model_components", {}) or {}),
         "rating": request.rating,
         "positive": options.prompt,
         "prompt": options.prompt,
@@ -841,8 +872,17 @@ class GenerationApi:
                 "display_name": profile.display_name,
                 "adult": profile.is_adult,
                 "model_family": profile.model_family,
+                "engine": profile.engine,
+                "supported_sizes": list(profile.supported_sizes),
+                "capabilities": {
+                    "lora": profile.supports_lora,
+                    "reference": profile.supports_reference,
+                    "pose": profile.supports_pose,
+                    "bulk": profile.supports_bulk,
+                    "overnight": profile.supports_overnight,
+                },
             }
-            for profile in IMAGE_GENERATION_PROFILES.values()
+            for profile in enabled_image_generation_profiles()
         ]
         lora_catalog: dict[str, list[dict[str, object]]] = {lora_type: [] for lora_type in LORA_TYPES}
         for key, style in sorted(COMFY_STYLES.items(), key=lambda item: item[1].display_name.casefold()):
@@ -871,6 +911,26 @@ class GenerationApi:
                     {"key": spec.key, "label": spec.label, "width": spec.width, "height": spec.height}
                     for spec in IMAGE_SIZE_SPECS.values()
                 ],
+                "model_sizes": {
+                    profile.model_key: [
+                        {
+                            "key": size_key,
+                            "label": IMAGE_SIZE_SPECS[size_key].label,
+                            "width": (
+                                profile.width
+                                if size_key == profile.default_size and profile.width
+                                else IMAGE_SIZE_SPECS[size_key].width
+                            ),
+                            "height": (
+                                profile.height
+                                if size_key == profile.default_size and profile.height
+                                else IMAGE_SIZE_SPECS[size_key].height
+                            ),
+                        }
+                        for size_key in profile.supported_sizes
+                    ]
+                    for profile in enabled_image_generation_profiles()
+                },
                 "multi_person_framing": [
                     {"key": key, "label": MULTI_PERSON_FRAMING_LABELS[key]}
                     for key in MULTI_PERSON_FRAMING_CHOICES
@@ -1131,6 +1191,12 @@ class GenerationApi:
                 raise GenerationApiError("JSON bodyが不正です。") from exc
             if not isinstance(payload, dict):
                 raise GenerationApiError("JSON objectを指定してください。")
+            try:
+                batch_profile = get_image_generation_profile(str(payload.get("model_key", "animagine")))
+            except ValueError:
+                batch_profile = None
+            if batch_profile is not None and not batch_profile.supports_bulk:
+                raise GenerationApiError(f"{batch_profile.display_name}ではBulkは未対応です。")
             raw_total = payload.get("total_count")
             if isinstance(raw_total, bool) or not isinstance(raw_total, int) or raw_total not in ALLOWED_BULK_GENERATION_COUNTS:
                 raise GenerationApiError("大量生成は16、24、32枚だけ指定できます。")
@@ -1266,6 +1332,12 @@ class GenerationApi:
             payload = await request.json(loads=json.loads)
             if not isinstance(payload, dict):
                 raise GenerationApiError("JSON objectを指定してください。")
+            try:
+                overnight_profile = get_image_generation_profile(str(payload.get("model_key", "animagine")))
+            except ValueError:
+                overnight_profile = None
+            if overnight_profile is not None and not overnight_profile.supports_overnight:
+                raise GenerationApiError(f"{overnight_profile.display_name}ではOvernightは未対応です。")
             total_count = payload.get("total_count")
             if isinstance(total_count, bool) or not isinstance(total_count, int) or total_count not in OVERNIGHT_TOTALS:
                 raise GenerationApiError("夜間生成は128、256、512枚だけ指定できます。")

@@ -183,6 +183,8 @@ def load_shogou_instruction(model_key: str = DEFAULT_IMAGE_GENERATION_MODEL_KEY)
         profile = get_image_generation_profile(model_key)
     except ValueError as exc:
         raise PromptGeneratorError(str(exc)) from exc
+    if profile.prompt_designer_instruction is None:
+        raise PromptGeneratorError("このモデルにはAnimagine/JANKU Prompt Designerを使用できません。")
     instruction_file = _resolve_prompt_instruction_path(profile.prompt_designer_instruction)
     if not instruction_file.exists():
         raise PromptGeneratorError(f"{instruction_file} が見つかりません。")

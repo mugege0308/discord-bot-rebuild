@@ -21,7 +21,10 @@ from services.danbooru_tag_resolver import DanbooruTagResolution
 from services.generation_variation import MAX_GENERATION_COUNT
 from services.image_generation_profiles import (
     DEFAULT_IMAGE_GENERATION_MODEL_KEY,
+    QWEN_IMAGE_ENGINE,
     get_image_generation_profile,
+    is_image_generation_profile_enabled,
+    profile_model_components,
 )
 from services.multi_person_framing import (
     MULTI_PERSON_FRAMING_TAGS,
@@ -47,6 +50,7 @@ from services.prompt_conflict_resolver import (
     merge_prompt_framing_semantics,
     resolve_prompt_tag_conflicts,
 )
+from services.qwen_image_prompt import build_qwen_prompt
 from services.sd_control import (
     GeneratedImage,
     LoraSelection,
@@ -620,6 +624,10 @@ class GenerationService:
         request.validate()
         profile = get_image_generation_profile(request.model_key.strip())
         validate_requested_prompt_rating(request.rating, is_adult=profile.is_adult)
+        if profile.engine == QWEN_IMAGE_ENGINE:
+            if not is_image_generation_profile_enabled(profile):
+                raise PromptGeneratorError("Qwen-Image 2.1は現在無効です。")
+            return self._resolve_qwen_request(request)
         resolver = prompt_resolver or self._prompt_resolver or generate_shogou_prompt_result
         resolver_kwargs: dict[str, Any] = {
             "enable_generic_danbooru": request.enable_generic_danbooru,
@@ -637,6 +645,100 @@ class GenerationService:
         if not isinstance(prompt_result, ShogouPromptResult):
             raise PromptGeneratorError("Prompt Designerの結果が不正です。")
         return self._merge_resolved_prompt(request, prompt_result)
+
+    @staticmethod
+    def _resolve_qwen_request(request: GenerationRequest) -> ResolvedGeneration:
+        prompt = build_qwen_prompt(request)
+        result = ShogouPromptResult(positive=prompt, negative="", summary=prompt)
+        provenance = tuple(
+            TagProvenance(tag, "user_request")
+            for tag in (*request.explicit_tags, request.request_text or "")
+            if _normalise_text(tag)
+        )
+        return ResolvedGeneration(
+            request=request,
+            prompt_result=result,
+            provenance=provenance,
+        )
+
+    def _prepare_qwen_generation(
+        self,
+        request: GenerationRequest,
+        profile: Any,
+        *,
+        resolved: ResolvedGeneration | None,
+        prompt_result: ShogouPromptResult | None,
+        positive_override: str | None,
+        gallery_output_root: Path | None,
+        gallery_metadata: Mapping[str, Any] | None,
+    ) -> PreparedGeneration:
+        if request.count != 1:
+            raise PromptGeneratorError("Qwen-Image 2.1ではcountは1だけ指定できます。")
+        if request.variation != "off":
+            raise PromptGeneratorError("Qwen-Image 2.1ではvariationは未対応です。")
+        if request.loras:
+            raise PromptGeneratorError("Qwen-Image 2.1ではLoRAは未対応です。")
+        if request.reference or request.pose:
+            raise PromptGeneratorError("Qwen-Image 2.1ではReference / Poseは未対応です。")
+
+        resolved = resolved or self._resolve_qwen_request(request)
+        if positive_override is not None:
+            positive = positive_override
+        elif prompt_result is not None:
+            positive = prompt_result.positive
+        else:
+            positive = resolved.prompt_result.positive
+        positive = _normalise_text(positive)
+        if not positive:
+            raise PromptGeneratorError("Qwen-Image用の自然文promptを指定してください。")
+
+        prepared_result = ShogouPromptResult(
+            positive=positive,
+            negative="",
+            summary=positive,
+            user_grounded_tags=(positive,),
+        )
+        prepared_resolved = replace(
+            resolved,
+            prompt_result=prepared_result,
+            provenance=(TagProvenance(positive, "user_request"),),
+            explicit_tags=(),
+            appearance_tags=(),
+        )
+        steps = int(profile.default_steps if profile.default_steps is not None else request.steps)
+        cfg = float(profile.default_cfg if profile.default_cfg is not None else request.cfg)
+        sampler = str(profile.default_sampler or request.sampler)
+        scheduler = str(profile.default_scheduler or "simple")
+        options = SdGenerationOptions(
+            prompt=positive,
+            negative_prompt="",
+            model_key=profile.model_key,
+            model_family=profile.model_family,
+            engine=profile.engine,
+            workflow_key=profile.workflow_key,
+            model_components=profile_model_components(profile),
+            filename_prefix=profile.filename_prefix,
+            model_selection_explicit=request.model_selection_explicit,
+            preserve_prompt_text=True,
+            count=1,
+            width=request.width,
+            height=request.height,
+            steps=steps,
+            cfg=cfg,
+            sampler=sampler,
+            scheduler=scheduler,
+            seed=request.seed,
+            loras=(),
+            gallery_output_root=gallery_output_root,
+            gallery_metadata=(None if gallery_metadata is None else dict(gallery_metadata)),
+            explicit_generation_fields=frozenset({"width", "height", "steps", "cfg", "sampler"}),
+        )
+        return PreparedGeneration(
+            request=request,
+            resolved=prepared_resolved,
+            options=options,
+            requested_seed=request.seed,
+        )
 
     def prepare_generation(
         self,
@@ -657,6 +759,18 @@ class GenerationService:
         )
         profile = get_image_generation_profile(request.model_key.strip())
         validate_requested_prompt_rating(request.rating, is_adult=profile.is_adult)
+        if profile.engine == QWEN_IMAGE_ENGINE:
+            if not is_image_generation_profile_enabled(profile):
+                raise PromptGeneratorError("Qwen-Image 2.1は現在無効です。")
+            return self._prepare_qwen_generation(
+                request,
+                profile,
+                resolved=resolved,
+                prompt_result=prompt_result,
+                positive_override=positive_override,
+                gallery_output_root=gallery_output_root,
+                gallery_metadata=gallery_metadata,
+            )
         if resolved is None:
             if prompt_result is not None:
                 resolved = self._merge_resolved_prompt(request, prompt_result)
@@ -863,6 +977,9 @@ class GenerationService:
             negative_prompt=str(negative),
             model_key=profile.model_key,
             model_family=profile.model_family,
+            engine=profile.engine,
+            workflow_key=profile.workflow_key,
+            model_components=profile_model_components(profile),
             filename_prefix=profile.filename_prefix,
             model_selection_explicit=request.model_selection_explicit,
             preserve_prompt_text=request.preserve_prompt_text,
