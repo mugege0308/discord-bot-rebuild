@@ -162,6 +162,19 @@ class ImageGenerationPanel(_ImageGenerationView):
     ) -> None:
         super().__init__(owner_id, bot_mention)
         self.state = state or ImageGenerationPanelState.from_user(owner_id)
+        try:
+            prompt_commands.sanitize_panel_state_for_model(self.state)
+        except ValueError:
+            self.state.model_key = prompt_commands.DEFAULT_IMAGE_GENERATION_MODEL_KEY
+            prompt_commands.sanitize_panel_state_for_model(self.state)
+        profile = get_image_generation_profile(self.state.model_key)
+        for child in self.children:
+            if not isinstance(child, discord.ui.Button):
+                continue
+            if child.label and "LoRA" in child.label:
+                child.disabled = not profile.supports_lora
+            elif child.label and "参照画像" in child.label:
+                child.disabled = not profile.supports_reference
 
     def render(self) -> str:
         state = self.state
@@ -219,6 +232,11 @@ class ImageGenerationPanel(_ImageGenerationView):
                 lora_text,
                 f"Reference: {reference_text}",
                 f"Input: {input_mode_text} / Seed: {seed_text}",
+                (
+                    "Qwenは自然文・512×512・1枚生成（LoRA/参照/ポーズ/Variationなし）"
+                    if not profile.supports_lora
+                    else ""
+                ),
             ]
         )
 
@@ -267,7 +285,7 @@ class ImageGenerationPanel(_ImageGenerationView):
             self.state,
             title="サイズを選択",
             setting_name="size_key",
-            options=prompt_commands.GENERATE_AI_SIZE_CHOICES,
+            options=prompt_commands.get_model_size_choices(self.state.model_key),
         )
         await _edit_picker_panel(interaction, view, "画像サイズを選んでね。")
 
@@ -441,6 +459,12 @@ class _PanelChoiceSelect(discord.ui.Select):
             await interaction.response.send_message("このパネルは呼び出した本人用だよ。", ephemeral=True)
             return
         setattr(self.state, self.setting_name, self.values[0])
+        if self.setting_name == "model_key":
+            try:
+                prompt_commands.sanitize_panel_state_for_model(self.state)
+            except ValueError as exc:
+                await interaction.response.send_message(str(exc), ephemeral=True)
+                return
         if self.setting_name == "reference_mode" and self.values[0] == prompt_commands.REFERENCE_MODE_NONE:
             self.state.use_last_reference = False
             self.state.reference_strength = None
@@ -495,6 +519,8 @@ class LoraSlotSelect(discord.ui.Select):
         for display_name, key in prompt_commands.get_comfy_lora_choice_specs(lora_type):
             options.append(discord.SelectOption(label=str(display_name)[:100], value=str(key)))
         super().__init__(placeholder=label, min_values=1, max_values=1, options=options)
+        if not prompt_commands.model_supports(state.model_key, "lora"):
+            self.disabled = True
 
     async def callback(self, interaction: discord.Interaction) -> None:
         if interaction.user.id != self.owner_id:
@@ -536,6 +562,10 @@ class LoraPanel(_ImageGenerationView):
                     label=label,
                 )
             )
+
+        if not prompt_commands.model_supports(state.model_key, "lora"):
+            for child in self.children:
+                child.disabled = True
 
     @discord.ui.button(label="強度を設定", style=discord.ButtonStyle.primary)
     async def strength_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -640,8 +670,14 @@ class ReferencePanel(_ImageGenerationView):
     def __init__(self, owner_id: int, bot_mention: str, state: ImageGenerationPanelState) -> None:
         super().__init__(owner_id, bot_mention, timeout=PANEL_TIMEOUT_SECONDS)
         self.state = state
+        self._reference_supported = prompt_commands.model_supports(state.model_key, "reference")
+        if not self._reference_supported:
+            for child in self.children:
+                child.disabled = True
 
     def render(self) -> str:
+        if not self._reference_supported:
+            return "🖼️ 参考画像\nこのモデルでは参考画像を利用できません。"
         available = prompt_commands.has_last_reference_image(self.owner_id)
         availability = "利用可能" if available else "未保存"
         return (
@@ -655,6 +691,9 @@ class ReferencePanel(_ImageGenerationView):
         )
 
     async def _set_reference_mode(self, interaction: discord.Interaction, mode: str) -> None:
+        if not self._reference_supported:
+            await interaction.response.send_message("このモデルでは参考画像を利用できません。", ephemeral=True)
+            return
         if interaction.user.id != self.owner_id:
             await interaction.response.send_message("このパネルは呼び出した本人用だよ。", ephemeral=True)
             return
@@ -825,6 +864,10 @@ class AdvancedPanel(_ImageGenerationView):
                 placeholder="入力方式",
             )
         )
+        if not prompt_commands.model_supports(state.model_key, "bulk"):
+            for child in self.children:
+                if isinstance(child, discord.ui.Button) and child.label in {"Selection AI切替", "候補枚数"}:
+                    child.disabled = True
 
     def render(self) -> str:
         input_mode = _choice_name(prompt_commands.GENERATE_AI_INPUT_MODE_CHOICES, self.state.input_mode)

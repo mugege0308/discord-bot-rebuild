@@ -187,17 +187,24 @@ class GenerateAiWiringTestCase(unittest.TestCase):
             and decorator.func.attr == "choices"
         )
         model_list = next(keyword.value for keyword in choices_decorator.keywords if keyword.arg == "model")
-        pairs = []
-        for choice_call in model_list.elts:
-            values = {keyword.arg: keyword.value.value for keyword in choice_call.keywords}
-            pairs.append((values["name"], values["value"]))
-        self.assertEqual(
-            pairs,
-            [
-                ("JANKU v7.77", "janku"),
-                ("Animagine XL 4.0 Clear", "animagine"),
-            ],
-        )
+        if isinstance(model_list, ast.List):
+            pairs = []
+            for choice_call in model_list.elts:
+                values = {keyword.arg: keyword.value.value for keyword in choice_call.keywords}
+                pairs.append((values["name"], values["value"]))
+            self.assertEqual(
+                pairs,
+                [
+                    ("JANKU v7.77", "janku"),
+                    ("Animagine XL 4.0 Clear", "animagine"),
+                ],
+            )
+        else:
+            self.assertIsInstance(model_list, ast.ListComp)
+            self.assertEqual(
+                [constant.value for constant in model_list.generators[0].iter.elts],
+                ["janku", "animagine", "qwen_image_2_1"],
+            )
         defaults = dict(zip((arg.arg for arg in function.args.args[-len(function.args.defaults):]), function.args.defaults))
         self.assertIsNone(defaults["model"].value)
 

@@ -60,7 +60,10 @@ from services.image_composition import (
 )
 from services.image_generation_profiles import (
     DEFAULT_IMAGE_GENERATION_MODEL_KEY,
+    QWEN_IMAGE_ENGINE,
+    enabled_image_generation_profiles,
     get_image_generation_profile,
+    is_image_generation_profile_enabled,
 )
 from services.generation_service import GenerationRequest, GenerationService
 from services.gallery_control import get_gallery_images_root
@@ -112,12 +115,24 @@ REFERENCE_MODE_POSE = "pose"
 REFERENCE_REQUIRED_MESSAGE = "構図参照には参考画像を添付するか、直前の画像を再利用してください。"
 POSE_REFERENCE_REQUIRED_MESSAGE = "ポーズ参照にはポーズ画像を添付するか、直前の画像を再利用してください。"
 GENERATE_AI_DEFAULT_SELECTION_AI = True
-GENERATE_AI_MODEL_CHOICES = [
-    app_commands.Choice(name="Animagine XL 4.0 Clear", value="animagine"),
-    app_commands.Choice(name="Animagine XL 4.0 Clear Adult", value="animagine_adult"),
-    app_commands.Choice(name="JANKU v7.77", value="janku"),
-    app_commands.Choice(name="JANKU v7.77 Adult", value="janku_adult"),
-]
+
+
+def _build_generate_ai_model_choices() -> list[app_commands.Choice[str]]:
+    """Build Discord choices from the same enabled profile catalog as the API.
+
+    The catalog is evaluated after ``main.py`` loads the deployment .env, so
+    Qwen is exposed only when ``ENABLE_QWEN_IMAGE_2_1`` is enabled.  Keeping
+    the feature flag at this boundary also means a disabled Qwen profile never
+    reaches Discord's autocomplete or request resolver.
+    """
+
+    return [
+        app_commands.Choice(name=profile.display_name, value=profile.model_key)
+        for profile in enabled_image_generation_profiles()
+    ]
+
+
+GENERATE_AI_MODEL_CHOICES = _build_generate_ai_model_choices()
 GENERATE_AI_PROMPT_RATING_CHOICES = [
     app_commands.Choice(name="Auto", value=PROMPT_RATING_AUTO),
     app_commands.Choice(name="Safe", value="safe"),
@@ -336,6 +351,83 @@ def _default_generate_ai_panel_settings(*, model_key: str | None = None) -> Reso
     )
 
 
+def get_model_size_choices(model_key: str | None = None) -> list[app_commands.Choice[str]]:
+    """Return only sizes supported by the selected model profile."""
+
+    profile = get_image_generation_profile(model_key)
+    allowed = set(profile.supported_sizes)
+    return [
+        choice
+        for choice in GENERATE_AI_SIZE_CHOICES
+        if choice.value in allowed
+    ]
+
+
+def model_supports(model_key: str | None, capability: str) -> bool:
+    """Read a capability without making UI code depend on profile fields."""
+
+    profile = get_image_generation_profile(model_key)
+    return bool(getattr(profile, f"supports_{capability}", False))
+
+
+def sanitize_panel_state_for_model(state: object) -> object:
+    """Normalize an interactive panel after a model switch.
+
+    The view uses this helper only for presentation; the resolver performs
+    the same sanitization again immediately before sending a request.
+    """
+
+    model_key = getattr(state, "model_key", DEFAULT_IMAGE_GENERATION_MODEL_KEY)
+    profile = get_image_generation_profile(model_key)
+    if not is_image_generation_profile_enabled(profile):
+        raise ValueError(f"{profile.display_name}は現在利用できません。")
+    if not profile.supports_lora:
+        for name in (
+            "style_key", "character_lora_key", "additional_lora_key",
+            "style_strength", "character_lora_strength", "additional_lora_strength",
+        ):
+            if hasattr(state, name):
+                setattr(state, name, None)
+    if not profile.supports_reference:
+        for name, value in (
+            ("reference_mode", REFERENCE_MODE_NONE),
+            ("use_last_reference", False),
+            ("saved_reference_id", None),
+            ("reference_strength", None),
+        ):
+            if hasattr(state, name):
+                setattr(state, name, value)
+    if profile.supported_sizes and getattr(state, "size_key", None) not in profile.supported_sizes:
+        setattr(state, "size_key", profile.default_size)
+    if not profile.supports_bulk:
+        if hasattr(state, "selection_ai"):
+            state.selection_ai = False
+        if hasattr(state, "candidate_count"):
+            state.candidate_count = 1
+    return state
+
+
+def _sanitize_resolved_model_settings(settings: ResolvedGenerateAiSettings) -> ResolvedGenerateAiSettings:
+    """Apply profile capabilities to every caller, including stale panel state."""
+
+    profile = get_image_generation_profile(settings.model_key)
+    if not is_image_generation_profile_enabled(profile):
+        raise ValueError(f"{profile.display_name}は現在利用できません。")
+
+    updates: dict[str, object] = {}
+    if not profile.supports_lora:
+        updates.update(style_key=None, lora_strength=None, loras=())
+    if not profile.supports_reference:
+        updates.update(reference_mode=REFERENCE_MODE_NONE, reference_strength=None, use_last_reference=False)
+    if profile.supported_sizes and settings.size_key not in profile.supported_sizes:
+        updates["size_key"] = profile.default_size
+    if not profile.supports_bulk:
+        # The panel's candidate count is the single-generation/selection
+        # count.  Qwen's single-image contract must win over inherited state.
+        updates.update(selection_ai=False, candidate_count=1)
+    return replace(settings, **updates) if updates else settings
+
+
 def _optional_lora_choice_value(choice: app_commands.Choice[str] | None) -> str | None:
     if choice is None or choice.value == GENERATE_AI_NO_LORA_VALUE:
         return None
@@ -396,6 +488,8 @@ def _resolve_generate_ai_settings(
         model_key = DEFAULT_IMAGE_GENERATION_MODEL_KEY
         sources["model"] = "default"
     profile = get_image_generation_profile(model_key)
+    if not is_image_generation_profile_enabled(profile):
+        raise ValueError(f"{profile.display_name}は現在利用できません。")
 
     previous = None
     if inherit_previous:
@@ -573,18 +667,23 @@ def _resolve_generate_ai_settings(
         sources["additional_lora_strength"] = "default"
 
     model_family = profile.model_family
-    loras = resolve_lora_selections(
-        character_key=character_key,
-        character_strength=character_strength,
-        style_key=style_key,
-        style_strength=style_strength,
-        additional_key=additional_key,
-        additional_strength=additional_strength,
-        model_family=model_family,
-    )
+    if profile.supports_lora:
+        loras = resolve_lora_selections(
+            character_key=character_key,
+            character_strength=character_strength,
+            style_key=style_key,
+            style_strength=style_strength,
+            additional_key=additional_key,
+            additional_strength=additional_strength,
+            model_family=model_family,
+        )
+    else:
+        # Unsupported stale/explicit SDXL LoRA values are discarded before
+        # catalog resolution, so they cannot raise or reach a Qwen request.
+        loras = ()
     style_selection = next((item for item in loras if item.lora_type == "style"), None)
 
-    return ResolvedGenerateAiSettings(
+    return _sanitize_resolved_model_settings(ResolvedGenerateAiSettings(
         model_key=profile.model_key,
         style_key=None if style_selection is None else style_selection.key,
         lora_strength=None if style_selection is None else style_selection.strength,
@@ -600,7 +699,7 @@ def _resolve_generate_ai_settings(
         reference_mode=resolved_reference_mode,
         use_last_reference=False,
         input_mode=resolved_input_mode,
-    )
+    ))
 
 
 def get_generate_ai_panel_defaults(
@@ -664,9 +763,29 @@ async def run_generate_ai_from_panel(
         raise ValueError("保存済み参考画像IDの指定が不正です。")
 
     resolved_model = _panel_choice_value(GENERATE_AI_MODEL_CHOICES, model_key, "Model")
+    profile = get_image_generation_profile(resolved_model)
+    if not is_image_generation_profile_enabled(profile):
+        raise ValueError(f"{profile.display_name}は現在利用できません。")
+    if not profile.supports_lora:
+        style_key = None
+        style_strength = None
+        character_lora_key = None
+        character_lora_strength = None
+        additional_lora_key = None
+        additional_lora_strength = None
+    if not profile.supports_reference:
+        reference_mode = REFERENCE_MODE_NONE
+        use_last_reference = False
+        reference_strength = None
+        saved_reference_id = None
+    if not profile.supports_bulk:
+        selection_ai = False
+        candidate_count = 1
     resolved_input_mode = _panel_choice_value(GENERATE_AI_INPUT_MODE_CHOICES, input_mode, "入力方式")
     resolved_rating = _panel_choice_value(GENERATE_AI_PROMPT_RATING_CHOICES, rating, "Rating")
     resolved_size = _panel_choice_value(GENERATE_AI_SIZE_CHOICES, size_key, "サイズ")
+    if resolved_size not in profile.supported_sizes:
+        resolved_size = profile.default_size
     resolved_composition = _panel_choice_value(
         GENERATE_AI_COMPOSITION_CHOICES,
         composition_preset,
@@ -1168,9 +1287,11 @@ def _build_generation_options(
     gallery_output_root: Path | None = None,
     gallery_metadata: dict[str, object] | None = None,
 ) -> SdGenerationOptions:
+    profile = get_image_generation_profile(model_key) if model_key else None
+    is_qwen = profile is not None and profile.engine == QWEN_IMAGE_ENGINE
     selection_available = selection_enabled and is_image_selection_available()
     has_reference_image = reference_image_bytes is not None or pose_reference_bytes is not None
-    if has_reference_image or not selection_available:
+    if is_qwen or has_reference_image or not selection_available:
         count = 1
     else:
         count = selection_generate_count or get_selection_generate_count()
@@ -1183,20 +1304,64 @@ def _build_generation_options(
         selection_generate_count,
         has_reference_image,
     )
+    if is_qwen:
+        # Qwen is a natural-language, single-image profile.  Do not allow
+        # stale SDXL controls to leak into its workflow.
+        positive_prompt = positive_prompt.strip()
+        negative_prompt = ""
+        width = profile.width or 512
+        height = profile.height or 512
+        steps = profile.default_steps or profile.steps or 8
+        cfg = profile.default_cfg if profile.default_cfg is not None else 1.0
+        sampler = profile.default_sampler or profile.sampler or "euler"
+        scheduler = profile.default_scheduler or profile.scheduler or "simple"
+        model_family = profile.model_family
+        engine = profile.engine
+        workflow_key = profile.workflow_key
+        model_components = {
+            key: value for key, value in profile.model_components
+        }
+        loras = ()
+        reference_image_bytes = None
+        reference_image_content_type = None
+        reference_strength = None
+        reference_mode = REFERENCE_MODE_NONE
+        pose_reference_bytes = None
+        pose_reference_content_type = None
+        pose_reference_width = None
+        pose_reference_height = None
+        pose_strength = None
+        style_key = None
+        lora_strength = None
+    else:
+        engine = "sdxl_tag"
+        workflow_key = None
+        model_components = None
+        width = 512
+        height = 512
+        steps = 20
+        cfg = 7.0
+        sampler = "Euler a"
+        scheduler = "normal"
+
     return SdGenerationOptions(
         prompt=positive_prompt,
         negative_prompt=negative_prompt,
         model_key=model_key,
         model_family=model_family,
+        engine=engine,
+        workflow_key=workflow_key,
+        model_components=model_components,
         filename_prefix=filename_prefix,
         model_selection_explicit=model_selection_explicit,
         preserve_prompt_text=preserve_prompt_text,
         count=count,
-        width=512,
-        height=512,
-        steps=20,
-        cfg=7.0,
-        sampler="Euler a",
+        width=width,
+        height=height,
+        steps=steps,
+        cfg=cfg,
+        sampler=sampler,
+        scheduler=scheduler,
         seed=seed,
         style_key=style_key,
         lora_strength=lora_strength,
@@ -2470,6 +2635,24 @@ def setup(client: discord.Client) -> None:
             await _send_error(interaction, str(exc), label="generate_ai.settings_invalid")
             return
 
+        profile = get_image_generation_profile(resolved_settings.model_key)
+        if not is_image_generation_profile_enabled(profile):
+            await _send_error(
+                interaction,
+                f"{profile.display_name}は現在利用できません。",
+                label="generate_ai.model_disabled",
+            )
+            return
+        if not profile.supports_reference:
+            # A stale attachment, saved reference, or previous panel mode is
+            # deliberately ignored for capability-limited models.
+            reference_id = None
+            reference_image = None
+            use_last_reference = False
+            saved_reference_id = None
+            reference_strength = None
+            reference_mode = None
+
         if saved_reference_id is not None and resolved_settings.reference_mode == REFERENCE_MODE_NONE:
             await _send_error(
                 interaction,
@@ -2615,7 +2798,6 @@ def setup(client: discord.Client) -> None:
             reference_image_bytes = None
             reference_image_content_type = None
 
-        profile = get_image_generation_profile(resolved_settings.model_key)
         if model is not None and not is_comfy_backend():
             await _send_error(
                 interaction,
@@ -2624,14 +2806,31 @@ def setup(client: discord.Client) -> None:
             )
             return
 
-        result = await _build_shogou_prompt_result(
-            interaction,
-            request,
-            label_prefix="generate_ai",
-            reference_id=reference_id,
-            model_key=profile.model_key,
-            requested_rating=resolved_settings.rating,
-        )
+        if profile.engine == QWEN_IMAGE_ENGINE:
+            natural_prompt = request.strip()
+            if not natural_prompt:
+                await _send_error(
+                    interaction,
+                    "Qwen-Imageには自然文のpromptを入力してください。",
+                    label="generate_ai.qwen_prompt_empty",
+                )
+                return
+            # Qwen intentionally bypasses the Animagine/JANKU Prompt
+            # Designer, quality tags, and SDXL negative defaults.
+            result = ShogouPromptResult(
+                positive=natural_prompt,
+                negative="",
+                summary=natural_prompt,
+            )
+        else:
+            result = await _build_shogou_prompt_result(
+                interaction,
+                request,
+                label_prefix="generate_ai",
+                reference_id=reference_id,
+                model_key=profile.model_key,
+                requested_rating=resolved_settings.rating,
+            )
         if result is None:
             return
 

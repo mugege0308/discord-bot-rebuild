@@ -87,6 +87,13 @@ from services.sd_control import (
     set_shutdown_after_done,
     start_sd_app,
 )
+from services.image_generation_profiles import (
+    QWEN_IMAGE_ENGINE,
+    enabled_image_generation_profiles,
+    get_image_generation_profile,
+    is_image_generation_profile_enabled,
+    profile_model_components,
+)
 from services.translator import translate_ja_to_en_to_ja
 from services.weather import (
     EVENING_NOTIFICATION,
@@ -803,8 +810,12 @@ async def slash_sd_status(interaction: discord.Interaction) -> None:
 @client.tree.command(name="sd_generate", description="ローカルStable Diffusion WebUIで画像生成します。")
 @app_commands.choices(
     model=[
-        app_commands.Choice(name="JANKU v7.77", value="janku"),
-        app_commands.Choice(name="Animagine XL 4.0 Clear", value="animagine"),
+        app_commands.Choice(
+            name=next(profile.display_name for profile in enabled_image_generation_profiles() if profile.model_key == model_key),
+            value=model_key,
+        )
+        for model_key in ("janku", "animagine", "qwen_image_2_1")
+        if any(profile.model_key == model_key for profile in enabled_image_generation_profiles())
     ]
 )
 @app_commands.describe(
@@ -838,6 +849,23 @@ async def slash_sd_generate(
         return
 
     await interaction.response.defer()
+    profile = get_image_generation_profile(model.value) if model is not None else None
+    if profile is not None and not is_image_generation_profile_enabled(profile):
+        await interaction.followup.send("選択したモデルは現在利用できません。")
+        return
+    qwen_selected = profile is not None and profile.engine == QWEN_IMAGE_ENGINE
+    if qwen_selected:
+        # /sd_generate is the legacy command, but it still shares the same
+        # capability contract as the modern panel.  Sanitize all SDXL-only
+        # values before queueing so stale/default arguments cannot leak into
+        # Qwen's single-image workflow.
+        count = 1
+        width = profile.width or 512
+        height = profile.height or 512
+        steps = profile.default_steps or profile.steps or 8
+        cfg = profile.default_cfg if profile.default_cfg is not None else 1.0
+        sampler = profile.default_sampler or profile.sampler or "euler"
+        negative_prompt = ""
     options = SdGenerationOptions(
         prompt=prompt,
         negative_prompt=negative_prompt or None,
@@ -849,13 +877,21 @@ async def slash_sd_generate(
         cfg=cfg,
         sampler=sampler,
         seed=seed,
+        engine=profile.engine if qwen_selected else "sdxl_tag",
+        workflow_key=profile.workflow_key if qwen_selected else None,
+        model_components=profile_model_components(profile) if qwen_selected else None,
+        filename_prefix=profile.filename_prefix if qwen_selected else None,
+        model_selection_explicit=model is not None,
     )
 
     try:
         paths = await asyncio.to_thread(generate_images, options)
     except Exception as exc:
         logger.exception("Failed to generate SD images.")
-        await interaction.followup.send(f"画像生成に失敗しました: {exc}")
+        if qwen_selected:
+            await interaction.followup.send("Qwen-Imageの生成に失敗しました。設定を確認してもう一度試してね。")
+        else:
+            await interaction.followup.send(f"画像生成に失敗しました: {exc}")
         return
 
     await _select_and_send_sd_files(interaction, paths)
