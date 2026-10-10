@@ -1,9 +1,13 @@
 import json
+import hashlib
+from io import BytesIO
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
+
+from PIL import Image
 
 from commands import prompt as prompt_commands
 from services import sd_control
@@ -20,6 +24,12 @@ def _result() -> ShogouPromptResult:
         summary="gallery test",
         assumptions=(),
     )
+
+
+def _png_bytes(width: int, height: int, color: tuple[int, int, int] = (40, 80, 120)) -> bytes:
+    buffer = BytesIO()
+    Image.new("RGB", (width, height), color).save(buffer, format="PNG")
+    return buffer.getvalue()
 
 
 class GalleryQueueLifecycleTests(unittest.IsolatedAsyncioTestCase):
@@ -120,15 +130,17 @@ class GalleryGenerationHandoffTests(unittest.IsolatedAsyncioTestCase):
 
 
 class GallerySidecarTests(unittest.TestCase):
-    def test_comfy_download_writes_local_and_authoritative_sidecars(self):
+    def test_comfy_download_imports_collision_safe_authoritative_image(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             local = root / "local"
             authoritative = root / "authoritative"
             local.mkdir()
             authoritative.mkdir()
-            (authoritative / "Comfy_00001.png").write_bytes(b"existing")
-            response = SimpleNamespace(content=b"generated", raise_for_status=lambda: None)
+            old = authoritative / "Comfy_00001.png"
+            old_bytes = _png_bytes(1024, 1024, (1, 2, 3))
+            old.write_bytes(old_bytes)
+            response = SimpleNamespace(content=_png_bytes(768, 1024), raise_for_status=lambda: None)
             history = {"outputs": {"19": {"images": [{"filename": "Comfy_00001.png", "type": "output", "subfolder": ""}]}}}
             with (
                 mock.patch.object(sd_control, "OUTPUT_DIR", local),
@@ -140,6 +152,8 @@ class GallerySidecarTests(unittest.TestCase):
                     gallery_output_root=authoritative,
                     gallery_metadata={
                         "job_id": "job-1",
+                        "width": 768,
+                        "height": 1024,
                         "reference_mode": "pose",
                         "requested_seed": -1,
                     },
@@ -148,13 +162,81 @@ class GallerySidecarTests(unittest.TestCase):
                 )
 
             self.assertEqual(1, len(paths))
-            sidecar = paths[0].with_name(paths[0].name + ".metadata.json")
+            imported = [
+                path
+                for path in authoritative.glob("*.png")
+                if path.name != old.name
+            ]
+            self.assertEqual(1, len(imported))
+            imported_path = imported[0]
+            sidecar = imported_path.with_name(imported_path.name + ".metadata.json")
             metadata = json.loads(sidecar.read_text(encoding="utf-8"))
             self.assertEqual("job-1", metadata["job_id"])
             self.assertEqual(-1, metadata["requested_seed"])
             self.assertEqual(12345, metadata["actual_seed"])
             self.assertEqual(12345, metadata["seed"])
-            self.assertTrue((authoritative / "Comfy_00001.png.metadata.json").is_file())
+            self.assertEqual(imported_path.name, metadata["gallery_filename"])
+            self.assertEqual({"width": 768, "height": 1024}, metadata["gallery_dimensions"])
+            self.assertEqual(old_bytes, old.read_bytes())
+
+    def test_dimension_mismatch_does_not_import_authoritative_image(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            local = root / "local"
+            authoritative = root / "authoritative"
+            local.mkdir()
+            authoritative.mkdir()
+            response = SimpleNamespace(content=b"not-a-png", raise_for_status=lambda: None)
+            history = {"outputs": {"19": {"images": [{"filename": "Comfy_00001.png", "type": "output", "subfolder": ""}]}}}
+            with (
+                mock.patch.object(sd_control, "OUTPUT_DIR", local),
+                mock.patch.object(sd_control.requests, "get", return_value=response),
+            ):
+                with self.assertRaises(RuntimeError):
+                    sd_control._download_comfy_images(
+                        history,
+                        1,
+                        gallery_output_root=authoritative,
+                        gallery_metadata={"job_id": "job-2", "width": 768, "height": 1024},
+                        prompt_id="prompt-2",
+                    )
+            self.assertEqual([], list(authoritative.iterdir()))
+
+    def test_retry_never_overwrites_first_import(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            local = root / "local"
+            authoritative = root / "authoritative"
+            local.mkdir()
+            authoritative.mkdir()
+            history = {"outputs": {"19": {"images": [{"filename": "Comfy_00001.png", "type": "output", "subfolder": ""}]}}}
+            responses = iter([
+                SimpleNamespace(content=b"first", raise_for_status=lambda: None),
+                SimpleNamespace(content=b"second", raise_for_status=lambda: None),
+            ])
+            with (
+                mock.patch.object(sd_control, "OUTPUT_DIR", local),
+                mock.patch.object(sd_control.requests, "get", side_effect=lambda *args, **kwargs: next(responses)),
+            ):
+                sd_control._download_comfy_images(
+                    history,
+                    1,
+                    gallery_output_root=authoritative,
+                    gallery_metadata={"job_id": "job-3"},
+                    prompt_id="prompt-3",
+                )
+                sd_control._download_comfy_images(
+                    history,
+                    1,
+                    gallery_output_root=authoritative,
+                    gallery_metadata={"job_id": "job-3"},
+                    prompt_id="prompt-3",
+                )
+            imported = sorted(authoritative.glob("*.png"))
+            self.assertEqual(2, len(imported))
+            self.assertEqual(b"first", imported[0].read_bytes())
+            self.assertEqual(b"second", imported[1].read_bytes())
+            self.assertNotEqual(hashlib.sha256(imported[0].read_bytes()).digest(), hashlib.sha256(imported[1].read_bytes()).digest())
 
 
 if __name__ == "__main__":
