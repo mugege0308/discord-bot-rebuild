@@ -2084,6 +2084,16 @@ def _validate_gallery_image_dimensions(
     return actual
 
 
+def _read_gallery_image_dimensions(image_bytes: bytes) -> tuple[int, int] | None:
+    """Read PNG/image dimensions without turning an optional import into an error."""
+
+    try:
+        with Image.open(BytesIO(image_bytes)) as image:
+            return int(image.width), int(image.height)
+    except (OSError, ValueError):
+        return None
+
+
 def _safe_gallery_filename_fragment(value: object, fallback: str) -> str:
     fragment = re.sub(r"[^A-Za-z0-9._-]+", "_", str(value or "")).strip("._")
     return (fragment[:80] or fallback)
@@ -2205,9 +2215,12 @@ def _download_comfy_images(
                 gallery_metadata,
                 source_name=filename,
             )
+            if actual_dimensions is None:
+                actual_dimensions = _read_gallery_image_dimensions(image_bytes)
             suffix = Path(filename).suffix or ".png"
             output_path = OUTPUT_DIR / f"{timestamp}_{batch_index:02d}_{len(paths) + image_index:02d}{suffix}"
             output_path.write_bytes(image_bytes)
+            payload: dict[str, Any] | None = None
             if gallery_metadata is not None:
                 payload = dict(gallery_metadata)
                 payload.setdefault("job_id", prompt_id or "")
@@ -2224,23 +2237,57 @@ def _download_comfy_images(
                     payload["pose_profile_reason"] = pose_profile_reason or ""
                 _write_gallery_metadata_sidecar(output_path, payload)
             if gallery_output_root is not None and image_type == "output":
-                imported_path = _import_gallery_image_bytes(
-                    image_bytes,
-                    output_root=gallery_output_root,
-                    filename=filename,
-                    subfolder=subfolder,
-                    prompt_id=prompt_id,
-                    gallery_metadata=gallery_metadata,
+                source_path = _resolve_gallery_output_path(
+                    gallery_output_root,
+                    filename,
+                    subfolder,
+                    image_type,
                 )
-                if gallery_metadata is not None:
-                    imported_payload = dict(payload)
-                    imported_payload["gallery_filename"] = imported_path.name
-                    imported_payload["gallery_dimensions"] = (
-                        None
-                        if actual_dimensions is None
-                        else {"width": actual_dimensions[0], "height": actual_dimensions[1]}
+                canonical_path: Path | None = None
+                if source_path is not None and actual_dimensions is not None:
+                    try:
+                        source_bytes = source_path.read_bytes()
+                        source_dimensions = _read_gallery_image_dimensions(source_bytes)
+                    except OSError:
+                        source_bytes = None
+                        source_dimensions = None
+                    if (
+                        source_bytes is not None
+                        and source_dimensions == actual_dimensions
+                        and hashlib.sha256(source_bytes).digest() == hashlib.sha256(image_bytes).digest()
+                    ):
+                        canonical_path = source_path
+
+                if canonical_path is not None:
+                    # The ComfyUI output is already inside the Gallery root and is
+                    # byte-for-byte the fetched image.  Reuse it instead of adding
+                    # a second filename that the Gallery scanner would index.
+                    if payload is not None:
+                        canonical_payload = dict(payload)
+                        canonical_payload["gallery_filename"] = canonical_path.name
+                        canonical_payload["gallery_dimensions"] = {
+                            "width": actual_dimensions[0],
+                            "height": actual_dimensions[1],
+                        }
+                        _write_gallery_metadata_sidecar(canonical_path, canonical_payload)
+                else:
+                    imported_path = _import_gallery_image_bytes(
+                        image_bytes,
+                        output_root=gallery_output_root,
+                        filename=filename,
+                        subfolder=subfolder,
+                        prompt_id=prompt_id,
+                        gallery_metadata=gallery_metadata,
                     )
-                    _write_gallery_metadata_sidecar(imported_path, imported_payload)
+                    if payload is not None:
+                        imported_payload = dict(payload)
+                        imported_payload["gallery_filename"] = imported_path.name
+                        imported_payload["gallery_dimensions"] = (
+                            None
+                            if actual_dimensions is None
+                            else {"width": actual_dimensions[0], "height": actual_dimensions[1]}
+                        )
+                        _write_gallery_metadata_sidecar(imported_path, imported_payload)
             paths.append(output_path)
 
     if not paths:

@@ -130,6 +130,127 @@ class GalleryGenerationHandoffTests(unittest.IsolatedAsyncioTestCase):
 
 
 class GallerySidecarTests(unittest.TestCase):
+    def test_shared_root_reuses_matching_source_and_writes_sidecar(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            local = root / "local"
+            shared = root / "shared"
+            local.mkdir()
+            shared.mkdir()
+            source = shared / "Comfy_00001.png"
+            source_bytes = _png_bytes(768, 1024, (20, 40, 60))
+            source.write_bytes(source_bytes)
+            source_hash = hashlib.sha256(source_bytes).hexdigest()
+            response = SimpleNamespace(content=source_bytes, raise_for_status=lambda: None)
+            history = {"outputs": {"19": {"images": [{"filename": source.name, "type": "output", "subfolder": ""}]}}}
+            with (
+                mock.patch.object(sd_control, "OUTPUT_DIR", local),
+                mock.patch.object(sd_control.requests, "get", return_value=response),
+            ):
+                sd_control._download_comfy_images(
+                    history,
+                    1,
+                    gallery_output_root=shared,
+                    gallery_metadata={"job_id": "job-shared", "width": 768, "height": 1024},
+                    prompt_id="prompt-shared",
+                )
+
+            self.assertEqual([source], list(shared.glob("*.png")))
+            self.assertEqual(source_hash, hashlib.sha256(source.read_bytes()).hexdigest())
+            metadata = json.loads(source.with_name(source.name + ".metadata.json").read_text(encoding="utf-8"))
+            self.assertEqual("job-shared", metadata["job_id"])
+            self.assertEqual("prompt-shared", metadata["prompt_id"])
+            self.assertEqual(source.name, metadata["gallery_filename"])
+            self.assertEqual({"width": 768, "height": 1024}, metadata["gallery_dimensions"])
+
+    def test_same_root_hash_mismatch_uses_collision_safe_copy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            local = root / "local"
+            shared = root / "shared"
+            local.mkdir()
+            shared.mkdir()
+            source = shared / "Comfy_00001.png"
+            old_bytes = _png_bytes(768, 1024, (1, 2, 3))
+            new_bytes = _png_bytes(768, 1024, (4, 5, 6))
+            source.write_bytes(old_bytes)
+            response = SimpleNamespace(content=new_bytes, raise_for_status=lambda: None)
+            history = {"outputs": {"19": {"images": [{"filename": source.name, "type": "output", "subfolder": ""}]}}}
+            with (
+                mock.patch.object(sd_control, "OUTPUT_DIR", local),
+                mock.patch.object(sd_control.requests, "get", return_value=response),
+            ):
+                sd_control._download_comfy_images(
+                    history,
+                    1,
+                    gallery_output_root=shared,
+                    gallery_metadata={"job_id": "job-mismatch", "width": 768, "height": 1024},
+                    prompt_id="prompt-mismatch",
+                )
+
+            imported = [path for path in shared.glob("*.png") if path != source]
+            self.assertEqual(1, len(imported))
+            self.assertEqual(old_bytes, source.read_bytes())
+            self.assertEqual(new_bytes, imported[0].read_bytes())
+
+    def test_external_source_root_uses_collision_safe_copy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            local = root / "local"
+            source_root = root / "comfy"
+            gallery = root / "gallery"
+            local.mkdir()
+            source_root.mkdir()
+            gallery.mkdir()
+            source = source_root / "Comfy_00001.png"
+            source_bytes = _png_bytes(768, 1024)
+            source.write_bytes(source_bytes)
+            response = SimpleNamespace(content=source_bytes, raise_for_status=lambda: None)
+            history = {"outputs": {"19": {"images": [{"filename": source.name, "type": "output", "subfolder": ""}]}}}
+            with (
+                mock.patch.object(sd_control, "OUTPUT_DIR", local),
+                mock.patch.object(sd_control.requests, "get", return_value=response),
+            ):
+                sd_control._download_comfy_images(
+                    history,
+                    1,
+                    gallery_output_root=gallery,
+                    gallery_metadata={"job_id": "job-external", "width": 768, "height": 1024},
+                    prompt_id="prompt-external",
+                )
+
+            imported = list(gallery.glob("*.png"))
+            self.assertEqual(1, len(imported))
+            self.assertEqual(source_bytes, imported[0].read_bytes())
+
+    def test_shared_root_retry_does_not_create_duplicate_copy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            local = root / "local"
+            shared = root / "shared"
+            local.mkdir()
+            shared.mkdir()
+            source = shared / "Comfy_00001.png"
+            source_bytes = _png_bytes(768, 1024)
+            source.write_bytes(source_bytes)
+            response = SimpleNamespace(content=source_bytes, raise_for_status=lambda: None)
+            history = {"outputs": {"19": {"images": [{"filename": source.name, "type": "output", "subfolder": ""}]}}}
+            with (
+                mock.patch.object(sd_control, "OUTPUT_DIR", local),
+                mock.patch.object(sd_control.requests, "get", return_value=response),
+            ):
+                for _ in range(2):
+                    sd_control._download_comfy_images(
+                        history,
+                        1,
+                        gallery_output_root=shared,
+                        gallery_metadata={"job_id": "job-retry", "width": 768, "height": 1024},
+                        prompt_id="prompt-retry",
+                    )
+
+            self.assertEqual([source], list(shared.glob("*.png")))
+            self.assertEqual(1, len(list(shared.glob("*.metadata.json"))))
+
     def test_comfy_download_imports_collision_safe_authoritative_image(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
