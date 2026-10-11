@@ -38,6 +38,12 @@ class ImageGenerationProfile:
     engine: str = "sdxl_tag"
     supports_lora: bool = True
     supports_reference: bool = True
+    # Edit/reference capability is kept internal during the prototype phase;
+    # the public options payload intentionally continues to expose only the
+    # established capability keys until the Gallery UI is ready.
+    supports_edit: bool = False
+    supports_image_reference: bool = False
+    max_reference_images: int = 0
     supports_pose: bool = True
     supports_bulk: bool = True
     supports_overnight: bool = True
@@ -96,6 +102,9 @@ IMAGE_GENERATION_PROFILES: dict[str, ImageGenerationProfile] = {
         engine=QWEN_IMAGE_ENGINE,
         supports_lora=False,
         supports_reference=False,
+        supports_edit=True,
+        supports_image_reference=True,
+        max_reference_images=1,
         supports_pose=False,
         supports_bulk=False,
         supports_overnight=False,

@@ -80,6 +80,12 @@ from services.qwen_workflow_adapter import (
     patch_qwen_workflow,
     validate_qwen_runtime_nodes,
 )
+from services.qwen_image_edit_adapter import (
+    QWEN_EDIT_WORKFLOW_FILE,
+    load_qwen_edit_workflow,
+    patch_qwen_edit_workflow,
+    validate_qwen_edit_runtime_nodes,
+)
 
 
 logger = logging.getLogger("secretary-bot.sd_control")
@@ -192,6 +198,7 @@ class SdGenerationOptions:
     model_key: str | None = None
     model_family: str | None = None
     engine: str = "sdxl_tag"
+    mode: str = "t2i"
     workflow_key: str | None = None
     model_components: dict[str, str] | None = None
     filename_prefix: str | None = None
@@ -675,8 +682,13 @@ def validate_options(options: SdGenerationOptions) -> SdGenerationOptions:
             raise ValueError("reference_imageはJPEG / PNG / WebPを指定してください。")
 
     reference_mode = str(options.reference_mode or "none").strip().casefold()
-    if reference_mode not in {"none", "composition", REFERENCE_MODE_POSE}:
-        raise ValueError("reference_modeはnone / composition / poseのいずれかで指定してください。")
+    if reference_mode not in {"none", "composition", "edit", REFERENCE_MODE_POSE}:
+        raise ValueError("reference_modeはnone / composition / edit / poseのいずれかで指定してください。")
+    if reference_mode == "edit":
+        if options.engine != "qwen_image" or not reference_used:
+            raise ValueError("edit referenceはQwen-Imageの参考画像付き生成でのみ利用できます。")
+        if options.count != 1:
+            raise ValueError("Qwen-Image editではcountは1だけ指定できます。")
     pose_used = options.pose_reference_bytes is not None
     if reference_mode == REFERENCE_MODE_POSE and not pose_used:
         raise ValueError("pose reference画像が指定されていません。")
@@ -707,6 +719,7 @@ def validate_options(options: SdGenerationOptions) -> SdGenerationOptions:
         model_key=options.model_key,
         model_family=resolved_model_family,
         engine=options.engine,
+        mode=options.mode,
         workflow_key=options.workflow_key,
         model_components=(None if options.model_components is None else dict(options.model_components)),
         filename_prefix=options.filename_prefix,
@@ -2333,6 +2346,20 @@ def _check_qwen_runtime_nodes() -> None:
         raise RuntimeError("Qwen用ComfyUI nodeの確認に失敗しました。生成は開始していません。") from exc
 
 
+def _check_qwen_edit_runtime_nodes() -> None:
+    """Validate the native Qwen 2.1 reference-conditioning nodes."""
+
+    try:
+        response = requests.get(_api_url("/object_info"), timeout=20)
+        response.raise_for_status()
+        object_info = response.json()
+        validate_qwen_edit_runtime_nodes(object_info)
+    except QwenWorkflowError:
+        raise
+    except (requests.RequestException, ValueError) as exc:
+        raise RuntimeError("Qwen edit用ComfyUI nodeの確認に失敗しました。生成は開始していません。") from exc
+
+
 def _generate_qwen_images_with_metadata(options: SdGenerationOptions) -> list[GeneratedImage]:
     if options.count != 1:
         raise RuntimeError("Qwen-Image 2.1ではcountは1だけ指定できます。")
@@ -2403,8 +2430,96 @@ def _generate_qwen_images_with_metadata(options: SdGenerationOptions) -> list[Ge
     ]
 
 
+def _generate_qwen_edit_images_with_metadata(options: SdGenerationOptions) -> list[GeneratedImage]:
+    """Generate exactly one Qwen 2.1 image from one uploaded reference."""
+
+    if options.count != 1:
+        raise RuntimeError("Qwen-Image editではcountは1だけ指定できます。")
+    if options.loras or options.pose_reference_bytes is not None:
+        raise RuntimeError("Qwen-Image editではLoRA / Poseは未対応です。")
+    if not options.reference_image_bytes:
+        raise RuntimeError("Qwen-Image editには参考画像が1枚必要です。")
+
+    _check_qwen_edit_runtime_nodes()
+    reference_image_name = _upload_comfy_reference_image(
+        options.reference_image_bytes,
+        options.reference_image_content_type or "image/png",
+    )
+    workflow, workflow_file = load_qwen_edit_workflow(QWEN_EDIT_WORKFLOW_FILE)
+    workflow_hash = _safe_workflow_file_hash(workflow_file)
+    requested_seed = options.seed if isinstance(options.seed, int) and options.seed >= 0 else random.randint(0, 2**32 - 1)
+    patched = patch_qwen_edit_workflow(
+        workflow,
+        reference_image_name=reference_image_name,
+        prompt=options.prompt,
+        width=options.width,
+        height=options.height,
+        seed=requested_seed,
+        steps=options.steps,
+        cfg=options.cfg,
+        sampler=options.sampler,
+        scheduler=options.scheduler,
+        output_prefix=options.filename_prefix or "Qwen21Edit",
+        components=options.model_components or QWEN_MODEL_COMPONENTS,
+    )
+    seed_node_id, seed_key = _find_seed_input(patched)
+    sampler_node_id = _find_sampler_node(patched)
+    steps, cfg, sampler_name, scheduler = _extract_sampler_settings(patched, sampler_node_id)
+    width, height = _extract_latent_dimensions(patched)
+    if width is None:
+        width = options.width
+    if height is None:
+        height = options.height
+    client_id = str(uuid.uuid4())
+    prompt_id = _queue_comfy_prompt_with_logging(patched, client_id)
+    history = _wait_comfy_history(prompt_id)
+    gallery_metadata = None
+    if options.gallery_metadata is not None:
+        gallery_metadata = dict(options.gallery_metadata)
+        gallery_metadata["mode"] = "edit"
+        gallery_metadata["reference_image_count"] = 1
+        if not gallery_metadata.get("workflow_hash"):
+            gallery_metadata["workflow_hash"] = workflow_hash
+        if not gallery_metadata.get("workflow"):
+            gallery_metadata["workflow"] = options.workflow_key or workflow_file.stem
+    download_options = options
+    if gallery_metadata is not None:
+        download_options = replace(options, gallery_metadata=gallery_metadata)
+    paths = _download_comfy_images(
+        history,
+        1,
+        gallery_output_root=download_options.gallery_output_root,
+        gallery_metadata=download_options.gallery_metadata,
+        prompt_id=prompt_id,
+        actual_seed=requested_seed,
+    )
+    actual_seed = requested_seed
+    if seed_node_id and seed_key:
+        raw_seed = _node_inputs(patched, seed_node_id).get(seed_key)
+        actual_seed = raw_seed if isinstance(raw_seed, int) else requested_seed
+    return [
+        GeneratedImage(
+            path=path,
+            batch_index=1,
+            seed=actual_seed,
+            checkpoint_name=None,
+            sampler_name=sampler_name,
+            scheduler=scheduler,
+            steps=steps,
+            cfg=cfg,
+            width=width,
+            height=height,
+            workflow_file=str(workflow_file),
+            workflow_hash=workflow_hash,
+        )
+        for path in paths
+    ]
+
+
 def _generate_comfy_images_with_metadata(options: SdGenerationOptions) -> list[GeneratedImage]:
     if options.engine == "qwen_image":
+        if options.mode == "edit":
+            return _generate_qwen_edit_images_with_metadata(options)
         return _generate_qwen_images_with_metadata(options)
     reference_enabled = options.reference_image_bytes is not None
     pose_enabled = options.pose_reference_bytes is not None

@@ -251,6 +251,9 @@ class GenerationRequest:
     appearance_text: str | None = None
     request_text: str | None = None
     model_key: str = DEFAULT_IMAGE_GENERATION_MODEL_KEY
+    # ``t2i`` is the backwards-compatible default.  ``edit`` is currently
+    # implemented only by the isolated Qwen-Image 2.1 adapter.
+    mode: str = "t2i"
     rating: str = PROMPT_RATING_AUTO
     loras: tuple[object, ...] = ()
     size_preset: str | None = None
@@ -284,6 +287,7 @@ class GenerationRequest:
         object.__setattr__(self, "loras", tuple(self.loras or ()))
         object.__setattr__(self, "source_metadata", dict(self.source_metadata or {}))
         object.__setattr__(self, "multi_person_framing", validate_multi_person_framing(self.multi_person_framing))
+        object.__setattr__(self, "mode", str(self.mode or "t2i").casefold().strip())
 
     @property
     def prompt_input(self) -> str:
@@ -308,6 +312,8 @@ class GenerationRequest:
     def validate(self, *, require_prompt_input: bool = True) -> None:
         if not _normalise_text(self.model_key):
             raise PromptGeneratorError("model_keyを指定してください。")
+        if self.mode not in {"t2i", "edit"}:
+            raise PromptGeneratorError("modeはt2iまたはeditで指定してください。")
         if self.count < 1 or self.count > MAX_GENERATION_COUNT:
             raise PromptGeneratorError(f"countは1～{MAX_GENERATION_COUNT}枚で指定してください。")
         if (
@@ -672,6 +678,16 @@ class GenerationService:
         gallery_output_root: Path | None,
         gallery_metadata: Mapping[str, Any] | None,
     ) -> PreparedGeneration:
+        if request.mode == "edit":
+            return self._prepare_qwen_edit_generation(
+                request,
+                profile,
+                resolved=resolved,
+                prompt_result=prompt_result,
+                positive_override=positive_override,
+                gallery_output_root=gallery_output_root,
+                gallery_metadata=gallery_metadata,
+            )
         if request.count != 1:
             raise PromptGeneratorError("Qwen-Image 2.1ではcountは1だけ指定できます。")
         if request.variation != "off":
@@ -715,6 +731,7 @@ class GenerationService:
             model_key=profile.model_key,
             model_family=profile.model_family,
             engine=profile.engine,
+            mode="t2i",
             workflow_key=profile.workflow_key,
             model_components=profile_model_components(profile),
             filename_prefix=profile.filename_prefix,
@@ -729,6 +746,93 @@ class GenerationService:
             scheduler=scheduler,
             seed=request.seed,
             loras=(),
+            gallery_output_root=gallery_output_root,
+            gallery_metadata=(None if gallery_metadata is None else dict(gallery_metadata)),
+            explicit_generation_fields=frozenset({"width", "height", "steps", "cfg", "sampler"}),
+        )
+        return PreparedGeneration(
+            request=request,
+            resolved=prepared_resolved,
+            options=options,
+            requested_seed=request.seed,
+        )
+
+    def _prepare_qwen_edit_generation(
+        self,
+        request: GenerationRequest,
+        profile: Any,
+        *,
+        resolved: ResolvedGeneration | None,
+        prompt_result: ShogouPromptResult | None,
+        positive_override: str | None,
+        gallery_output_root: Path | None,
+        gallery_metadata: Mapping[str, Any] | None,
+    ) -> PreparedGeneration:
+        """Prepare one-reference Qwen edit without touching the T2I path."""
+
+        if request.count != 1:
+            raise PromptGeneratorError("Qwen-Image editではcountは1だけ指定できます。")
+        if request.variation != "off":
+            raise PromptGeneratorError("Qwen-Image editではvariationは未対応です。")
+        if request.loras or request.pose:
+            raise PromptGeneratorError("Qwen-Image editではLoRA / Poseは未対応です。")
+        reference = request.reference or {}
+        if str(reference.get("mode") or "") != "edit" or not reference.get("image_bytes"):
+            raise PromptGeneratorError("Qwen-Image editでは参考画像を1枚指定してください。")
+
+        resolved = resolved or self._resolve_qwen_request(request)
+        if positive_override is not None:
+            positive = positive_override
+        elif prompt_result is not None:
+            positive = prompt_result.positive
+        else:
+            positive = resolved.prompt_result.positive
+        positive = _normalise_text(positive)
+        if not positive:
+            raise PromptGeneratorError("Qwen-Image edit用の自然文promptを指定してください。")
+
+        prepared_result = ShogouPromptResult(
+            positive=positive,
+            negative="",
+            summary=positive,
+            user_grounded_tags=(positive,),
+        )
+        prepared_resolved = replace(
+            resolved,
+            prompt_result=prepared_result,
+            provenance=(TagProvenance(positive, "user_request"),),
+            explicit_tags=(),
+            appearance_tags=(),
+        )
+        steps = int(profile.default_steps if profile.default_steps is not None else request.steps)
+        cfg = float(profile.default_cfg if profile.default_cfg is not None else request.cfg)
+        sampler = str(profile.default_sampler or request.sampler)
+        scheduler = str(profile.default_scheduler or "simple")
+        options = SdGenerationOptions(
+            prompt=positive,
+            negative_prompt="",
+            model_key=profile.model_key,
+            model_family=profile.model_family,
+            engine=profile.engine,
+            mode="edit",
+            workflow_key="qwen_image_2_1_edit_w4a8",
+            model_components=profile_model_components(profile),
+            filename_prefix="Qwen21Edit",
+            model_selection_explicit=request.model_selection_explicit,
+            preserve_prompt_text=True,
+            count=1,
+            width=request.width,
+            height=request.height,
+            steps=steps,
+            cfg=cfg,
+            sampler=sampler,
+            scheduler=scheduler,
+            seed=request.seed,
+            loras=(),
+            reference_image_bytes=bytes(reference.get("image_bytes") or b""),
+            reference_image_content_type=str(reference.get("content_type") or "image/png"),
+            reference_strength=reference.get("strength"),
+            reference_mode="edit",
             gallery_output_root=gallery_output_root,
             gallery_metadata=(None if gallery_metadata is None else dict(gallery_metadata)),
             explicit_generation_fields=frozenset({"width", "height", "steps", "cfg", "sampler"}),

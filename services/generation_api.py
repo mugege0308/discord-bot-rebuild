@@ -113,6 +113,7 @@ _ALLOWED_REQUEST_KEYS = frozenset(
         "appearance_text",
         "request_text",
         "model_key",
+        "mode",
         "rating",
         "loras",
         "size",
@@ -125,6 +126,8 @@ _ALLOWED_REQUEST_KEYS = frozenset(
         "reference_image_id",
         "reference_strength",
         "reference_fit",
+        # Accepted so edit clients receive a specific single-reference error.
+        "reference_image_ids",
     }
 )
 _ALLOWED_LORA_KEYS = frozenset({"key", "lora_type", "strength"})
@@ -385,8 +388,8 @@ def _parse_reference(
     if not isinstance(mode_value, str):
         raise GenerationApiError("reference_modeが不正です。")
     mode = mode_value.casefold().strip()
-    if mode not in {"none", "composition", "pose"}:
-        raise GenerationApiError("reference_modeはnone / composition / poseのいずれかで指定してください。")
+    if mode not in {"none", "composition", "pose", "edit"}:
+        raise GenerationApiError("reference_modeはnone / composition / pose / editのいずれかで指定してください。")
     image_id = payload.get("reference_image_id")
     strength = payload.get("reference_strength")
     fit_value = payload.get("reference_fit", "contain")
@@ -481,6 +484,13 @@ def _build_request(
     if not is_image_generation_profile_enabled(profile):
         raise GenerationApiError(f"{profile.display_name}は現在無効です。")
 
+    mode_value = payload.get("mode", "t2i")
+    if not isinstance(mode_value, str) or mode_value.casefold().strip() not in {"t2i", "edit"}:
+        raise GenerationApiError("modeはt2iまたはeditで指定してください。")
+    mode = mode_value.casefold().strip()
+    if mode == "edit" and not profile.supports_edit:
+        raise GenerationApiError("edit modeはQwen-Image 2.1でのみ利用できます。")
+
     rating = payload.get("rating", "auto")
     if not isinstance(rating, str) or rating.casefold() not in PROMPT_RATING_CHOICES:
         raise GenerationApiError("指定されたratingには対応していません。")
@@ -510,13 +520,24 @@ def _build_request(
         raise GenerationApiError(f"{profile.display_name}では複数枚生成は未対応です。")
     if not profile.supports_lora and payload.get("loras"):
         raise GenerationApiError(f"{profile.display_name}ではLoRAは未対応です。")
-    if not profile.supports_reference and (
-        payload.get("reference_image_id") or str(payload.get("reference_mode") or "none").casefold() != "none"
+    reference_mode_value = str(payload.get("reference_mode") or "none").casefold().strip()
+    if mode == "edit":
+        if payload.get("reference_image_ids") is not None:
+            raise GenerationApiError("Qwen-Image editでは参考画像は1枚だけ指定できます。")
+        if reference_mode_value == "none" and payload.get("reference_image_id"):
+            reference_mode_value = "edit"
+        if reference_mode_value != "edit":
+            raise GenerationApiError("Qwen-Image editではreference_mode=editと参考画像1枚が必要です。")
+    elif not profile.supports_reference and (
+        payload.get("reference_image_id") or reference_mode_value != "none"
     ):
         raise GenerationApiError(f"{profile.display_name}ではReference / Poseは未対応です。")
     if profile.engine == QWEN_IMAGE_ENGINE and variation != VARIATION_OFF:
         raise GenerationApiError(f"{profile.display_name}ではvariationは未対応です。")
-    reference = _parse_reference(payload, reference_upload_bytes=reference_upload_bytes)
+    reference_payload = dict(payload)
+    if mode == "edit" and "reference_mode" not in reference_payload:
+        reference_payload["reference_mode"] = "edit"
+    reference = _parse_reference(reference_payload, reference_upload_bytes=reference_upload_bytes)
 
     loras = _parse_loras(payload.get("loras"), model_family=profile.model_family)
     if reference is not None and loras:
@@ -530,6 +551,7 @@ def _build_request(
         appearance_text=_clean_text(payload.get("appearance_text"), "appearance_text"),
         request_text=_clean_text(payload.get("request_text"), "request_text"),
         model_key=model_key.strip(),
+        mode=mode,
         rating=rating,
         loras=loras,
         size_preset=size,
@@ -649,6 +671,7 @@ def _build_gallery_metadata(
         "requested_variation": request.variation,
         "variation_offset": request.variation_offset,
         "model": str(options.model_key or request.model_key),
+        "mode": str(getattr(request, "mode", "t2i") or "t2i"),
         "engine": str(getattr(options, "engine", "sdxl_tag") or "sdxl_tag"),
         "workflow": str(getattr(options, "workflow_key", "") or ""),
         "workflow_hash": str(getattr(options, "workflow_hash", "") or ""),
@@ -677,6 +700,7 @@ def _build_gallery_metadata(
         "appearance_text": request.appearance_text or "",
         "request_text": request.request_text or "",
         "reference_mode": str((request.reference or {}).get("mode") or "none"),
+        "reference_image_count": 1 if request.mode == "edit" and request.reference else 0,
         "reference_image_id": str((request.reference or {}).get("image_id") or ""),
         "reference_strength": (request.reference or {}).get("strength"),
         "reference_fit": str((request.reference or {}).get("fit") or "contain"),
