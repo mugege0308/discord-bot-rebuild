@@ -27,6 +27,10 @@ class ImageCompositionTests(unittest.TestCase):
         instruction = build_composition_preset_instruction("夕暮れの海辺", "full_body")
         self.assertIn("head to toe", instruction)
 
+    def test_cowboy_preset_is_available_for_multi_person_framing(self):
+        instruction = build_composition_preset_instruction("二人を描く", "cowboy")
+        self.assertIn("cowboy-shot", instruction)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -30,6 +30,7 @@ SOURCE_PRIORITY: Mapping[str, int] = {
     "user_ui": 94,
     "variation_auto": 60,
     "prompt_designer": 50,
+    "framing_auto": 55,
     "request_resolver": 50,
     "inference": 40,
     "system": 20,
@@ -106,6 +107,14 @@ _CATEGORY_ALIASES: dict[str, tuple[str, ...]] = {
         "thigh up",
         "full body",
         "medium shot",
+        "wide shot",
+        "long shot",
+        "distant view",
+        "from far away",
+    ),
+    "body_visibility": (
+        "feet visible",
+        "feet shown",
     ),
     "camera_horizontal": (
         "straight-on",
@@ -177,6 +186,11 @@ _SINGLE_SUBJECT_FRAMING = frozenset(
         "face close-up",
         "face close up",
         "face focus",
+        # For a multi-person request, an automatically inferred upper-body
+        # framing is just as likely to crop the partner as a close-up.  Keep
+        # explicit/user-requested ``upper body`` intact; this set is only
+        # consulted for lower-priority generated framing.
+        "upper body",
     }
 )
 
@@ -497,6 +511,7 @@ def resolve_prompt_tag_conflicts(
     base_provenance: Iterable[PromptTagRecord] = (),
     variation_tags: Sequence[str] = (),
     preferred_framing_tag: str = "",
+    protected_framing_tags: Sequence[str] = (),
     dictionary: PromptTagDictionary | None = None,
 ) -> PromptConflictResolution:
     """Keep user intent and suppress only lower-priority conflicting tags."""
@@ -527,6 +542,11 @@ def resolve_prompt_tag_conflicts(
         known_sources.setdefault(normalize_prompt_constraint(item.tag), item)
     variation_keys = {normalize_prompt_constraint(value) for value in variation_tags}
     preferred_framing_key = normalize_prompt_constraint(preferred_framing_tag)
+    protected_framing_keys = {
+        normalize_prompt_constraint(value)
+        for value in protected_framing_tags
+        if normalize_prompt_constraint(value)
+    }
 
     records: list[PromptTagRecord] = []
     suppressed: list[SuppressedPromptTag] = []
@@ -572,6 +592,7 @@ def resolve_prompt_tag_conflicts(
             preferred_framing_key
             and "framing" in categories
             and key != preferred_framing_key
+            and key not in protected_framing_keys
             and not is_user_constraint
         ):
             suppressed.append(
@@ -590,6 +611,7 @@ def resolve_prompt_tag_conflicts(
         if (
             framing_key
             and people_semantics.requires_multiple_people
+            and framing_key not in protected_framing_keys
             and not is_user_constraint
         ):
             source_interaction = people_semantics.source_interactions[0] if people_semantics.source_interactions else ""
@@ -635,7 +657,12 @@ def resolve_prompt_tag_conflicts(
                 )
             )
             continue
-        if locked and not is_user_constraint and _source_priority(source) < SOURCE_PRIORITY["user_request"]:
+        if (
+            locked
+            and key not in protected_framing_keys
+            and not is_user_constraint
+            and _source_priority(source) < SOURCE_PRIORITY["user_request"]
+        ):
             locked_category = next(iter(categories.intersection(explicit_categories)), category)
             explicit_hint = ", ".join(text_constraints.get(locked_category, ())) or ", ".join(
                 value for value in explicit_values if locked_category in classify_tag(value, dictionary=prompt_dictionary)

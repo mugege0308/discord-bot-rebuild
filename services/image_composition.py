@@ -29,6 +29,7 @@ COMPOSITION_LABELS = {
     "none": "None",
     "face_closeup": "Face close-up",
     "upper_body": "Upper body",
+    "cowboy": "Cowboy shot",
     "full_body": "Full body",
     "full_body_tight": "Full body tight",
 }
@@ -36,6 +37,7 @@ COMPOSITION_LABELS = {
 _COMPOSITION_INSTRUCTIONS = {
     "face_closeup": "Use a face close-up with the face large and the character centered.",
     "upper_body": "Use an upper-body composition centered on the character.",
+    "cowboy": "Use a cowboy-shot composition showing the people from about mid-thigh up.",
     "full_body": "Show the complete character from head to toe, including both feet.",
     "full_body_tight": (
         "Show the complete character from head to toe, centered and filling most of the frame, "

@@ -130,14 +130,14 @@ class PromptConflictResolverTests(unittest.TestCase):
         self.assertEqual("hetero", suppressed.source_interaction)
         self.assertEqual(("portrait",), result.framing_semantics.suppressed)
 
-    def test_multi_person_auto_close_up_is_suppressed_but_upper_body_is_kept(self):
+    def test_multi_person_auto_close_up_and_upper_body_are_suppressed(self):
         result = resolve_prompt_tag_conflicts(
             "1girl, 1boy, hetero, close-up, upper body",
             explicit_tags=("1girl", "1boy", "hetero"),
         )
         self.assertNotIn("close-up", result.positive)
-        self.assertIn("upper body", result.positive)
-        self.assertEqual(("close-up",), result.framing_semantics.suppressed)
+        self.assertNotIn("upper body", result.positive)
+        self.assertEqual(("close-up", "upper body"), result.framing_semantics.suppressed)
 
     def test_explicit_multi_person_portrait_is_preserved(self):
         result = resolve_prompt_tag_conflicts(

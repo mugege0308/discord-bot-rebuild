@@ -38,6 +38,7 @@ class MultiPersonFramingDecision:
     source: str = "system_default"
     explicit_tags: tuple[str, ...] = ()
     preferred_tag: str = ""
+    supplemental_tags: tuple[str, ...] = ()
 
     @property
     def is_semantic(self) -> bool:

@@ -123,6 +123,18 @@ def _tag_key(value: object) -> str:
     return " ".join(str(value or "").strip().casefold().replace("_", " ").split())
 
 
+def _framing_context_text(request: "GenerationRequest") -> str:
+    return " ".join(
+        value
+        for value in (
+            request.request_text,
+            request.character_preset,
+            request.freeform_character,
+        )
+        if _normalise_text(value)
+    )
+
+
 def _dedupe_tags(values: Sequence[str]) -> tuple[str, ...]:
     result: list[str] = []
     seen: set[str] = set()
@@ -156,6 +168,7 @@ def resolve_multi_person_framing_decision(
     requires_multiple_people: bool,
     explicit_tags: Sequence[str] = (),
     request_text: str = "",
+    rating: object = PROMPT_RATING_AUTO,
 ) -> MultiPersonFramingDecision:
     """Resolve the UI mode without allowing it to override user framing."""
 
@@ -174,7 +187,10 @@ def resolve_multi_person_framing_decision(
     ]
     text_framing = list(classify_text_constraints(request_text).get("framing", ()))
     explicit_values = tuple(dict.fromkeys((*explicit_framing, *text_framing)))
-    if explicit_values:
+    blocking_explicit_values = tuple(
+        value for value in explicit_values if _tag_key(value) != "full body"
+    )
+    if blocking_explicit_values:
         source = "user_explicit" if explicit_framing else "user_request"
         return MultiPersonFramingDecision(
             requested=mode,
@@ -183,6 +199,19 @@ def resolve_multi_person_framing_decision(
             explicit_tags=explicit_values,
         )
     preferred_tag = MULTI_PERSON_FRAMING_TAGS.get(mode, "")
+    rating_key = _normalise_text(rating).casefold()
+    if (
+        mode == "full_body"
+        and rating_key in {"explicit", "nsfw"}
+        and not blocking_explicit_values
+    ):
+        return MultiPersonFramingDecision(
+            requested=mode,
+            effective=mode,
+            source="adult_multi_person_full_body_auto",
+            preferred_tag=preferred_tag,
+            supplemental_tags=("wide shot",),
+        )
     return MultiPersonFramingDecision(
         requested=mode,
         effective=mode,
@@ -595,7 +624,8 @@ class GenerationService:
             request.multi_person_framing,
             requires_multiple_people=people_semantics.requires_multiple_people,
             explicit_tags=explicit_tags,
-            request_text=request.request_text or "",
+            request_text=_framing_context_text(request),
+            rating=request.rating,
         )
 
         merged_result = replace(
@@ -616,6 +646,93 @@ class GenerationService:
             appearance_tags=appearance_tags,
             provenance=tuple(dict.fromkeys(provenance)),
             people_semantics=people_semantics,
+            multi_person_framing_requested=framing_decision.requested,
+            multi_person_framing_effective=framing_decision.effective,
+            multi_person_framing_source=framing_decision.source,
+        )
+
+    @staticmethod
+    def _finalize_resolved_prompt(resolved: ResolvedGeneration) -> ResolvedGeneration:
+        """Apply the shared semantic conflict rules at the request boundary.
+
+        ``resolve_request`` is also used by the Discord adapter, which needs a
+        prompt suitable for generation before it reaches the heavier options
+        preparation path.  Keeping this pass here makes both adapters use the
+        same resolver without duplicating framing/people rules.  The pass is
+        intentionally limited to conflict resolution: system quality tags,
+        negative defaults, and LoRA triggers remain owned by
+        :meth:`prepare_generation` for backwards compatibility.
+        """
+
+        request = resolved.request
+        framing_decision = resolve_multi_person_framing_decision(
+            request.multi_person_framing,
+            requires_multiple_people=resolved.people_semantics.requires_multiple_people,
+            explicit_tags=resolved.explicit_tags,
+            request_text=_framing_context_text(request),
+            rating=request.rating,
+        )
+        positive_source = resolved.prompt_result.positive
+        base_provenance = tuple(
+            PromptTagRecord(item.tag, item.source, item.category)
+            for item in resolved.provenance
+        )
+        if framing_decision.preferred_tag:
+            positive_source = _append_tags(positive_source, (framing_decision.preferred_tag,))
+            preferred_key = _tag_key(framing_decision.preferred_tag)
+            base_provenance = tuple(
+                item for item in base_provenance if _tag_key(item.tag) != preferred_key
+            ) + (PromptTagRecord(framing_decision.preferred_tag, "user_ui", "framing"),)
+        if framing_decision.supplemental_tags:
+            positive_source = _append_tags(positive_source, framing_decision.supplemental_tags)
+            supplemental_keys = {_tag_key(tag) for tag in framing_decision.supplemental_tags}
+            base_provenance = tuple(
+                item for item in base_provenance if _tag_key(item.tag) not in supplemental_keys
+            ) + tuple(
+                PromptTagRecord(tag, "framing_auto", "framing")
+                for tag in framing_decision.supplemental_tags
+            )
+
+        conflict_resolution = resolve_prompt_tag_conflicts(
+            positive_source,
+            explicit_tags=resolved.explicit_tags,
+            request_text=_framing_context_text(request),
+            character_text=" ".join(
+                value
+                for value in (request.character_preset, request.freeform_character)
+                if _normalise_text(value)
+            ),
+            base_provenance=base_provenance,
+            preferred_framing_tag=framing_decision.preferred_tag,
+            protected_framing_tags=framing_decision.supplemental_tags,
+        )
+        prepared_result = replace(
+            resolved.prompt_result,
+            positive=conflict_resolution.positive,
+            tag_provenance=tuple(
+                f"{item.tag} -> {item.source}"
+                for item in conflict_resolution.provenance
+            ),
+        )
+        return replace(
+            resolved,
+            prompt_result=prepared_result,
+            provenance=conflict_resolution.provenance,
+            suppressed_tags=tuple(
+                dict.fromkeys(
+                    (*resolved.suppressed_tags, *conflict_resolution.suppressed_tags)
+                )
+            ),
+            prompt_conflicts=tuple(
+                dict.fromkeys(
+                    (*resolved.prompt_conflicts, *conflict_resolution.prompt_conflicts)
+                )
+            ),
+            people_semantics=conflict_resolution.people_semantics,
+            framing_semantics=merge_prompt_framing_semantics(
+                resolved.framing_semantics,
+                conflict_resolution.framing_semantics,
+            ),
             multi_person_framing_requested=framing_decision.requested,
             multi_person_framing_effective=framing_decision.effective,
             multi_person_framing_source=framing_decision.source,
@@ -650,7 +767,9 @@ class GenerationService:
         )
         if not isinstance(prompt_result, ShogouPromptResult):
             raise PromptGeneratorError("Prompt Designerの結果が不正です。")
-        return self._merge_resolved_prompt(request, prompt_result)
+        return self._finalize_resolved_prompt(
+            self._merge_resolved_prompt(request, prompt_result)
+        )
 
     @staticmethod
     def _resolve_qwen_request(request: GenerationRequest) -> ResolvedGeneration:
@@ -890,11 +1009,14 @@ class GenerationService:
             request.multi_person_framing,
             requires_multiple_people=resolved.people_semantics.requires_multiple_people,
             explicit_tags=resolved.explicit_tags,
-            request_text=request.request_text or "",
+            request_text=_framing_context_text(request),
+            rating=request.rating,
         )
         preferred_framing_tag = framing_decision.preferred_tag
         if preferred_framing_tag:
             positive_source = _append_tags(positive_source, (preferred_framing_tag,))
+        if framing_decision.supplemental_tags:
+            positive_source = _append_tags(positive_source, framing_decision.supplemental_tags)
         base_provenance = tuple(
             PromptTagRecord(item.tag, item.source, item.category)
             for item in resolved.provenance
@@ -904,6 +1026,14 @@ class GenerationService:
             base_provenance = tuple(
                 item for item in base_provenance if _tag_key(item.tag) != preferred_key
             ) + (PromptTagRecord(preferred_framing_tag, "user_ui", "framing"),)
+        if framing_decision.supplemental_tags:
+            supplemental_keys = {_tag_key(tag) for tag in framing_decision.supplemental_tags}
+            base_provenance = tuple(
+                item for item in base_provenance if _tag_key(item.tag) not in supplemental_keys
+            ) + tuple(
+                PromptTagRecord(tag, "framing_auto", "framing")
+                for tag in framing_decision.supplemental_tags
+            )
         pre_final_conflicts = resolve_prompt_tag_conflicts(
             positive_source,
             explicit_tags=resolved.explicit_tags,
@@ -916,6 +1046,7 @@ class GenerationService:
             base_provenance=base_provenance,
             variation_tags=variation_tags,
             preferred_framing_tag=preferred_framing_tag,
+            protected_framing_tags=framing_decision.supplemental_tags,
         )
         positive, system_provenance = _finalize_positive(
             request,
@@ -938,6 +1069,7 @@ class GenerationService:
             base_provenance=(*base_provenance, *pre_final_conflicts.provenance, *system_records),
             variation_tags=variation_tags,
             preferred_framing_tag=preferred_framing_tag,
+            protected_framing_tags=framing_decision.supplemental_tags,
         )
         positive = final_conflicts.positive
         positive = apply_lora_triggers(positive, loras)
@@ -961,6 +1093,7 @@ class GenerationService:
             ),
             variation_tags=variation_tags,
             preferred_framing_tag=preferred_framing_tag,
+            protected_framing_tags=framing_decision.supplemental_tags,
         )
         positive = post_lora_conflicts.positive
         negative = (

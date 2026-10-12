@@ -436,6 +436,18 @@ def _optional_lora_choice_value(choice: app_commands.Choice[str] | None) -> str 
     return choice.value.strip()
 
 
+def _multi_person_framing_for_composition(composition_preset: str | None) -> str:
+    """Map the existing Discord composition selector to shared framing rules."""
+
+    preset = str(composition_preset or DEFAULT_COMPOSITION_PRESET).strip().casefold()
+    return {
+        "upper_body": "upper_body",
+        "cowboy": "cowboy",
+        "full_body": "full_body",
+        "full_body_tight": "full_body",
+    }.get(preset, "auto")
+
+
 def _previous_lora_slot(previous, lora_type: str) -> dict[str, object] | None:
     if previous is None:
         return None
@@ -1902,6 +1914,7 @@ async def _build_shogou_prompt_result(
     reference_id: int | None = None,
     model_key: str = DEFAULT_IMAGE_GENERATION_MODEL_KEY,
     requested_rating: str = PROMPT_RATING_AUTO,
+    multi_person_framing: str = "auto",
 ) -> ShogouPromptResult | None:
     try:
         generation_request = GenerationRequest(
@@ -1912,20 +1925,35 @@ async def _build_shogou_prompt_result(
             source=f"discord.{label_prefix}",
             reference_id=reference_id,
             enable_generic_danbooru=(label_prefix == "generate_ai"),
+            multi_person_framing=multi_person_framing,
         )
         generation_service = GenerationService()
-        result = await asyncio.to_thread(
+        resolved = await asyncio.to_thread(
             generation_service.resolve_request,
             generation_request,
             prompt_resolver=generate_shogou_prompt_result,
         )
-        result = result.prompt_result
+        result = resolved.prompt_result
         logger.info(
             "%s result received: positive_length=%s negative_length=%s blocked=%s",
             label_prefix,
             len(result.positive),
             len(result.negative),
             result.blocked,
+        )
+        logger.info(
+            "%s framing diagnostics: people_semantics=%s framing_semantics=%s "
+            "provenance=%s suppressed_tags=%s multi_person_framing=%s",
+            label_prefix,
+            resolved.people_semantics.to_dict(),
+            resolved.framing_semantics.to_dict(),
+            [(item.tag, item.source, item.category) for item in resolved.provenance],
+            [item.to_dict() for item in resolved.suppressed_tags],
+            {
+                "requested": resolved.multi_person_framing_requested,
+                "effective": resolved.multi_person_framing_effective,
+                "source": resolved.multi_person_framing_source,
+            },
         )
         return result
     except PromptGeneratorTimeout:
@@ -2830,6 +2858,9 @@ def setup(client: discord.Client) -> None:
                 reference_id=reference_id,
                 model_key=profile.model_key,
                 requested_rating=resolved_settings.rating,
+                multi_person_framing=_multi_person_framing_for_composition(
+                    resolved_settings.composition_preset
+                ),
             )
         if result is None:
             return

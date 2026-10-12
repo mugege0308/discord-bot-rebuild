@@ -66,6 +66,79 @@ class GenerationServiceCharacterizationTests(unittest.TestCase):
             self.prompt_resolver.call_args.kwargs["multi_person_framing"],
         )
 
+    def test_resolve_request_applies_multi_person_conflicts_for_discord_path(self):
+        auto_framing = (
+            "1girl, 1boy, hetero, standing, full body, feet visible, "
+            "portrait, upper body, close-up, face focus, solo"
+        )
+        service = GenerationService(prompt_resolver=Mock(return_value=_prompt_result(auto_framing)))
+        for interaction in ("hetero", "hetero, clothed_sex", "hetero, clothed_sex, leg_lock"):
+            with self.subTest(interaction=interaction):
+                request = GenerationRequest(
+                    request_text=f"1girl, 1boy, {interaction}, standing, full body, feet visible",
+                    model_key="animagine_adult",
+                    rating="explicit",
+                    source="discord.generate_ai",
+                    seed=424242,
+                )
+                resolved = service.resolve_request(request)
+                positive = {token.strip() for token in resolved.prompt_result.positive.split(",")}
+                self.assertTrue({"1girl", "1boy", "hetero", "full body", "feet visible"}.issubset(positive))
+                self.assertNotIn("portrait", positive)
+                self.assertNotIn("upper body", positive)
+                self.assertNotIn("close-up", positive)
+                self.assertNotIn("face focus", positive)
+                self.assertNotIn("solo", positive)
+                suppressed = {item.tag for item in resolved.suppressed_tags}
+                self.assertTrue({"portrait", "upper body", "close-up", "face focus", "solo"}.issubset(suppressed))
+                self.assertTrue(resolved.people_semantics.requires_multiple_people)
+                self.assertEqual("full body", resolved.framing_semantics.effective[-1])
+
+    def test_resolve_request_preserves_user_explicit_upper_body(self):
+        service = GenerationService(
+            prompt_resolver=Mock(
+                return_value=_prompt_result("1girl, 1boy, hetero, upper body, full body")
+            )
+        )
+        resolved = service.resolve_request(
+            GenerationRequest(
+                request_text="1girl, 1boy, hetero, upper body",
+                model_key="animagine_adult",
+                rating="explicit",
+                source="discord.generate_ai",
+            )
+        )
+        positive = {token.strip() for token in resolved.prompt_result.positive.split(",")}
+        self.assertIn("upper body", positive)
+        self.assertNotIn("full body", positive)
+        self.assertNotIn("solo", positive)
+
+    def test_resolve_request_multi_person_selector_resolves_cowboy_and_full_body(self):
+        for mode, expected in (("cowboy", "cowboy shot"), ("full_body", "full body")):
+            with self.subTest(mode=mode):
+                service = GenerationService(
+                    prompt_resolver=Mock(
+                        return_value=_prompt_result(
+                            "1girl, 1boy, hetero, portrait, upper body, face focus, solo"
+                        )
+                    )
+                )
+                resolved = service.resolve_request(
+                    GenerationRequest(
+                        request_text="1girl, 1boy, hetero",
+                        multi_person_framing=mode,
+                        model_key="animagine_adult",
+                        rating="explicit",
+                        source="discord.generate_ai",
+                    )
+                )
+                positive = {token.strip() for token in resolved.prompt_result.positive.split(",")}
+                self.assertIn(expected, positive)
+                self.assertNotIn("portrait", positive)
+                self.assertNotIn("upper body", positive)
+                self.assertNotIn("face focus", positive)
+                self.assertNotIn("solo", positive)
+
     def test_registered_character_preset_preserves_confirmed_prompt_and_negative(self):
         confirmed = _prompt_result(
             positive="1girl, kochiya sanae, green hair",
@@ -412,7 +485,7 @@ class GenerationServicePreparationTests(unittest.TestCase):
         self.assertEqual("conflicts_with_multi_person_framing", suppressed.reason)
         self.assertEqual(("portrait",), prepared.resolved.framing_semantics.suppressed)
 
-    def test_multi_person_auto_framing_keeps_moderate_upper_body(self):
+    def test_multi_person_auto_framing_suppresses_auto_upper_body(self):
         service = GenerationService(
             prompt_resolver=Mock(
                 return_value=_prompt_result(
@@ -428,8 +501,8 @@ class GenerationServicePreparationTests(unittest.TestCase):
         )
 
         prepared = service.prepare_generation(request)
-        self.assertIn("upper body", prepared.options.prompt)
-        self.assertFalse(prepared.resolved.framing_semantics.suppressed)
+        self.assertNotIn("upper body", prepared.options.prompt)
+        self.assertIn("upper body", prepared.resolved.framing_semantics.suppressed)
 
     def test_multi_person_ui_full_body_adds_verified_tag_and_suppresses_auto_framing(self):
         service = GenerationService(
@@ -454,6 +527,89 @@ class GenerationServicePreparationTests(unittest.TestCase):
         self.assertNotIn("portrait", positive)
         self.assertEqual("full_body", prepared.resolved.multi_person_framing_effective)
         self.assertIn(("full body", "user_ui"), {(item.tag, item.source) for item in prepared.resolved.provenance})
+
+    def test_adult_multi_person_full_body_adds_auto_wide_shot(self):
+        for rating in ("explicit", "nsfw"):
+            with self.subTest(rating=rating):
+                service = GenerationService(
+                    prompt_resolver=Mock(
+                        return_value=_prompt_result(
+                            "1girl, 1boy, hetero, portrait, upper body, close-up, face focus, solo"
+                        )
+                    )
+                )
+                request = GenerationRequest(
+                    explicit_tags=("1girl", "1boy", "hetero"),
+                    request_text="hetero",
+                    multi_person_framing="full_body",
+                    model_key="animagine_adult",
+                    rating=rating,
+                )
+
+                prepared = service.prepare_generation(request)
+                tokens = {token.strip() for token in prepared.options.prompt.split(",")}
+                self.assertIn("full body", tokens)
+                self.assertIn("wide shot", tokens)
+                self.assertFalse(
+                    {"portrait", "upper body", "close-up", "face focus", "solo"}.intersection(tokens)
+                )
+                self.assertIn(
+                    ("wide shot", "framing_auto"),
+                    {(item.tag, item.source) for item in prepared.resolved.provenance},
+                )
+
+    def test_adult_wide_shot_injection_respects_scope_and_user_framing(self):
+        cases = (
+            ("safe", ("1girl", "1boy", "hetero"), "full_body", False),
+            ("explicit", ("1girl",), "full_body", False),
+            ("explicit", ("1girl", "1boy", "hetero"), "cowboy", False),
+            ("explicit", ("1girl", "1boy", "hetero", "close-up"), "full_body", False),
+        )
+        for rating, explicit_tags, mode, expect_wide in cases:
+            with self.subTest(rating=rating, explicit_tags=explicit_tags, mode=mode):
+                prompt = (
+                    "1girl, portrait, solo"
+                    if len(explicit_tags) == 1
+                    else "1girl, 1boy, hetero, close-up, portrait, solo"
+                )
+                service = GenerationService(
+                    prompt_resolver=Mock(
+                        return_value=_prompt_result(prompt)
+                    )
+                )
+                prepared = service.prepare_generation(
+                    GenerationRequest(
+                        explicit_tags=explicit_tags,
+                        request_text="hetero" if len(explicit_tags) > 1 else "standing",
+                        multi_person_framing=mode,
+                        model_key="animagine_adult",
+                        rating=rating,
+                    )
+                )
+                tokens = {token.strip() for token in prepared.options.prompt.split(",")}
+                self.assertEqual(expect_wide, "wide shot" in tokens)
+                if "close-up" in explicit_tags:
+                    self.assertIn("close-up", tokens)
+
+    def test_adult_wide_shot_does_not_duplicate_existing_tag(self):
+        service = GenerationService(
+            prompt_resolver=Mock(
+                return_value=_prompt_result("1girl, 1boy, hetero, full body, wide shot")
+            )
+        )
+        prepared = service.prepare_generation(
+            GenerationRequest(
+                explicit_tags=("1girl", "1boy", "hetero", "wide shot"),
+                request_text="hetero",
+                multi_person_framing="full_body",
+                model_key="animagine_adult",
+                rating="explicit",
+            )
+        )
+        self.assertEqual(
+            1,
+            sum(token.strip() == "wide shot" for token in prepared.options.prompt.split(",")),
+        )
 
     def test_multi_person_explicit_framing_wins_over_ui_mode_and_is_recorded(self):
         service = GenerationService(

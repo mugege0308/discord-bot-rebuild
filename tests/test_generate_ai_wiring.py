@@ -88,6 +88,25 @@ class GenerateAiWiringTestCase(unittest.TestCase):
         self.assertIn("reference_image_content_type", keyword_names)
         self.assertIn("reference_strength", keyword_names)
 
+    def test_generate_ai_forwards_composition_to_shared_multi_person_framing(self):
+        function = _find_function(self.tree, "slash_generate_ai")
+        call = _find_calls(function, "_build_shogou_prompt_result")[0]
+        keyword_names = {keyword.arg for keyword in call.keywords}
+        self.assertIn("multi_person_framing", keyword_names)
+
+    def test_shogou_request_carries_multi_person_framing_into_generation_service(self):
+        function = _find_function(self.tree, "_build_shogou_prompt_result")
+        calls = [
+            node
+            for node in ast.walk(function)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "GenerationRequest"
+        ]
+        self.assertEqual(1, len(calls))
+        keyword_names = {keyword.arg for keyword in calls[0].keywords}
+        self.assertIn("multi_person_framing", keyword_names)
+
     def test_generate_ai_model_choices_include_normal_and_adult_profiles(self):
         self.assertEqual(
             [(choice.name, choice.value) for choice in GENERATE_AI_MODEL_CHOICES],
