@@ -210,7 +210,7 @@ def resolve_multi_person_framing_decision(
             effective=mode,
             source="adult_multi_person_full_body_auto",
             preferred_tag=preferred_tag,
-            supplemental_tags=("wide shot",),
+            supplemental_tags=("long shot",),
         )
     return MultiPersonFramingDecision(
         requested=mode,

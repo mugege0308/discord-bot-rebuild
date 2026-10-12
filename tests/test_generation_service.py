@@ -528,7 +528,7 @@ class GenerationServicePreparationTests(unittest.TestCase):
         self.assertEqual("full_body", prepared.resolved.multi_person_framing_effective)
         self.assertIn(("full body", "user_ui"), {(item.tag, item.source) for item in prepared.resolved.provenance})
 
-    def test_adult_multi_person_full_body_adds_auto_wide_shot(self):
+    def test_adult_multi_person_full_body_adds_auto_long_shot(self):
         for rating in ("explicit", "nsfw"):
             with self.subTest(rating=rating):
                 service = GenerationService(
@@ -549,23 +549,23 @@ class GenerationServicePreparationTests(unittest.TestCase):
                 prepared = service.prepare_generation(request)
                 tokens = {token.strip() for token in prepared.options.prompt.split(",")}
                 self.assertIn("full body", tokens)
-                self.assertIn("wide shot", tokens)
+                self.assertIn("long shot", tokens)
                 self.assertFalse(
                     {"portrait", "upper body", "close-up", "face focus", "solo"}.intersection(tokens)
                 )
                 self.assertIn(
-                    ("wide shot", "framing_auto"),
+                    ("long shot", "framing_auto"),
                     {(item.tag, item.source) for item in prepared.resolved.provenance},
                 )
 
-    def test_adult_wide_shot_injection_respects_scope_and_user_framing(self):
+    def test_adult_long_shot_injection_respects_scope_and_user_framing(self):
         cases = (
             ("safe", ("1girl", "1boy", "hetero"), "full_body", False),
             ("explicit", ("1girl",), "full_body", False),
             ("explicit", ("1girl", "1boy", "hetero"), "cowboy", False),
             ("explicit", ("1girl", "1boy", "hetero", "close-up"), "full_body", False),
         )
-        for rating, explicit_tags, mode, expect_wide in cases:
+        for rating, explicit_tags, mode, expect_long in cases:
             with self.subTest(rating=rating, explicit_tags=explicit_tags, mode=mode):
                 prompt = (
                     "1girl, portrait, solo"
@@ -587,19 +587,19 @@ class GenerationServicePreparationTests(unittest.TestCase):
                     )
                 )
                 tokens = {token.strip() for token in prepared.options.prompt.split(",")}
-                self.assertEqual(expect_wide, "wide shot" in tokens)
+                self.assertEqual(expect_long, "long shot" in tokens)
                 if "close-up" in explicit_tags:
                     self.assertIn("close-up", tokens)
 
-    def test_adult_wide_shot_does_not_duplicate_existing_tag(self):
+    def test_adult_long_shot_does_not_duplicate_existing_tag(self):
         service = GenerationService(
             prompt_resolver=Mock(
-                return_value=_prompt_result("1girl, 1boy, hetero, full body, wide shot")
+                return_value=_prompt_result("1girl, 1boy, hetero, full body, long shot")
             )
         )
         prepared = service.prepare_generation(
             GenerationRequest(
-                explicit_tags=("1girl", "1boy", "hetero", "wide shot"),
+                explicit_tags=("1girl", "1boy", "hetero", "long shot"),
                 request_text="hetero",
                 multi_person_framing="full_body",
                 model_key="animagine_adult",
@@ -608,7 +608,7 @@ class GenerationServicePreparationTests(unittest.TestCase):
         )
         self.assertEqual(
             1,
-            sum(token.strip() == "wide shot" for token in prepared.options.prompt.split(",")),
+            sum(token.strip() == "long shot" for token in prepared.options.prompt.split(",")),
         )
 
     def test_multi_person_explicit_framing_wins_over_ui_mode_and_is_recorded(self):
