@@ -26,6 +26,11 @@ from services.image_generation_profiles import (
     is_image_generation_profile_enabled,
     profile_model_components,
 )
+from services.interaction_profiles import (
+    InteractionProfileError,
+    apply_prompt_only_profile,
+    resolve_phase1_interaction,
+)
 from services.multi_person_framing import (
     MULTI_PERSON_FRAMING_TAGS,
     MultiPersonFramingDecision,
@@ -279,6 +284,7 @@ class GenerationRequest:
     explicit_tags: tuple[str, ...] = ()
     appearance_text: str | None = None
     request_text: str | None = None
+    interaction_id: str | None = None
     model_key: str = DEFAULT_IMAGE_GENERATION_MODEL_KEY
     # ``t2i`` is the backwards-compatible default.  ``edit`` is currently
     # implemented only by the isolated Qwen-Image 2.1 adapter.
@@ -317,6 +323,10 @@ class GenerationRequest:
         object.__setattr__(self, "source_metadata", dict(self.source_metadata or {}))
         object.__setattr__(self, "multi_person_framing", validate_multi_person_framing(self.multi_person_framing))
         object.__setattr__(self, "mode", str(self.mode or "t2i").casefold().strip())
+        if self.interaction_id is not None:
+            if not isinstance(self.interaction_id, str) or not self.interaction_id.strip():
+                raise PromptGeneratorError("interaction_idが不正です。")
+            object.__setattr__(self, "interaction_id", self.interaction_id.strip())
 
     @property
     def prompt_input(self) -> str:
@@ -652,6 +662,44 @@ class GenerationService:
         )
 
     @staticmethod
+    def _apply_interaction_profile(resolved: ResolvedGeneration) -> ResolvedGeneration:
+        """Apply only an explicitly released prompt-only interaction profile."""
+
+        interaction_id = resolved.request.interaction_id
+        if interaction_id is None:
+            return resolved
+        try:
+            profile = resolve_phase1_interaction(interaction_id)
+        except InteractionProfileError as exc:
+            raise PromptGeneratorError(str(exc)) from exc
+        positive, negative = apply_prompt_only_profile(
+            profile,
+            resolved.prompt_result.positive,
+            resolved.prompt_result.negative,
+        )
+        profile_provenance = tuple(
+            TagProvenance(tag, "interaction_profile")
+            for tag in (*profile.prompt_additions, *profile.negative_additions)
+        )
+        prepared_result = replace(
+            resolved.prompt_result,
+            positive=positive,
+            negative=negative,
+            user_grounded_tags=_dedupe_tags(
+                (*resolved.prompt_result.user_grounded_tags, *profile.prompt_additions)
+            ),
+            tag_provenance=tuple(
+                f"{item.tag} -> {item.source}"
+                for item in (*resolved.provenance, *profile_provenance)
+            ),
+        )
+        return replace(
+            resolved,
+            prompt_result=prepared_result,
+            provenance=tuple(dict.fromkeys((*resolved.provenance, *profile_provenance))),
+        )
+
+    @staticmethod
     def _finalize_resolved_prompt(resolved: ResolvedGeneration) -> ResolvedGeneration:
         """Apply the shared semantic conflict rules at the request boundary.
 
@@ -767,9 +815,9 @@ class GenerationService:
         )
         if not isinstance(prompt_result, ShogouPromptResult):
             raise PromptGeneratorError("Prompt Designerの結果が不正です。")
-        return self._finalize_resolved_prompt(
-            self._merge_resolved_prompt(request, prompt_result)
-        )
+        resolved = self._merge_resolved_prompt(request, prompt_result)
+        resolved = self._apply_interaction_profile(resolved)
+        return self._finalize_resolved_prompt(resolved)
 
     @staticmethod
     def _resolve_qwen_request(request: GenerationRequest) -> ResolvedGeneration:
@@ -996,7 +1044,9 @@ class GenerationService:
             )
         if resolved is None:
             if prompt_result is not None:
-                resolved = self._merge_resolved_prompt(request, prompt_result)
+                resolved = self._apply_interaction_profile(
+                    self._merge_resolved_prompt(request, prompt_result)
+                )
             else:
                 resolved = self.resolve_request(request)
 

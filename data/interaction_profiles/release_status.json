@@ -1,0 +1,424 @@
+{
+  "version": 1,
+  "generated_from": [
+    "interaction_profiles.json",
+    "e2e/**/*.json",
+    "e2e_*.json"
+  ],
+  "profiles": {
+    "holding_hands": {
+      "profile_id": "holding_hands",
+      "classification": "production_candidate",
+      "ready": true,
+      "status": "validated",
+      "mode": "prompt_only",
+      "reasons": [
+        "validated_e2e_semantics_and_no_blocking_failures"
+      ],
+      "known_risks": [],
+      "evidence": {
+        "e2e": true,
+        "semantic_success": true,
+        "semantic_evidence": true,
+        "evidence_count": 1,
+        "paths": [
+          "../e2e_holding_hands_424242.json"
+        ]
+      }
+    },
+    "piggyback": {
+      "profile_id": "piggyback",
+      "classification": "experimental",
+      "ready": true,
+      "status": "validated",
+      "mode": "prompt_only",
+      "reasons": [
+        "semantic_interaction_failure",
+        "full_body_partial_or_failed"
+      ],
+      "known_risks": [],
+      "evidence": {
+        "e2e": true,
+        "semantic_success": false,
+        "semantic_evidence": true,
+        "evidence_count": 3,
+        "paths": [
+          "manual_evaluation_424242.json",
+          "piggyback/piggyback_424242.json",
+          "prompt_only_summary_424242.json"
+        ]
+      }
+    },
+    "dancing_together": {
+      "profile_id": "dancing_together",
+      "classification": "production_candidate",
+      "ready": true,
+      "status": "validated",
+      "mode": "prompt_only",
+      "reasons": [
+        "validated_e2e_semantics_and_no_blocking_failures"
+      ],
+      "known_risks": [],
+      "evidence": {
+        "e2e": true,
+        "semantic_success": true,
+        "semantic_evidence": true,
+        "evidence_count": 3,
+        "paths": [
+          "dancing_together/dancing_together_424242.json",
+          "manual_evaluation_424242.json",
+          "prompt_only_summary_424242.json"
+        ]
+      }
+    },
+    "hand_on_shoulder": {
+      "profile_id": "hand_on_shoulder",
+      "classification": "production_candidate",
+      "ready": true,
+      "status": "validated",
+      "mode": "prompt_only",
+      "reasons": [
+        "validated_e2e_semantics_and_no_blocking_failures"
+      ],
+      "known_risks": [],
+      "evidence": {
+        "e2e": true,
+        "semantic_success": true,
+        "semantic_evidence": true,
+        "evidence_count": 3,
+        "paths": [
+          "hand_on_shoulder/hand_on_shoulder_424242.json",
+          "manual_evaluation_424242.json",
+          "prompt_only_summary_424242.json"
+        ]
+      }
+    },
+    "arm_around_shoulder": {
+      "profile_id": "arm_around_shoulder",
+      "classification": "production_candidate",
+      "ready": true,
+      "status": "validated",
+      "mode": "prompt_only",
+      "reasons": [
+        "validated_e2e_semantics_and_no_blocking_failures"
+      ],
+      "known_risks": [],
+      "evidence": {
+        "e2e": true,
+        "semantic_success": true,
+        "semantic_evidence": true,
+        "evidence_count": 3,
+        "paths": [
+          "arm_around_shoulder/arm_around_shoulder_424242.json",
+          "manual_evaluation_424242.json",
+          "prompt_only_summary_424242.json"
+        ]
+      }
+    },
+    "leaning_on_partner": {
+      "profile_id": "leaning_on_partner",
+      "classification": "production_candidate",
+      "ready": true,
+      "status": "validated",
+      "mode": "prompt_only",
+      "reasons": [
+        "validated_e2e_semantics_and_no_blocking_failures"
+      ],
+      "known_risks": [],
+      "evidence": {
+        "e2e": true,
+        "semantic_success": true,
+        "semantic_evidence": true,
+        "evidence_count": 3,
+        "paths": [
+          "leaning_on_partner/leaning_on_partner_424242.json",
+          "manual_evaluation_424242.json",
+          "prompt_only_summary_424242.json"
+        ]
+      }
+    },
+    "sitting_together": {
+      "profile_id": "sitting_together",
+      "classification": "experimental",
+      "ready": true,
+      "status": "validated",
+      "mode": "prompt_only",
+      "reasons": [
+        "crop_risk",
+        "full_body_partial_or_failed"
+      ],
+      "known_risks": [
+        "固定poseが必要なケースではPrompt onlyだけでは不安定になり得る"
+      ],
+      "evidence": {
+        "e2e": true,
+        "semantic_success": true,
+        "semantic_evidence": true,
+        "evidence_count": 3,
+        "paths": [
+          "manual_evaluation_424242.json",
+          "prompt_only_summary_424242.json",
+          "sitting_together/sitting_together_424242.json"
+        ]
+      }
+    },
+    "embracing": {
+      "profile_id": "embracing",
+      "classification": "experimental",
+      "ready": true,
+      "status": "usable",
+      "mode": "prompt_only",
+      "reasons": [
+        "status_not_validated"
+      ],
+      "known_risks": [
+        "厳密な相互抱擁では腕ownershipが不安定"
+      ],
+      "evidence": {
+        "e2e": true,
+        "semantic_success": true,
+        "semantic_evidence": true,
+        "evidence_count": 3,
+        "paths": [
+          "embracing/embracing_424242.json",
+          "manual_evaluation_usable_424242.json",
+          "prompt_only_usable_summary_424242.json"
+        ]
+      }
+    },
+    "holding_waist": {
+      "profile_id": "holding_waist",
+      "classification": "experimental",
+      "ready": true,
+      "status": "usable",
+      "mode": "prompt_only",
+      "reasons": [
+        "status_not_validated",
+        "semantic_interaction_failure",
+        "crop_risk",
+        "full_body_partial_or_failed"
+      ],
+      "known_risks": [],
+      "evidence": {
+        "e2e": true,
+        "semantic_success": false,
+        "semantic_evidence": true,
+        "evidence_count": 3,
+        "paths": [
+          "holding_waist/holding_waist_424242.json",
+          "manual_evaluation_usable_424242.json",
+          "prompt_only_usable_summary_424242.json"
+        ]
+      }
+    },
+    "lying_together": {
+      "profile_id": "lying_together",
+      "classification": "experimental",
+      "ready": true,
+      "status": "usable",
+      "mode": "prompt_only",
+      "reasons": [
+        "status_not_validated",
+        "semantic_interaction_failure",
+        "crop_risk",
+        "full_body_partial_or_failed"
+      ],
+      "known_risks": [],
+      "evidence": {
+        "e2e": true,
+        "semantic_success": false,
+        "semantic_evidence": true,
+        "evidence_count": 3,
+        "paths": [
+          "lying_together/lying_together_424242.json",
+          "manual_evaluation_usable_424242.json",
+          "prompt_only_usable_summary_424242.json"
+        ]
+      }
+    },
+    "face_to_face": {
+      "profile_id": "face_to_face",
+      "classification": "experimental",
+      "ready": true,
+      "status": "usable",
+      "mode": "prompt_only",
+      "reasons": [
+        "status_not_validated"
+      ],
+      "known_risks": [
+        "顔向きや距離に軽い不安定さ"
+      ],
+      "evidence": {
+        "e2e": true,
+        "semantic_success": true,
+        "semantic_evidence": true,
+        "evidence_count": 3,
+        "paths": [
+          "face_to_face/face_to_face_424242.json",
+          "manual_evaluation_usable_424242.json",
+          "prompt_only_usable_summary_424242.json"
+        ]
+      }
+    },
+    "lap_pillow": {
+      "profile_id": "lap_pillow",
+      "classification": "experimental",
+      "ready": true,
+      "status": "usable",
+      "mode": "prompt_plus_framing",
+      "reasons": [
+        "status_not_validated",
+        "crop_risk",
+        "full_body_partial_or_failed"
+      ],
+      "known_risks": [
+        "full bodyがpartialになり得る"
+      ],
+      "evidence": {
+        "e2e": true,
+        "semantic_success": true,
+        "semantic_evidence": true,
+        "evidence_count": 3,
+        "paths": [
+          "lap_pillow/lap_pillow_424242.json",
+          "manual_evaluation_prompt_plus_framing_usable_424242.json",
+          "prompt_plus_framing_usable_summary_424242.json"
+        ]
+      }
+    },
+    "bridal_carry": {
+      "profile_id": "bridal_carry",
+      "classification": "experimental",
+      "ready": true,
+      "status": "usable",
+      "mode": "prompt_plus_framing",
+      "reasons": [
+        "status_not_validated",
+        "full_body_partial_or_failed"
+      ],
+      "known_risks": [
+        "full bodyがpartialになり得る"
+      ],
+      "evidence": {
+        "e2e": true,
+        "semantic_success": false,
+        "semantic_evidence": true,
+        "evidence_count": 3,
+        "paths": [
+          "bridal_carry/bridal_carry_424242.json",
+          "manual_evaluation_prompt_plus_framing_usable_424242.json",
+          "prompt_plus_framing_usable_summary_424242.json"
+        ]
+      }
+    },
+    "hugging": {
+      "profile_id": "hugging",
+      "classification": "production_candidate",
+      "ready": true,
+      "status": "validated",
+      "mode": "ipadapter_profile",
+      "reasons": [
+        "validated_e2e_semantics_and_no_blocking_failures"
+      ],
+      "known_risks": [
+        "seed依存で男性頭部がcropされることがある"
+      ],
+      "evidence": {
+        "e2e": true,
+        "semantic_success": true,
+        "semantic_evidence": true,
+        "evidence_count": 3,
+        "paths": [
+          "ipadapter_hugging_424242.json",
+          "ipadapter_hugging_preflight_424242.json"
+        ]
+      }
+    },
+    "carrying": {
+      "profile_id": "carrying",
+      "classification": "unavailable",
+      "ready": false,
+      "status": "needs_reference",
+      "mode": "unresolved",
+      "reasons": [
+        "needs_reference"
+      ],
+      "known_risks": [
+        "Prompt-only不成立",
+        "bridal carry/piggybackと重複しない専用reference不足"
+      ],
+      "evidence": {
+        "e2e": false,
+        "semantic_success": false,
+        "semantic_evidence": false,
+        "evidence_count": 0,
+        "paths": []
+      }
+    },
+    "forehead_touch": {
+      "profile_id": "forehead_touch",
+      "classification": "unavailable",
+      "ready": false,
+      "status": "needs_reference",
+      "mode": "unresolved",
+      "reasons": [
+        "needs_reference"
+      ],
+      "known_risks": [
+        "Prompt-onlyでは接触が不明瞭",
+        "明確なforehead-to-forehead reference不足"
+      ],
+      "evidence": {
+        "e2e": false,
+        "semantic_success": false,
+        "semantic_evidence": false,
+        "evidence_count": 0,
+        "paths": []
+      }
+    },
+    "cheek_kiss": {
+      "profile_id": "cheek_kiss",
+      "classification": "unavailable",
+      "ready": false,
+      "status": "needs_reference",
+      "mode": "unresolved",
+      "reasons": [
+        "needs_reference"
+      ],
+      "known_risks": [
+        "Prompt-onlyではlip kiss寄り",
+        "明確なcheek contact reference不足"
+      ],
+      "evidence": {
+        "e2e": false,
+        "semantic_success": false,
+        "semantic_evidence": false,
+        "evidence_count": 0,
+        "paths": []
+      }
+    },
+    "foreground_background": {
+      "profile_id": "foreground_background",
+      "classification": "unavailable",
+      "ready": false,
+      "status": "difficult",
+      "mode": "unresolved",
+      "reasons": [
+        "difficult"
+      ],
+      "known_risks": [
+        "Prompt-onlyで1人化",
+        "Mask + OpenPoseで3人化",
+        "半透明人物",
+        "scale/geometry崩壊"
+      ],
+      "evidence": {
+        "e2e": false,
+        "semantic_success": false,
+        "semantic_evidence": false,
+        "evidence_count": 0,
+        "paths": []
+      }
+    }
+  }
+}

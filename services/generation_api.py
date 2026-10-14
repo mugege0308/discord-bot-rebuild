@@ -65,6 +65,12 @@ from services.image_generation_profiles import (
     get_image_generation_profile,
     is_image_generation_profile_enabled,
 )
+from services.interaction_profiles import (
+    InteractionProfileError,
+    interaction_metadata,
+    list_phase1_profiles,
+    resolve_phase1_interaction,
+)
 from services.lora_catalog import COMFY_STYLES, model_family_compatible
 from services.lora_training import LORA_TYPES, normalize_lora_type
 from services.prompt_generator import PromptGeneratorError, _get_lmstudio_api_url
@@ -112,6 +118,7 @@ _ALLOWED_REQUEST_KEYS = frozenset(
         "explicit_tags",
         "appearance_text",
         "request_text",
+        "interaction_id",
         "model_key",
         "mode",
         "rating",
@@ -137,6 +144,10 @@ GENERATION_API_APP_KEY = web.AppKey("generation_api", object)
 
 class GenerationApiError(ValueError):
     """A client-visible, sanitized request validation error."""
+
+    def __init__(self, message: str, *, code: str | None = None) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 class GenerationDependencyError(GenerationApiError):
@@ -287,8 +298,11 @@ def _is_configured(*names: str) -> bool:
     return any(os.getenv(name, "").strip() for name in names)
 
 
-def _json_error(message: str, status: int = 400) -> web.Response:
-    return web.json_response({"error": message}, status=status)
+def _json_error(message: str, status: int = 400, *, code: str | None = None) -> web.Response:
+    payload: dict[str, object] = {"error": message}
+    if code:
+        payload["code"] = code
+    return web.json_response(payload, status=status)
 
 
 def _lm_studio_ready() -> bool:
@@ -325,6 +339,29 @@ def _clean_text(value: object, field_name: str, *, allow_none: bool = True) -> s
     if len(value) > MAX_TEXT_LENGTH:
         raise GenerationApiError(f"{field_name}が長すぎます。")
     return value or None
+
+
+def _parse_interaction_id(value: object) -> str | None:
+    """Validate the optional Phase 1 interaction id at the API boundary."""
+
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise GenerationApiError(
+            "interaction_idは文字列で指定してください。",
+            code="interaction_profile_schema_invalid",
+        )
+    interaction_id = value.strip()
+    if not interaction_id:
+        raise GenerationApiError(
+            "interaction_idが見つかりません。",
+            code="interaction_not_found",
+        )
+    try:
+        resolve_phase1_interaction(interaction_id)
+    except InteractionProfileError as exc:
+        raise GenerationApiError(str(exc), code=exc.code) from exc
+    return interaction_id
 
 
 def _parse_explicit_tags(value: object) -> tuple[str, ...]:
@@ -474,6 +511,8 @@ def _build_request(
     if unknown:
         raise GenerationApiError("サポートされていない生成項目が含まれています。")
 
+    interaction_id = _parse_interaction_id(payload.get("interaction_id"))
+
     model_key = payload.get("model_key", "animagine")
     if not isinstance(model_key, str) or not model_key.strip():
         raise GenerationApiError("model_keyが不正です。")
@@ -550,6 +589,7 @@ def _build_request(
         explicit_tags=_parse_explicit_tags(payload.get("explicit_tags")),
         appearance_text=_clean_text(payload.get("appearance_text"), "appearance_text"),
         request_text=_clean_text(payload.get("request_text"), "request_text"),
+        interaction_id=interaction_id,
         model_key=model_key.strip(),
         mode=mode,
         rating=rating,
@@ -717,6 +757,9 @@ def _build_gallery_metadata(
         metadata["requested_seed"] = requested_seed_override
     if metadata_overrides:
         metadata.update(dict(metadata_overrides))
+    interaction = interaction_metadata(request.interaction_id)
+    if interaction is not None:
+        metadata["interaction"] = interaction
     return metadata
 
 
@@ -805,6 +848,7 @@ class GenerationApi:
             [
                 web.get("/api/generation/health", self.health),
                 web.get("/api/generation/options", self.options),
+                web.get("/api/generation/interaction-profiles", self.interaction_profiles),
                 web.get("/api/generation/tags/search", self.search_tags),
                 web.post("/api/generation/references", self.upload_reference),
                 web.post("/api/generation/jobs", self.create_job),
@@ -972,6 +1016,12 @@ class GenerationApi:
                 },
             }
         )
+
+    async def interaction_profiles(self, request: web.Request) -> web.Response:
+        """Return only Phase 1 profiles safe for Gallery selection."""
+
+        released = request.query.get("released", "production_candidate")
+        return web.json_response(list_phase1_profiles(released=released))
 
     async def search_tags(self, request: web.Request) -> web.Response:
         query = request.query.get("q", "")
@@ -1193,7 +1243,7 @@ class GenerationApi:
             self._reject_if_overnight_active()
         except GenerationApiError as exc:
             status = 409 if "夜間生成実行中" in str(exc) else 400
-            return _json_error(str(exc), status)
+            return _json_error(str(exc), status, code=exc.code)
         except web.HTTPRequestEntityTooLarge:
             return _json_error("リクエストが大きすぎます。", 413)
 
@@ -1246,7 +1296,7 @@ class GenerationApi:
             job = self.bulk_jobs.create(generation_request, raw_total, selection_mode, bulk_variation)
         except GenerationApiError as exc:
             status = 409 if "同時に1件" in str(exc) or "夜間生成実行中" in str(exc) else 400
-            return _json_error(str(exc), status)
+            return _json_error(str(exc), status, code=exc.code)
         except web.HTTPRequestEntityTooLarge:
             return _json_error("リクエストが大きすぎます。", 413)
 
