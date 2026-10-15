@@ -219,6 +219,11 @@ class SdGenerationOptions:
     reference_image_content_type: str | None = None
     reference_strength: float | None = None
     reference_mode: str = "none"
+    # Internal interaction profile execution details.  This is deliberately
+    # separate from user reference metadata and is only populated for a
+    # released IPAdapter interaction profile.
+    interaction_ipadapter: dict[str, Any] | None = None
+    interaction_execution: dict[str, Any] | None = None
     pose_reference_bytes: bytes | None = None
     pose_reference_content_type: str | None = None
     pose_reference_width: int | None = None
@@ -740,6 +745,12 @@ def validate_options(options: SdGenerationOptions) -> SdGenerationOptions:
         reference_image_content_type=reference_content_type,
         reference_strength=reference_strength,
         reference_mode=reference_mode,
+        interaction_ipadapter=(
+            None if options.interaction_ipadapter is None else dict(options.interaction_ipadapter)
+        ),
+        interaction_execution=(
+            None if options.interaction_execution is None else dict(options.interaction_execution)
+        ),
         pose_reference_bytes=options.pose_reference_bytes,
         pose_reference_content_type=pose_content_type,
         pose_reference_width=options.pose_reference_width,
@@ -1631,6 +1642,31 @@ def _apply_comfy_options(
             raise RuntimeError("ComfyUIへアップロードした参考画像名がありません。")
         _set_node_input(workflow, load_image_nodes[0], "image", reference_image_name)
         _set_node_input(workflow, adapter_nodes[0], "weight", options.reference_strength)
+        if options.interaction_ipadapter:
+            settings = options.interaction_ipadapter
+            adapter_node = workflow[adapter_nodes[0]]
+            inputs = adapter_node.setdefault("inputs", {})
+            # These fields are part of IPAdapterAdvanced's API contract.  The
+            # workflow's unified loader owns model/CLIP resolution; profile
+            # values are still retained in execution metadata and the preset
+            # is applied where the loader exposes it.
+            for profile_key, node_key in (
+                ("weight_type", "weight_type"),
+                ("combine_embeds", "combine_embeds"),
+                ("embeds_scaling", "embeds_scaling"),
+            ):
+                if profile_key in settings:
+                    inputs[node_key] = settings[profile_key]
+            if "start" in settings:
+                inputs["start_at"] = settings["start"]
+            if "end" in settings:
+                inputs["end_at"] = settings["end"]
+            loader_nodes = [
+                node for node in workflow.values()
+                if isinstance(node, dict) and str(node.get("class_type", "")) == "IPAdapterUnifiedLoader"
+            ]
+            if len(loader_nodes) == 1 and settings.get("preset"):
+                loader_nodes[0].setdefault("inputs", {})["preset"] = settings["preset"]
 
     if options.pose_reference_bytes is not None:
         if not pose_reference_name:

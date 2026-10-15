@@ -18,6 +18,7 @@ from services.interaction_profiles import (
     InteractionProfileNotFound,
     apply_prompt_only_profile,
     list_phase1_profiles,
+    list_production_profiles,
     resolve_interaction_profile,
     resolve_phase1_interaction,
 )
@@ -49,6 +50,20 @@ class InteractionProfileTests(unittest.TestCase):
         self.assertEqual("1girl, holding hands, full body, standing together", positive)
         self.assertEqual("bad quality", negative)
 
+    def test_production_listing_includes_released_hugging(self) -> None:
+        profiles = list_production_profiles()
+        self.assertEqual(
+            {
+                "holding_hands",
+                "dancing_together",
+                "hand_on_shoulder",
+                "arm_around_shoulder",
+                "leaning_on_partner",
+                "hugging",
+            },
+            {item["id"] for item in profiles},
+        )
+
     def test_all_phase1_profiles_are_accepted_as_prompt_only(self) -> None:
         expected = {
             "holding_hands",
@@ -71,7 +86,6 @@ class InteractionProfileTests(unittest.TestCase):
     def test_out_of_scope_profiles_are_rejected_without_fallback(self) -> None:
         cases = {
             "sitting_together": "interaction_not_released",
-            "hugging": "interaction_not_released",
             "embracing": "interaction_not_released",
             "carrying": "interaction_not_ready",
             "does_not_exist": "interaction_not_found",
@@ -88,7 +102,7 @@ class InteractionProfileTests(unittest.TestCase):
         with self.assertRaises(InteractionProfileNotFound):
             resolve_interaction_profile("does_not_exist")
         with self.assertRaises(GenerationApiError) as caught:
-            _build_request({"freeform_character": "couple", "interaction_id": "hugging"})
+            _build_request({"freeform_character": "couple", "interaction_id": "sitting_together"})
         self.assertEqual("interaction_not_released", caught.exception.code)
 
     def test_request_without_interaction_keeps_default(self) -> None:
@@ -158,7 +172,7 @@ class InteractionProfileTests(unittest.TestCase):
 
 
 class InteractionProfileApiTests(unittest.IsolatedAsyncioTestCase):
-    async def test_profile_listing_api_hides_non_phase1_profiles(self) -> None:
+    async def test_profile_listing_api_exposes_released_profiles(self) -> None:
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as tempdir:
             app = create_generation_app(overnight_db_path=Path(tempdir) / "overnight.db")
             server = TestServer(app)
@@ -168,8 +182,8 @@ class InteractionProfileApiTests(unittest.IsolatedAsyncioTestCase):
                 response = await client.get("/api/generation/interaction-profiles?released=production_candidate")
                 self.assertEqual(200, response.status)
                 payload = await response.json()
-                self.assertEqual(5, len(payload))
-                self.assertNotIn("hugging", {item["id"] for item in payload})
+                self.assertEqual(6, len(payload))
+                self.assertIn("hugging", {item["id"] for item in payload})
                 self.assertNotIn("prompt_additions", str(payload))
                 response = await client.get("/api/generation/interaction-profiles?released=experimental")
                 self.assertEqual([], await response.json())

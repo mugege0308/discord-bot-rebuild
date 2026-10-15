@@ -68,9 +68,10 @@ from services.image_generation_profiles import (
 from services.interaction_profiles import (
     InteractionProfileError,
     interaction_metadata,
-    list_phase1_profiles,
-    resolve_phase1_interaction,
+    list_production_profiles,
+    resolve_production_interaction,
 )
+from services.interaction_ipadapter import validate_hugging_compatibility
 from services.lora_catalog import COMFY_STYLES, model_family_compatible
 from services.lora_training import LORA_TYPES, normalize_lora_type
 from services.prompt_generator import PromptGeneratorError, _get_lmstudio_api_url
@@ -358,7 +359,7 @@ def _parse_interaction_id(value: object) -> str | None:
             code="interaction_not_found",
         )
     try:
-        resolve_phase1_interaction(interaction_id)
+        resolve_production_interaction(interaction_id)
     except InteractionProfileError as exc:
         raise GenerationApiError(str(exc), code=exc.code) from exc
     return interaction_id
@@ -613,6 +614,11 @@ def _build_request(
         generation_request.validate()
     except PromptGeneratorError as exc:
         raise GenerationApiError(str(exc)) from exc
+    if interaction_id == "hugging":
+        try:
+            validate_hugging_compatibility(generation_request)
+        except InteractionProfileError as exc:
+            raise GenerationApiError(str(exc), code=exc.code) from exc
     return generation_request
 
 
@@ -747,12 +753,33 @@ def _build_gallery_metadata(
         "tag_provenance": tag_provenance,
         "suppressed_tags": suppressed_tags,
         "prompt_conflicts": prompt_conflicts,
+        "prompt_designer_raw_positive": str(
+            prepared.resolved.prompt_designer_positive
+            or prepared.resolved.prompt_result.raw_llm_positive
+            or ""
+        ),
+        "prompt_designer_raw_negative": str(
+            prepared.resolved.prompt_designer_negative
+            or ""
+        ),
+        "prompt_constraint_removed_tags": [
+            item.to_dict()
+            for item in prepared.resolved.suppressed_tags
+            if str(item.source or "") in {"prompt_designer", "request_resolver"}
+            and (
+                str(item.reason or "").endswith("_conflict")
+                or str(item.reason or "").startswith("rating_")
+                or str(item.reason or "").startswith("interaction_")
+                or str(item.reason or "").startswith("composition_")
+            )
+        ],
         "people_semantics": prepared.resolved.people_semantics.to_dict(),
         "multi_person_framing_requested": prepared.resolved.multi_person_framing_requested,
         "multi_person_framing_effective": prepared.resolved.multi_person_framing_effective,
         "framing_semantics": prepared.resolved.framing_semantics.to_dict(),
         "multi_person_framing_source": prepared.resolved.multi_person_framing_source,
     }
+    metadata["removed_prompt_designer_tags"] = list(metadata["prompt_constraint_removed_tags"])
     if requested_seed_override is not _UNSET:
         metadata["requested_seed"] = requested_seed_override
     if metadata_overrides:
@@ -760,6 +787,15 @@ def _build_gallery_metadata(
     interaction = interaction_metadata(request.interaction_id)
     if interaction is not None:
         metadata["interaction"] = interaction
+    interaction_execution = getattr(options, "interaction_execution", None)
+    if isinstance(interaction_execution, Mapping):
+        # The execution record is intentionally limited to ledger values; no
+        # resolved filesystem path or raw reference bytes are persisted.
+        metadata["interaction_execution"] = {
+            str(key): value
+            for key, value in interaction_execution.items()
+            if str(key) not in {"reference_path", "image_bytes"}
+        }
     return metadata
 
 
@@ -1018,10 +1054,10 @@ class GenerationApi:
         )
 
     async def interaction_profiles(self, request: web.Request) -> web.Response:
-        """Return only Phase 1 profiles safe for Gallery selection."""
+        """Return all released profiles safe for Gallery selection."""
 
         released = request.query.get("released", "production_candidate")
-        return web.json_response(list_phase1_profiles(released=released))
+        return web.json_response(list_production_profiles(released=released))
 
     async def search_tags(self, request: web.Request) -> web.Response:
         query = request.query.get("q", "")

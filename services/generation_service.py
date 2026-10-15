@@ -29,7 +29,11 @@ from services.image_generation_profiles import (
 from services.interaction_profiles import (
     InteractionProfileError,
     apply_prompt_only_profile,
-    resolve_phase1_interaction,
+    resolve_production_interaction,
+)
+from services.interaction_ipadapter import (
+    preflight_ipadapter_profile,
+    validate_hugging_compatibility,
 )
 from services.multi_person_framing import (
     MULTI_PERSON_FRAMING_TAGS,
@@ -55,6 +59,7 @@ from services.prompt_conflict_resolver import (
     merge_prompt_framing_semantics,
     resolve_prompt_tag_conflicts,
 )
+from services.prompt_constraint_sanitizer import apply_request_prompt_constraints
 from services.qwen_image_prompt import build_qwen_prompt
 from services.sd_control import (
     GeneratedImage,
@@ -476,6 +481,8 @@ class ResolvedGeneration:
     multi_person_framing_requested: str = "auto"
     multi_person_framing_effective: str = "auto"
     multi_person_framing_source: str = "system_default"
+    prompt_designer_positive: str = ""
+    prompt_designer_negative: str = ""
 
 
 @dataclass(frozen=True)
@@ -558,6 +565,8 @@ class GenerationService:
         request: GenerationRequest,
         prompt_result: ShogouPromptResult,
     ) -> ResolvedGeneration:
+        prompt_designer_positive = str(prompt_result.raw_llm_positive or prompt_result.positive or "")
+        prompt_designer_negative = str(prompt_result.negative or "")
         explicit_tags, explicit_resolution = self._canonicalize_explicit_tags(request.explicit_tags)
         appearance = self._resolve_appearance(request.appearance_text)
 
@@ -659,6 +668,8 @@ class GenerationService:
             multi_person_framing_requested=framing_decision.requested,
             multi_person_framing_effective=framing_decision.effective,
             multi_person_framing_source=framing_decision.source,
+            prompt_designer_positive=prompt_designer_positive,
+            prompt_designer_negative=prompt_designer_negative,
         )
 
     @staticmethod
@@ -669,9 +680,13 @@ class GenerationService:
         if interaction_id is None:
             return resolved
         try:
-            profile = resolve_phase1_interaction(interaction_id)
+            profile = resolve_production_interaction(interaction_id)
         except InteractionProfileError as exc:
             raise PromptGeneratorError(str(exc)) from exc
+        if profile.mode != "prompt_only":
+            # Dedicated profiles supply their own prompt in the preparation
+            # path; never append their generic prompt additions to LLM output.
+            return resolved
         positive, negative = apply_prompt_only_profile(
             profile,
             resolved.prompt_result.positive,
@@ -697,6 +712,47 @@ class GenerationService:
             resolved,
             prompt_result=prepared_result,
             provenance=tuple(dict.fromkeys((*resolved.provenance, *profile_provenance))),
+        )
+
+    @staticmethod
+    def _apply_request_prompt_constraints(resolved: ResolvedGeneration) -> ResolvedGeneration:
+        """Apply request-owned safety/interaction constraints after profile merge."""
+
+        if resolved.request.interaction_id is None:
+            return resolved
+        try:
+            profile = resolve_production_interaction(resolved.request.interaction_id)
+        except InteractionProfileError as exc:
+            raise PromptGeneratorError(str(exc)) from exc
+        if profile.mode != "prompt_only":
+            return resolved
+        constrained = apply_request_prompt_constraints(
+            resolved.prompt_result.positive,
+            request=resolved.request,
+            profile=profile,
+            provenance=tuple(
+                PromptTagRecord(item.tag, item.source, item.category)
+                for item in resolved.provenance
+            ),
+        )
+        prepared_result = replace(
+            resolved.prompt_result,
+            positive=constrained.positive,
+            tag_provenance=tuple(
+                f"{item.tag} -> {item.source}"
+                for item in constrained.provenance
+            ),
+        )
+        return replace(
+            resolved,
+            prompt_result=prepared_result,
+            provenance=tuple(
+                TagProvenance(item.tag, item.source, item.category)
+                for item in constrained.provenance
+            ),
+            suppressed_tags=tuple(
+                dict.fromkeys((*resolved.suppressed_tags, *constrained.removed))
+            ),
         )
 
     @staticmethod
@@ -799,6 +855,40 @@ class GenerationService:
             if not is_image_generation_profile_enabled(profile):
                 raise PromptGeneratorError("Qwen-Image 2.1は現在無効です。")
             return self._resolve_qwen_request(request)
+        if request.interaction_id is not None:
+            try:
+                interaction_profile = resolve_production_interaction(request.interaction_id)
+            except InteractionProfileError as exc:
+                raise PromptGeneratorError(str(exc)) from exc
+            if interaction_profile.mode == "ipadapter_profile":
+                try:
+                    validate_hugging_compatibility(request)
+                except InteractionProfileError as exc:
+                    raise PromptGeneratorError(f"{exc.code}: {exc}") from exc
+                if not interaction_profile.dedicated_positive or not interaction_profile.dedicated_negative:
+                    raise PromptGeneratorError("interaction_profile_schema_invalid: dedicated promptが不足しています。")
+                dedicated = ShogouPromptResult(
+                    positive=interaction_profile.dedicated_positive,
+                    negative=interaction_profile.dedicated_negative,
+                    summary=interaction_profile.dedicated_positive,
+                    raw_llm_positive=interaction_profile.dedicated_positive,
+                    user_grounded_tags=tuple(
+                        part.strip()
+                        for part in interaction_profile.dedicated_positive.split(",")
+                        if part.strip()
+                    ),
+                )
+                provenance = tuple(
+                    TagProvenance(tag, "interaction_profile")
+                    for tag in _positive_tokens(interaction_profile.dedicated_positive)
+                )
+                return ResolvedGeneration(
+                    request=request,
+                    prompt_result=dedicated,
+                    provenance=provenance,
+                    prompt_designer_positive="",
+                    prompt_designer_negative="",
+                )
         resolver = prompt_resolver or self._prompt_resolver or generate_shogou_prompt_result
         resolver_kwargs: dict[str, Any] = {
             "enable_generic_danbooru": request.enable_generic_danbooru,
@@ -816,8 +906,97 @@ class GenerationService:
         if not isinstance(prompt_result, ShogouPromptResult):
             raise PromptGeneratorError("Prompt Designerの結果が不正です。")
         resolved = self._merge_resolved_prompt(request, prompt_result)
+        resolved = self._apply_request_prompt_constraints(resolved)
         resolved = self._apply_interaction_profile(resolved)
         return self._finalize_resolved_prompt(resolved)
+
+    def _prepare_ipadapter_generation(
+        self,
+        request: GenerationRequest,
+        profile: Any,
+        *,
+        resolved: ResolvedGeneration | None,
+        gallery_output_root: Path | None,
+        gallery_metadata: Mapping[str, Any] | None,
+    ) -> PreparedGeneration:
+        """Prepare a released dedicated IPAdapter interaction without LLM prompt output."""
+
+        try:
+            validate_hugging_compatibility(request)
+        except InteractionProfileError as exc:
+            raise PromptGeneratorError(f"{exc.code}: {exc}") from exc
+        if profile.mode != "ipadapter_profile":
+            raise PromptGeneratorError(f"interaction modeはIPAdapterではありません: {profile.mode}")
+        try:
+            reference = preflight_ipadapter_profile(profile)
+        except InteractionProfileError as exc:
+            raise PromptGeneratorError(f"{exc.code}: {exc}") from exc
+        if not profile.dedicated_positive or not profile.dedicated_negative:
+            raise PromptGeneratorError("interaction_profile_schema_invalid: dedicated promptが不足しています。")
+        image_profile = get_image_generation_profile(request.model_key.strip())
+
+        dedicated = ShogouPromptResult(
+            positive=profile.dedicated_positive,
+            negative=profile.dedicated_negative,
+            summary=profile.dedicated_positive,
+            raw_llm_positive=profile.dedicated_positive,
+            user_grounded_tags=tuple(_positive_tokens(profile.dedicated_positive)),
+        )
+        profile_provenance = tuple(
+            TagProvenance(tag, "interaction_profile")
+            for tag in _positive_tokens(profile.dedicated_positive)
+        )
+        prepared_resolved = replace(
+            resolved
+            or ResolvedGeneration(request=request, prompt_result=dedicated),
+            prompt_result=dedicated,
+            provenance=profile_provenance,
+            explicit_tags=(),
+            appearance_tags=(),
+            prompt_designer_positive=(resolved.prompt_designer_positive if resolved else ""),
+            prompt_designer_negative=(resolved.prompt_designer_negative if resolved else ""),
+        )
+        execution = {
+            "profile_id": profile.id,
+            "reference_sha256": reference.reference_sha256,
+            "preprocess": reference.preprocess,
+            **reference.ipadapter,
+        }
+        options = SdGenerationOptions(
+            prompt=profile.dedicated_positive,
+            negative_prompt=profile.dedicated_negative,
+            model_key=image_profile.model_key,
+            model_family=image_profile.model_family,
+            engine=image_profile.engine,
+            workflow_key=image_profile.workflow_key,
+            model_components=profile_model_components(image_profile),
+            filename_prefix=image_profile.filename_prefix,
+            model_selection_explicit=request.model_selection_explicit,
+            preserve_prompt_text=True,
+            count=1,
+            width=request.width,
+            height=request.height,
+            steps=request.steps,
+            cfg=request.cfg,
+            sampler=request.sampler,
+            seed=request.seed,
+            loras=(),
+            reference_image_bytes=reference.image_bytes,
+            reference_image_content_type=reference.content_type,
+            reference_strength=float(reference.ipadapter["weight"]),
+            reference_mode="composition",
+            interaction_ipadapter=dict(reference.ipadapter),
+            interaction_execution=execution,
+            gallery_output_root=gallery_output_root,
+            gallery_metadata=(None if gallery_metadata is None else dict(gallery_metadata)),
+            explicit_generation_fields=request.explicit_generation_fields,
+        )
+        return PreparedGeneration(
+            request=request,
+            resolved=prepared_resolved,
+            options=options,
+            requested_seed=request.seed,
+        )
 
     @staticmethod
     def _resolve_qwen_request(request: GenerationRequest) -> ResolvedGeneration:
@@ -1042,10 +1221,25 @@ class GenerationService:
                 gallery_output_root=gallery_output_root,
                 gallery_metadata=gallery_metadata,
             )
+        if request.interaction_id is not None:
+            try:
+                interaction_profile = resolve_production_interaction(request.interaction_id)
+            except InteractionProfileError as exc:
+                raise PromptGeneratorError(str(exc)) from exc
+            if interaction_profile.mode == "ipadapter_profile":
+                return self._prepare_ipadapter_generation(
+                    request,
+                    interaction_profile,
+                    resolved=resolved,
+                    gallery_output_root=gallery_output_root,
+                    gallery_metadata=gallery_metadata,
+                )
         if resolved is None:
             if prompt_result is not None:
                 resolved = self._apply_interaction_profile(
-                    self._merge_resolved_prompt(request, prompt_result)
+                    self._apply_request_prompt_constraints(
+                        self._merge_resolved_prompt(request, prompt_result)
+                    )
                 )
             else:
                 resolved = self.resolve_request(request)

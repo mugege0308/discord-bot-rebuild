@@ -1,8 +1,8 @@
-"""Production interaction-profile ledger and Phase 1 release gate.
+"""Production interaction-profile ledger and release gates.
 
 The ledger is owned by the Backend.  This module intentionally exposes only
-the small prompt-only surface released in Phase 1; profile details for future
-IPAdapter or framing modes remain unavailable to the production request path.
+the profile ledger is the sole source of truth for both the prompt-only Phase 1
+profiles and the narrowly released Phase 2 IPAdapter profile.
 """
 
 from __future__ import annotations
@@ -25,6 +25,8 @@ PHASE1_RELEASED_IDS = (
     "arm_around_shoulder",
     "leaning_on_partner",
 )
+
+PRODUCTION_RELEASED_IDS = PHASE1_RELEASED_IDS + ("hugging",)
 
 
 class InteractionProfileError(ValueError):
@@ -54,6 +56,18 @@ class InteractionProfileModeUnsupported(InteractionProfileError):
     code = "interaction_mode_unsupported"
 
 
+class InteractionProfileCompatibilityError(InteractionProfileError):
+    """The request cannot be combined with the selected interaction profile."""
+
+
+class InteractionReferenceMissing(InteractionProfileError):
+    code = "interaction_reference_missing"
+
+
+class InteractionChecksumMismatch(InteractionProfileError):
+    code = "interaction_checksum_mismatch"
+
+
 @dataclass(frozen=True)
 class InteractionProfile:
     id: str
@@ -65,6 +79,10 @@ class InteractionProfile:
     ledger_version: int
     prompt_additions: tuple[str, ...]
     negative_additions: tuple[str, ...]
+    dedicated_positive: str | None = None
+    dedicated_negative: str | None = None
+    reference: dict[str, Any] | None = None
+    ipadapter: dict[str, Any] | None = None
 
     def public_dict(self) -> dict[str, object]:
         """Return only values safe for the Gallery profile-listing API."""
@@ -166,6 +184,20 @@ def resolve_interaction_profile(interaction_id: str) -> InteractionProfile:
         ledger_version=version,
         prompt_additions=_dedupe_tags(raw.get("prompt_additions", ())),
         negative_additions=_dedupe_tags(raw.get("negative_additions", ())),
+        dedicated_positive=(
+            str(raw["dedicated_positive"]).strip()
+            if isinstance(raw.get("dedicated_positive"), str)
+            and raw["dedicated_positive"].strip()
+            else None
+        ),
+        dedicated_negative=(
+            str(raw["dedicated_negative"]).strip()
+            if isinstance(raw.get("dedicated_negative"), str)
+            and raw["dedicated_negative"].strip()
+            else None
+        ),
+        reference=(dict(raw["reference"]) if isinstance(raw.get("reference"), dict) else None),
+        ipadapter=(dict(raw["ipadapter"]) if isinstance(raw.get("ipadapter"), dict) else None),
     )
 
 
@@ -184,6 +216,28 @@ def resolve_phase1_interaction(interaction_id: str) -> InteractionProfile:
     return profile
 
 
+def resolve_production_interaction(interaction_id: str) -> InteractionProfile:
+    """Resolve an exact interaction released for the production request path.
+
+    Phase 1 remains an explicit five-profile prompt-only allowlist.  Phase 2
+    adds only the validated ``hugging`` IPAdapter profile; all other ledger
+    entries remain unreleased and never fall back to another mode.
+    """
+
+    profile = resolve_interaction_profile(interaction_id)
+    if not profile.ready:
+        raise InteractionProfileNotReady(f"interaction profileは未準備です: {profile.id}")
+    if profile.classification != "production_candidate" or profile.status != "validated":
+        raise InteractionProfileNotReleased(f"interaction profileはProduction未公開です: {profile.id}")
+    if profile.id in PHASE1_RELEASED_IDS:
+        if profile.mode != "prompt_only":
+            raise InteractionProfileModeUnsupported(f"interaction modeはPhase 1未対応です: {profile.mode}")
+        return profile
+    if profile.id == "hugging" and profile.mode == "ipadapter_profile":
+        return profile
+    raise InteractionProfileNotReleased(f"interaction profileはProduction未公開です: {profile.id}")
+
+
 def list_phase1_profiles(*, released: str = "production_candidate") -> list[dict[str, object]]:
     """Return the safe, selectable Phase 1 profile catalog."""
 
@@ -193,6 +247,17 @@ def list_phase1_profiles(*, released: str = "production_candidate") -> list[dict
     for profile_id in PHASE1_RELEASED_IDS:
         result.append(resolve_phase1_interaction(profile_id).public_dict())
     return result
+
+
+def list_production_profiles(*, released: str = "production_candidate") -> list[dict[str, object]]:
+    """Return every interaction profile currently exposed to Production UI."""
+
+    if released != "production_candidate":
+        return []
+    return [
+        resolve_production_interaction(profile_id).public_dict()
+        for profile_id in PRODUCTION_RELEASED_IDS
+    ]
 
 
 def apply_prompt_only_profile(
@@ -218,23 +283,29 @@ def apply_prompt_only_profile(
 def interaction_metadata(interaction_id: str | None) -> dict[str, object] | None:
     if interaction_id is None:
         return None
-    return resolve_phase1_interaction(interaction_id).metadata()
+    return resolve_production_interaction(interaction_id).metadata()
 
 
 __all__ = [
     "InteractionProfile",
     "InteractionProfileError",
     "InteractionProfileModeUnsupported",
+    "InteractionProfileCompatibilityError",
+    "InteractionReferenceMissing",
+    "InteractionChecksumMismatch",
     "InteractionProfileNotFound",
     "InteractionProfileNotReady",
     "InteractionProfileNotReleased",
     "LEDGER_PATH",
     "LEDGER_VERSION",
     "PHASE1_RELEASED_IDS",
+    "PRODUCTION_RELEASED_IDS",
     "RELEASE_STATUS_PATH",
     "apply_prompt_only_profile",
     "interaction_metadata",
     "list_phase1_profiles",
+    "list_production_profiles",
     "resolve_interaction_profile",
     "resolve_phase1_interaction",
+    "resolve_production_interaction",
 ]
